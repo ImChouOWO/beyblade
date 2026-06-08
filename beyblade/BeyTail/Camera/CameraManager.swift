@@ -1,5 +1,6 @@
 import AVFoundation
 import UIKit
+import ImageIO
 
 final class CameraManager: NSObject {
 
@@ -8,6 +9,15 @@ final class CameraManager: NSObject {
     let session = AVCaptureSession()
 
     var onFrame: ((CMSampleBuffer) -> Void)?
+
+    var currentVisionImageOrientation: CGImagePropertyOrientation {
+        orientationLock.lock()
+        defer {
+            orientationLock.unlock()
+        }
+
+        return _currentVisionImageOrientation
+    }
 
     // MARK: - Private
 
@@ -26,6 +36,38 @@ final class CameraManager: NSObject {
     private var isConfigured = false
     private var isSessionRunning = false
 
+    private var activeCameraDevice: AVCaptureDevice?
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+
+    private var lastAppliedRotationAngle: CGFloat = -1
+
+    private let orientationLock = NSLock()
+    private var _currentVisionImageOrientation: CGImagePropertyOrientation = .right
+
+    // MARK: - Init
+
+    override init() {
+        super.init()
+
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(deviceOrientationDidChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+    }
+
+    @objc private func deviceOrientationDidChange() {
+        updateVideoRotation()
+    }
+
     // MARK: - Permission / Start
 
     func requestPermissionAndStart() {
@@ -37,7 +79,9 @@ final class CameraManager: NSObject {
 
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                guard let self else { return }
+                guard let self else {
+                    return
+                }
 
                 if granted {
                     self.start()
@@ -65,7 +109,7 @@ final class CameraManager: NSObject {
             return await startAsync()
 
         case .notDetermined:
-            let granted = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let granted = await withCheckedContinuation { continuation in
                 AVCaptureDevice.requestAccess(for: .video) { granted in
                     continuation.resume(returning: granted)
                 }
@@ -94,14 +138,16 @@ final class CameraManager: NSObject {
 
     func start() {
         sessionQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
 
             self.startSessionIfNeeded()
         }
     }
 
     private func startAsync() async -> Bool {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+        await withCheckedContinuation { continuation in
             sessionQueue.async { [weak self] in
                 guard let self else {
                     continuation.resume(returning: false)
@@ -118,14 +164,16 @@ final class CameraManager: NSObject {
 
     func stop() {
         sessionQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
 
             self.stopSessionIfNeeded()
         }
     }
 
     func stopForPickerAsync() async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        await withCheckedContinuation { continuation in
             sessionQueue.async { [weak self] in
                 guard let self else {
                     continuation.resume()
@@ -150,6 +198,8 @@ final class CameraManager: NSObject {
             return
         }
 
+        applyCurrentVideoRotation(force: true)
+
         guard !session.isRunning else {
             isSessionRunning = true
             return
@@ -157,6 +207,8 @@ final class CameraManager: NSObject {
 
         session.startRunning()
         isSessionRunning = session.isRunning
+
+        applyCurrentVideoRotation(force: true)
     }
 
     private func stopSessionIfNeeded() {
@@ -194,6 +246,12 @@ final class CameraManager: NSObject {
             print("[ERROR] Back camera not found.")
             return
         }
+
+        activeCameraDevice = device
+        rotationCoordinator = AVCaptureDevice.RotationCoordinator(
+            device: device,
+            previewLayer: nil
+        )
 
         guard addCameraInput(device) else {
             isConfigured = false
@@ -265,23 +323,116 @@ final class CameraManager: NSObject {
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
-        if #available(iOS 17.0, *) {
-            let portraitAngle: CGFloat = 90
-
-            if connection.isVideoRotationAngleSupported(portraitAngle) {
-                connection.videoRotationAngle = portraitAngle
-            }
-
-        } else {
-            if connection.isVideoOrientationSupported {
-                connection.videoOrientation = .portrait
-            }
+        if connection.isVideoMirroringSupported {
+            connection.isVideoMirrored = false
         }
+
+        applyCurrentVideoRotation(
+            to: connection,
+            force: true
+        )
+    }
+
+    // MARK: - Dynamic Rotation
+
+    func updateVideoRotation() {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.applyCurrentVideoRotation(force: false)
+        }
+    }
+
+    private func applyCurrentVideoRotation(force: Bool) {
+        guard let connection = videoOutput.connection(with: .video) else {
+            return
+        }
+
+        applyCurrentVideoRotation(
+            to: connection,
+            force: force
+        )
+    }
+
+    private func applyCurrentVideoRotation(
+        to connection: AVCaptureConnection,
+        force: Bool
+    ) {
+        guard let rotationCoordinator else {
+            return
+        }
+
+        let angle = rotationCoordinator.videoRotationAngleForHorizonLevelCapture
+
+        guard angle.isFinite else {
+            return
+        }
+
+        let visionOrientation = visionImageOrientation(
+            forRotationAngle: angle
+        )
+
+        setCurrentVisionImageOrientation(visionOrientation)
+
+        guard force || angle != lastAppliedRotationAngle else {
+            return
+        }
+
+        guard connection.isVideoRotationAngleSupported(angle) else {
+            print("[WARN] videoRotationAngle not supported:", angle)
+            return
+        }
+
+        connection.videoRotationAngle = angle
+        lastAppliedRotationAngle = angle
 
         if connection.isVideoMirroringSupported {
             connection.isVideoMirrored = false
         }
+
+        print(
+            "[CAMERA] apply videoRotationAngle:",
+            angle,
+            "visionOrientation:",
+            visionOrientation
+        )
     }
+
+    private func setCurrentVisionImageOrientation(
+        _ orientation: CGImagePropertyOrientation
+    ) {
+        orientationLock.lock()
+        _currentVisionImageOrientation = orientation
+        orientationLock.unlock()
+    }
+
+    private func visionImageOrientation(
+        forRotationAngle angle: CGFloat
+    ) -> CGImagePropertyOrientation {
+        let rounded = Int(round(angle / 90.0)) * 90
+        let normalized = ((rounded % 360) + 360) % 360
+
+        switch normalized {
+        case 0:
+            return .up
+
+        case 90:
+            return .right
+
+        case 180:
+            return .down
+
+        case 270:
+            return .left
+
+        default:
+            return .right
+        }
+    }
+
+    // MARK: - Frame Rate
 
     private func configureFrameRate(_ device: AVCaptureDevice) {
         do {
@@ -314,6 +465,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        applyCurrentVideoRotation(
+            to: connection,
+            force: false
+        )
+
         onFrame?(sampleBuffer)
     }
 

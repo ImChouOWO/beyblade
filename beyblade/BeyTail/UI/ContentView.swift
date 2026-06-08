@@ -21,125 +21,158 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
-            Group {
-                if vm.isUsingVideoFile {
-                    VideoPlayerView(player: vm.videoFrameSource.player)
-                } else {
-                    CameraPreviewView(session: vm.cameraManager.session)
-                }
-            }
-            .ignoresSafeArea()
+        GeometryReader { geometry in
+            let size = geometry.size
+            let isLandscape = size.width > size.height
+            let videoGravity: AVLayerVideoGravity = isLandscape
+                ? .resizeAspect
+                : .resizeAspectFill
 
-            TrailOverlayRepresentable(view: vm.trailOverlayView)
+            ZStack {
+                Group {
+                    if vm.isUsingVideoFile {
+                        VideoPlayerView(
+                            player: vm.videoFrameSource.player,
+                            videoGravity: videoGravity
+                        )
+                    } else {
+                        CameraPreviewView(
+                            session: vm.cameraManager.session,
+                            videoGravity: videoGravity
+                        )
+                    }
+                }
                 .ignoresSafeArea()
 
-            VStack {
-                LinearGradient(
-                    colors: [
-                        .black.opacity(0.55),
-                        .clear
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 120)
+                TrailOverlayRepresentable(view: vm.trailOverlayView)
+                    .ignoresSafeArea()
 
-                Spacer()
-            }
-            .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                topBar
-                Spacer()
-                hintBar
-                bottomBar
-            }
-            .ignoresSafeArea(edges: .bottom)
-
-            if vm.effectMenuVisible {
                 VStack {
-                    Spacer()
+                    LinearGradient(
+                        colors: [
+                            .black.opacity(0.55),
+                            .clear
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 120)
 
-                    HStack {
+                    Spacer()
+                }
+                .ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    topBar
+                    Spacer()
+                    hintBar
+                    bottomBar
+                }
+                .ignoresSafeArea(edges: .bottom)
+
+                if vm.effectMenuVisible {
+                    VStack {
                         Spacer()
 
-                        EffectMenuView(
-                            selectedEffect: $vm.selectedEffect,
-                            isVisible: $vm.effectMenuVisible
-                        )
-                        .padding(.trailing, 8)
-                        .padding(.bottom, 130)
-                    }
-                }
-                .ignoresSafeArea()
-                .transition(.opacity)
-            }
+                        HStack {
+                            Spacer()
 
-            if isBusy {
-                busyOverlay
+                            EffectMenuView(
+                                selectedEffect: $vm.selectedEffect,
+                                isVisible: $vm.effectMenuVisible
+                            )
+                            .padding(.trailing, 8)
+                            .padding(.bottom, 130)
+                        }
+                    }
+                    .ignoresSafeArea()
                     .transition(.opacity)
-            }
-        }
-        .sheet(
-            isPresented: $showVideoPicker,
-            onDismiss: {
-                let sessionID = presentedPickerSessionID ?? pickerSessionID
-                handleVideoPickerDismiss(sessionID: sessionID)
-            }
-        ) {
-            VideoPickerController(
-                isPresented: $showVideoPicker,
-                sessionID: pickerSessionID,
-                onSelectionPrepared: { sessionID in
-                    handleSelectionPrepared(sessionID: sessionID)
-                },
-                onPicked: { sessionID, url in
-                    guard markPickerSessionHandled(sessionID) else {
-                        return
-                    }
-
-                    handleSelectedVideo(url)
-                },
-                onCancel: { sessionID in
-                    guard markPickerSessionHandled(sessionID) else {
-                        resetPickerUIState()
-                        return
-                    }
-
-                    resetPickerUIState()
-                    vm.cancelVideoPickerAndRecover()
-                },
-                onFailed: { sessionID in
-                    guard markPickerSessionHandled(sessionID) else {
-                        resetPickerUIState()
-                        return
-                    }
-
-                    resetPickerUIState()
-                    vm.videoSelectionFailed()
                 }
-            )
-            .ignoresSafeArea()
-            .interactiveDismissDisabled(false)
-        }
-        .onAppear {
-            vm.start()
-        }
-        .onDisappear {
-            vm.stop()
-        }
-        .onChange(of: vm.isSwitchingInputSource) { _, newValue in
-            if !newValue {
-                isPreparingVideoPicker = false
+
+                if isBusy {
+                    busyOverlay
+                        .transition(.opacity)
+                }
             }
-        }
-        .onChange(of: vm.isVideoLoading) { _, newValue in
-            if !newValue {
-                isPreparingVideoPicker = false
+            .sheet(
+                isPresented: $showVideoPicker,
+                onDismiss: {
+                    let sessionID = presentedPickerSessionID ?? pickerSessionID
+                    handleVideoPickerDismiss(sessionID: sessionID)
+                }
+            ) {
+                VideoPickerController(
+                    isPresented: $showVideoPicker,
+                    sessionID: pickerSessionID,
+                    onSelectionPrepared: { sessionID in
+                        handleSelectionPrepared(sessionID: sessionID)
+                    },
+                    onPicked: { sessionID, url in
+                        guard markPickerSessionHandled(sessionID) else {
+                            return
+                        }
+
+                        handleSelectedVideo(url)
+                    },
+                    onCancel: { sessionID in
+                        guard markPickerSessionHandled(sessionID) else {
+                            resetPickerUIState()
+                            return
+                        }
+
+                        resetPickerUIState()
+                        vm.cancelVideoPickerAndRecover()
+                    },
+                    onFailed: { sessionID in
+                        guard markPickerSessionHandled(sessionID) else {
+                            resetPickerUIState()
+                            return
+                        }
+
+                        resetPickerUIState()
+                        vm.videoSelectionFailed()
+                    }
+                )
+                .ignoresSafeArea()
+                .interactiveDismissDisabled(false)
             }
+            .onAppear {
+                vm.updatePreviewLayout(
+                    overlaySize: size,
+                    videoGravity: videoGravity
+                )
+
+                vm.cameraManager.updateVideoRotation()
+                vm.start()
+            }
+            .onDisappear {
+                vm.stop()
+            }
+            .onChange(of: size) { _, newSize in
+                let newIsLandscape = newSize.width > newSize.height
+                let newVideoGravity: AVLayerVideoGravity = newIsLandscape
+                    ? .resizeAspect
+                    : .resizeAspectFill
+
+                vm.updatePreviewLayout(
+                    overlaySize: newSize,
+                    videoGravity: newVideoGravity
+                )
+
+                vm.cameraManager.updateVideoRotation()
+            }
+            .onChange(of: vm.isSwitchingInputSource) { _, newValue in
+                if !newValue {
+                    isPreparingVideoPicker = false
+                }
+            }
+            .onChange(of: vm.isVideoLoading) { _, newValue in
+                if !newValue {
+                    isPreparingVideoPicker = false
+                }
+            }
+            .preferredColorScheme(.dark)
         }
-        .preferredColorScheme(.dark)
     }
 
     // MARK: - Video Picker Handler
@@ -511,7 +544,6 @@ struct VideoPickerController: UIViewControllerRepresentable {
     @Binding var isPresented: Bool
 
     let sessionID: UUID
-
     let onSelectionPrepared: (UUID) -> Void
     let onPicked: (UUID, URL) -> Void
     let onCancel: (UUID) -> Void
@@ -641,21 +673,32 @@ struct VideoPickerController: UIViewControllerRepresentable {
 // MARK: - Camera Preview
 
 struct CameraPreviewView: UIViewRepresentable {
+
     let session: AVCaptureSession
+    let videoGravity: AVLayerVideoGravity
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
         let view = CameraPreviewUIView()
         view.backgroundColor = .black
-        view.previewLayer.videoGravity = .resizeAspectFill
-        view.previewLayer.session = session
-
+        view.attachSession(session)
+        view.setVideoGravity(videoGravity)
         return view
     }
 
-    func updateUIView(_ uiView: CameraPreviewUIView, context: Context) {
-        uiView.previewLayer.session = session
-        uiView.previewLayer.videoGravity = .resizeAspectFill
+    func updateUIView(
+        _ uiView: CameraPreviewUIView,
+        context: Context
+    ) {
+        uiView.attachSession(session)
+        uiView.setVideoGravity(videoGravity)
         uiView.setNeedsLayout()
+    }
+
+    static func dismantleUIView(
+        _ uiView: CameraPreviewUIView,
+        coordinator: ()
+    ) {
+        uiView.detachSession()
     }
 }
 
@@ -673,10 +716,23 @@ final class CameraPreviewUIView: UIView {
         return layer
     }
 
+    func attachSession(_ session: AVCaptureSession) {
+        if previewLayer.session !== session {
+            previewLayer.session = session
+        }
+    }
+
+    func detachSession() {
+        previewLayer.session = nil
+    }
+
+    func setVideoGravity(_ videoGravity: AVLayerVideoGravity) {
+        previewLayer.videoGravity = videoGravity
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         previewLayer.frame = bounds
-        previewLayer.videoGravity = .resizeAspectFill
     }
 }
 

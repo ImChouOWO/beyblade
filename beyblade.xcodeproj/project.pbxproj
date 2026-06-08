@@ -266,6 +266,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = beyblade/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";
@@ -314,6 +315,7 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = beyblade/Info.plist;
+				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";

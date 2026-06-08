@@ -29,45 +29,14 @@ final class InferenceEngine: @unchecked Sendable {
 
     private var activeFrameSize = CGSize(width: 1, height: 1)
 
-    /*
-     YOLOv10 standard output:
-     [1, 300, 6]
-
-     each row:
-     [x1, y1, x2, y2, confidence, classId]
-     */
     private let confidenceThreshold: Float = 0.30
     private let nmsIoUThreshold: CGFloat = 0.35
     private let maxOutputDetections = 2
 
     private let modelInputSize = CGSize(width: 640, height: 640)
 
-    /*
-     單類別多目標偵測。
-     若你的模型只有一類，classId 應為 0。
-     */
     private let singleClassId = 0
 
-    /*
-     bbox 方向修正。
-
-     你目前 imageOrientation() = .right。
-     iPhone portrait camera 常見需要把 YOLO output 轉到 portrait overlay 座標。
-
-     測試順序：
-     1. rotateRight
-     2. rotateLeft
-     3. flipY
-     4. none
-     */
-    private enum BBoxOrientationMode {
-        case none
-        case rotateRight
-        case rotateLeft
-        case flipY
-    }
-
-    private let bboxOrientationMode: BBoxOrientationMode = .none
     private var didPrintRawOutputInfo = false
     private var didPrintFirstRows = false
     private var didPrintKeptRows = false
@@ -136,10 +105,6 @@ final class InferenceEngine: @unchecked Sendable {
             completionHandler: onResult
         )
 
-        /*
-         scaleFill 代表 Vision 會把來源 frame 拉伸到模型輸入尺寸。
-         YOLOv10 raw bbox 若是 640x640 座標，會在後面除以 modelInputSize。
-         */
         request.imageCropAndScaleOption = .scaleFill
 
         return request
@@ -167,7 +132,10 @@ final class InferenceEngine: @unchecked Sendable {
         print("[INFO] InferenceEngine stop")
     }
 
-    func processFrame(_ sampleBuffer: CMSampleBuffer) {
+    func processFrame(
+        _ sampleBuffer: CMSampleBuffer,
+        orientation: CGImagePropertyOrientation = .up
+    ) {
         if isMockMode {
             mockTick()
             return
@@ -184,6 +152,7 @@ final class InferenceEngine: @unchecked Sendable {
 
         let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
         let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
+        let frameOrientation = orientation
 
         let boxedPixelBuffer = InferenceUncheckedSendableBox(
             value: pixelBuffer
@@ -193,7 +162,7 @@ final class InferenceEngine: @unchecked Sendable {
             value: request
         )
 
-        inferenceQueue.async { [weak self, boxedPixelBuffer, boxedRequest] in
+        inferenceQueue.async { [weak self, boxedPixelBuffer, boxedRequest, frameOrientation] in
             guard let self else {
                 return
             }
@@ -211,7 +180,7 @@ final class InferenceEngine: @unchecked Sendable {
 
             let handler = VNImageRequestHandler(
                 cvPixelBuffer: boxedPixelBuffer.value,
-                orientation: self.imageOrientation(),
+                orientation: frameOrientation,
                 options: [:]
             )
 
@@ -230,15 +199,6 @@ final class InferenceEngine: @unchecked Sendable {
                 }
             }
         }
-    }
-
-    private func imageOrientation() -> CGImagePropertyOrientation {
-        /*
-         iPhone portrait camera 常見是 .right。
-         如果 bbox 方向錯，可嘗試：
-         .up / .down / .left / .right
-         */
-        return .right
     }
 
     // MARK: - Vision Result
@@ -310,11 +270,6 @@ final class InferenceEngine: @unchecked Sendable {
                     return nil
                 }
 
-                /*
-                 VNRecognizedObjectObservation.boundingBox 是 normalized 0...1，
-                 原點在左下角。
-                 UI / DetectionResult 使用左上角，因此這裡翻轉 Y。
-                 */
                 let rect = CGRect(
                     x: obs.boundingBox.minX,
                     y: 1.0 - obs.boundingBox.maxY,
@@ -542,11 +497,6 @@ final class InferenceEngine: @unchecked Sendable {
                 )
             }
 
-            /*
-             依你的要求：先不要做面積篩選。
-             所以這裡不使用 minBoxAreaRatio / maxBoxAreaRatio。
-             */
-
             let detection = DetectionResult(
                 boundingBox: rect,
                 confidence: confidence,
@@ -604,13 +554,6 @@ final class InferenceEngine: @unchecked Sendable {
         y2: Float,
         sourceFrameSize: CGSize
     ) -> CGRect? {
-        /*
-         標準 YOLOv10 格式：
-         [x1, y1, x2, y2]
-
-         先轉成 normalized rect，再根據 bboxOrientationMode 做方向修正。
-         */
-
         let rawX1 = CGFloat(x1)
         let rawY1 = CGFloat(y1)
         let rawX2 = CGFloat(x2)
@@ -645,15 +588,14 @@ final class InferenceEngine: @unchecked Sendable {
             return nil
         }
 
-        let rawRect = CGRect(
+        let rect = CGRect(
             x: nx1,
             y: ny1,
             width: nx2 - nx1,
             height: ny2 - ny1
         )
 
-        let orientedRect = applyBBoxOrientation(rawRect)
-        let clamped = clampNormalizedRect(orientedRect)
+        let clamped = clampNormalizedRect(rect)
 
         guard clamped.width > 0.001,
               clamped.height > 0.001 else {
@@ -661,74 +603,6 @@ final class InferenceEngine: @unchecked Sendable {
         }
 
         return clamped
-    }
-
-    private func applyBBoxOrientation(
-        _ rect: CGRect
-    ) -> CGRect {
-        switch bboxOrientationMode {
-        case .none:
-            return rect
-
-        case .flipY:
-            return CGRect(
-                x: rect.minX,
-                y: 1.0 - rect.maxY,
-                width: rect.width,
-                height: rect.height
-            )
-
-        case .rotateRight:
-            /*
-             normalized point transform:
-             old(x, y) -> new(1 - y, x)
-             */
-            let p1 = CGPoint(
-                x: 1.0 - rect.minY,
-                y: rect.minX
-            )
-
-            let p2 = CGPoint(
-                x: 1.0 - rect.maxY,
-                y: rect.maxX
-            )
-
-            return rectFromPoints(p1, p2)
-
-        case .rotateLeft:
-            /*
-             normalized point transform:
-             old(x, y) -> new(y, 1 - x)
-             */
-            let p1 = CGPoint(
-                x: rect.minY,
-                y: 1.0 - rect.minX
-            )
-
-            let p2 = CGPoint(
-                x: rect.maxY,
-                y: 1.0 - rect.maxX
-            )
-
-            return rectFromPoints(p1, p2)
-        }
-    }
-
-    private func rectFromPoints(
-        _ a: CGPoint,
-        _ b: CGPoint
-    ) -> CGRect {
-        let minX = min(a.x, b.x)
-        let minY = min(a.y, b.y)
-        let maxX = max(a.x, b.x)
-        let maxY = max(a.y, b.y)
-
-        return CGRect(
-            x: minX,
-            y: minY,
-            width: maxX - minX,
-            height: maxY - minY
-        )
     }
 
     private enum YOLOCoordinateSpace {

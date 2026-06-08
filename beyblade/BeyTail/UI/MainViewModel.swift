@@ -77,12 +77,6 @@ final class MainViewModel: ObservableObject {
         let clearRecordedPreview: Bool
         let clearTracking: Bool
 
-        static let none = ResourceClearPolicy(
-            clearLoadedVideo: false,
-            clearRecordedPreview: false,
-            clearTracking: false
-        )
-
         static let beforeOpenVideoLibrary = ResourceClearPolicy(
             clearLoadedVideo: true,
             clearRecordedPreview: true,
@@ -125,21 +119,12 @@ final class MainViewModel: ObservableObject {
     private var isStartingCameraPreview = false
     private var hasRequestedInitialCameraPreview = false
 
-    /*
-     最小修正重點：
-     記錄目前送進模型的 frame size，用於 aspectFill bbox 補償。
-
-     DetectionResult.boundingBox 仍維持 normalized 0...1。
-     但在送給 TrailOverlayView 前，會根據 source frame 與 overlay size
-     做 aspectFill crop offset 修正。
-     */
     private var latestSourceFrameSize = CGSize(width: 1, height: 1)
 
-    /*
-     如果你發現修正後 bbox 反而偏移，可以先改成 false。
-     代表你的模型輸出可能已經是畫面顯示座標，不需要 aspectFill 補償。
-     */
-    private let enableAspectFillBBoxMapping = false
+    private var latestOverlaySize = CGSize(width: 1, height: 1)
+    private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
+
+    private let enableAspectFillBBoxMapping = true
 
     // MARK: - Init
 
@@ -190,6 +175,22 @@ final class MainViewModel: ObservableObject {
         }
 
         syncPublishedState()
+    }
+
+    // MARK: - Layout Sync
+
+    func updatePreviewLayout(
+        overlaySize: CGSize,
+        videoGravity: AVLayerVideoGravity
+    ) {
+        guard overlaySize.width > 1,
+              overlaySize.height > 1 else {
+            return
+        }
+
+        latestOverlaySize = overlaySize
+        previewVideoGravity = videoGravity
+        trailOverlayView.setNeedsDisplay()
     }
 
     // MARK: - Published State Sync
@@ -384,11 +385,6 @@ final class MainViewModel: ObservableObject {
             hardwareColor = colorForHardware(first.hardware)
         }
 
-        /*
-         最小修正：
-         不改 DetectionResult、不改 TrailOverlayView。
-         只在寫入 overlay 前，把 bbox 做 aspectFill 顯示座標映射。
-         */
         let mappedResults = tracked.map {
             mapDetectionToOverlaySpace($0)
         }
@@ -426,7 +422,7 @@ final class MainViewModel: ObservableObject {
         }
     }
 
-    // MARK: - AspectFill BBox Mapping
+    // MARK: - BBox Mapping
 
     private struct DisplayDetection {
         let displayRect: CGRect
@@ -438,7 +434,7 @@ final class MainViewModel: ObservableObject {
     private func mapDetectionToOverlaySpace(
         _ detection: DetectionResult
     ) -> DisplayDetection {
-        let mappedRect = mapNormalizedRectToAspectFillOverlay(
+        let mappedRect = mapNormalizedRectToOverlay(
             detection.boundingBox
         )
 
@@ -453,14 +449,21 @@ final class MainViewModel: ObservableObject {
         )
     }
 
-    private func mapNormalizedRectToAspectFillOverlay(
+    private func mapNormalizedRectToOverlay(
         _ normalizedRect: CGRect
     ) -> CGRect {
         guard enableAspectFillBBoxMapping else {
             return clampNormalizedRect(normalizedRect)
         }
 
-        let overlaySize = trailOverlayView.bounds.size
+        let overlaySize: CGSize
+
+        if latestOverlaySize.width > 1,
+           latestOverlaySize.height > 1 {
+            overlaySize = latestOverlaySize
+        } else {
+            overlaySize = trailOverlayView.bounds.size
+        }
 
         guard overlaySize.width > 1,
               overlaySize.height > 1,
@@ -469,15 +472,32 @@ final class MainViewModel: ObservableObject {
             return clampNormalizedRect(normalizedRect)
         }
 
-        let sourceSize = orientedSourceSizeForCurrentOverlay(
+        let sourceSize = effectiveSourceSizeForCurrentOverlay(
             rawSourceSize: latestSourceFrameSize,
             overlaySize: overlaySize
         )
 
-        let scale = max(
-            overlaySize.width / sourceSize.width,
-            overlaySize.height / sourceSize.height
-        )
+        let scale: CGFloat
+
+        switch previewVideoGravity {
+        case .resizeAspect:
+            scale = min(
+                overlaySize.width / sourceSize.width,
+                overlaySize.height / sourceSize.height
+            )
+
+        case .resizeAspectFill:
+            scale = max(
+                overlaySize.width / sourceSize.width,
+                overlaySize.height / sourceSize.height
+            )
+
+        default:
+            scale = max(
+                overlaySize.width / sourceSize.width,
+                overlaySize.height / sourceSize.height
+            )
+        }
 
         let scaledWidth = sourceSize.width * scale
         let scaledHeight = sourceSize.height * scale
@@ -509,32 +529,14 @@ final class MainViewModel: ObservableObject {
         return clampNormalizedRect(normalizedDisplayRect)
     }
 
-    private func orientedSourceSizeForCurrentOverlay(
+    private func effectiveSourceSizeForCurrentOverlay(
         rawSourceSize: CGSize,
         overlaySize: CGSize
     ) -> CGSize {
-        /*
-         AVCaptureVideoDataOutput 的 pixelBuffer 常見是 landscape：
-         1920x1080 / 1280x720。
-
-         但 iPhone portrait 預覽通常是 portrait。
-         若 overlay 是 portrait 而 source 是 landscape，這裡交換寬高，
-         避免 aspectFill 計算使用錯誤的比例。
-         */
         let overlayIsPortrait = overlaySize.height >= overlaySize.width
-        let sourceIsLandscape = rawSourceSize.width > rawSourceSize.height
+        let sourceIsPortrait = rawSourceSize.height >= rawSourceSize.width
 
-        if overlayIsPortrait && sourceIsLandscape {
-            return CGSize(
-                width: rawSourceSize.height,
-                height: rawSourceSize.width
-            )
-        }
-
-        let overlayIsLandscape = overlaySize.width > overlaySize.height
-        let sourceIsPortrait = rawSourceSize.height > rawSourceSize.width
-
-        if overlayIsLandscape && sourceIsPortrait {
+        if overlayIsPortrait != sourceIsPortrait {
             return CGSize(
                 width: rawSourceSize.height,
                 height: rawSourceSize.width
@@ -1167,7 +1169,11 @@ final class MainViewModel: ObservableObject {
         }
 
         updateLatestSourceFrameSize(from: buffer)
-        inferenceEngine.processFrame(buffer)
+
+        inferenceEngine.processFrame(
+            buffer,
+            orientation: cameraManager.currentVisionImageOrientation
+        )
     }
 
     private func stopCameraForExternalPicker() async {

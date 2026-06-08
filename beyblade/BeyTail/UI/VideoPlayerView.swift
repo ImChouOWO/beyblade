@@ -5,16 +5,22 @@ import UIKit
 struct VideoPlayerView: UIViewRepresentable {
 
     let player: AVPlayer
+    let videoGravity: AVLayerVideoGravity
 
     func makeUIView(context: Context) -> PlayerView {
         let view = PlayerView()
         view.backgroundColor = .black
         view.attachPlayer(player)
+        view.setVideoGravity(videoGravity)
         return view
     }
 
-    func updateUIView(_ uiView: PlayerView, context: Context) {
+    func updateUIView(
+        _ uiView: PlayerView,
+        context: Context
+    ) {
         uiView.attachPlayer(player)
+        uiView.setVideoGravity(videoGravity)
         uiView.setNeedsLayout()
     }
 
@@ -44,8 +50,10 @@ final class PlayerView: UIView {
         if playerLayer.player !== player {
             playerLayer.player = player
         }
+    }
 
-        playerLayer.videoGravity = .resizeAspectFill
+    func setVideoGravity(_ videoGravity: AVLayerVideoGravity) {
+        playerLayer.videoGravity = videoGravity
     }
 
     func detachPlayer() {
@@ -54,8 +62,6 @@ final class PlayerView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-
         playerLayer.frame = bounds
-        playerLayer.videoGravity = .resizeAspectFill
     }
 }
