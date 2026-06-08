@@ -2,15 +2,15 @@ import CoreML
 import Vision
 import AVFoundation
 import UIKit
+import ImageIO
+
+private struct InferenceUncheckedSendableBox<T>: @unchecked Sendable {
+    let value: T
+}
 
 // 對應 Android InferenceEngine.kt
 // 有 CoreML 模型 → 真實推論
 // 無模型 → frame-driven mock 模式
-//
-// 重要：
-// 1. mock 不使用 Timer，只在 processFrame(...) 被呼叫時輸出結果。
-// 2. 真實模型使用 Vision + CoreML。
-// 3. 若 CoreML 輸出不是 VNRecognizedObjectObservation，會先印出 raw output 資訊。
 final class InferenceEngine: @unchecked Sendable {
 
     let isMockMode: Bool
@@ -121,7 +121,6 @@ final class InferenceEngine: @unchecked Sendable {
         print("[INFO] InferenceEngine stop")
     }
 
-    // 每幀從 CameraManager 或 VideoFrameSource 收到 CMSampleBuffer 後呼叫
     func processFrame(_ sampleBuffer: CMSampleBuffer) {
         if isMockMode {
             mockTick()
@@ -137,7 +136,9 @@ final class InferenceEngine: @unchecked Sendable {
             return
         }
 
-        inferenceQueue.async { [weak self, pixelBuffer, request] in
+        let boxedPixelBuffer = InferenceUncheckedSendableBox(value: pixelBuffer)
+
+        inferenceQueue.async { [weak self, boxedPixelBuffer, request] in
             guard let self else {
                 return
             }
@@ -149,7 +150,7 @@ final class InferenceEngine: @unchecked Sendable {
             self.isProcessing = true
 
             let handler = VNImageRequestHandler(
-                cvPixelBuffer: pixelBuffer,
+                cvPixelBuffer: boxedPixelBuffer.value,
                 orientation: self.imageOrientation(),
                 options: [:]
             )
@@ -161,8 +162,8 @@ final class InferenceEngine: @unchecked Sendable {
 
                 self.isProcessing = false
 
-                DispatchQueue.main.async {
-                    self.onResult?([])
+                DispatchQueue.main.async { [weak self] in
+                    self?.onResult?([])
                 }
             }
         }
@@ -171,7 +172,7 @@ final class InferenceEngine: @unchecked Sendable {
     private func imageOrientation() -> CGImagePropertyOrientation {
         /*
          目前先以 iPhone 直向 portrait 為主。
-         如果畫面 bbox 旋轉或方向錯誤，通常要在這裡調整：
+         如果 bbox 旋轉或方向錯誤，可嘗試：
          .right / .left / .up / .down
          */
         return .right
@@ -242,9 +243,9 @@ final class InferenceEngine: @unchecked Sendable {
 
                 /*
                  VNRecognizedObjectObservation.boundingBox 是 normalized 0...1，
-                 且座標原點在左下角。
+                 原點在左下角。
 
-                 目前 DetectionResult / UI 使用左上座標，因此這裡翻轉 Y。
+                 DetectionResult / UI 使用左上座標，因此這裡翻轉 Y。
                  */
                 let flipped = CGRect(
                     x: obs.boundingBox.minX,
@@ -257,7 +258,7 @@ final class InferenceEngine: @unchecked Sendable {
                     boundingBox: flipped,
                     confidence: confidence,
                     fps: currentFps,
-                    hardware: .npu,
+                    hardware: BeyTailInferenceHardware.npu,
                     trackId: 0,
                     dominantColor: .white
                 )
@@ -272,14 +273,14 @@ final class InferenceEngine: @unchecked Sendable {
         _ features: [VNCoreMLFeatureValueObservation]
     ) {
         /*
-         如果你看到這個 log，代表 CoreML 模型不是 Vision Object Detector 格式，
-         可能是 YOLOv10 raw tensor output。
+         如果看到這個 log，代表 CoreML 模型不是 Vision Object Detector 格式，
+         可能是 YOLO raw tensor output。
 
-         這種情況下一步要做 YOLOv10 output decode：
-         1. 讀 MLMultiArray
-         2. 解析 box / confidence / class
-         3. 做 threshold
-         4. 必要時做 NMS
+         下一步需要補 YOLO output decode：
+         1. 讀取 MLMultiArray
+         2. 解析 bbox / confidence / class
+         3. threshold
+         4. NMS
          */
 
         print("[WARN] CoreML returned raw feature outputs. Need YOLO tensor decode.")
@@ -355,7 +356,7 @@ final class InferenceEngine: @unchecked Sendable {
                 ),
                 confidence: 0.95,
                 fps: fps,
-                hardware: .mock,
+                hardware: BeyTailInferenceHardware.mock,
                 trackId: 0,
                 dominantColor: UIColor(hex: 0x00DDFF)
             ),
@@ -368,8 +369,8 @@ final class InferenceEngine: @unchecked Sendable {
                 ),
                 confidence: 0.91,
                 fps: fps,
-                hardware: .mock,
-                trackId: 1,
+                hardware: BeyTailInferenceHardware.mock,
+                trackId: 0,
                 dominantColor: UIColor(hex: 0xFF00CC)
             )
         ]

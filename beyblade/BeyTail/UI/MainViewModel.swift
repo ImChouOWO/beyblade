@@ -2,6 +2,10 @@ import SwiftUI
 import Combine
 import AVFoundation
 
+private struct UncheckedSendableBox<T>: @unchecked Sendable {
+    let value: T
+}
+
 @MainActor
 final class MainViewModel: ObservableObject {
 
@@ -20,6 +24,7 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var fps: Int = 0
     @Published private(set) var hardwareLabel = "MOCK"
     @Published private(set) var hardwareColor = Color(white: 0.6)
+
     @Published var hintVisible = true
     @Published var pulseScale: CGFloat = 1.0
 
@@ -32,18 +37,18 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var canReturnToCamera = false
 
     @Published private(set) var loadingText = ""
-    @Published private(set) var detections: [DetectionResult] = []
 
     // MARK: - Components
 
-    let cameraManager     = CameraManager()
+    let cameraManager = CameraManager()
+    let inferenceEngine = InferenceEngine()
+    let tracker = BeybladeTracker()
     let trailEffectEngine = TrailEffectEngine()
-    let trailOverlayView  = TrailOverlayView()
-    let videoFrameSource  = VideoFrameSource()
-    let recordingManager  = RecordingManager()
-    let inferenceEngine = InferenceEngine(modelName: "best")
+    let trailOverlayView = TrailOverlayView()
+    let videoFrameSource = VideoFrameSource()
+    let recordingManager = RecordingManager()
 
-    // MARK: - Event State
+    // MARK: - Internal State
 
     private enum UIEvent: Equatable {
         case openVideoLibrary
@@ -70,20 +75,30 @@ final class MainViewModel: ObservableObject {
     private struct ResourceClearPolicy {
         let clearLoadedVideo: Bool
         let clearRecordedPreview: Bool
+        let clearTracking: Bool
 
         static let none = ResourceClearPolicy(
             clearLoadedVideo: false,
-            clearRecordedPreview: false
+            clearRecordedPreview: false,
+            clearTracking: false
         )
 
         static let beforeOpenVideoLibrary = ResourceClearPolicy(
             clearLoadedVideo: true,
-            clearRecordedPreview: true
+            clearRecordedPreview: true,
+            clearTracking: true
         )
 
         static let beforeStartRecording = ResourceClearPolicy(
             clearLoadedVideo: true,
-            clearRecordedPreview: true
+            clearRecordedPreview: true,
+            clearTracking: true
+        )
+
+        static let returnToCamera = ResourceClearPolicy(
+            clearLoadedVideo: true,
+            clearRecordedPreview: true,
+            clearTracking: true
         )
     }
 
@@ -117,6 +132,17 @@ final class MainViewModel: ObservableObject {
         trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
         trailOverlayView.currentEffect = selectedEffect
 
+        inferenceEngine.onResult = { [weak self] detections in
+            Task { @MainActor [weak self, detections] in
+                guard let self else {
+                    return
+                }
+
+                let tracked = self.tracker.update(detections)
+                self.applyTrackedResults(tracked)
+            }
+        }
+
         videoFrameSource.onEnded = { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else {
@@ -147,42 +173,7 @@ final class MainViewModel: ObservableObject {
             }
         }
 
-        inferenceEngine.onResult = { [weak self] detections in
-            Task { @MainActor [weak self, detections] in
-                guard let self else {
-                    return
-                }
-
-                self.handleDetectorDetections(detections)
-            }
-        }
-
         syncPublishedState()
-    }
-
-    // MARK: - Detection
-
-    private func handleDetectorDetections(_ detections: [DetectionResult]) {
-        self.detections = detections
-
-        guard let first = detections.first else {
-            fps = 0
-            hardwareLabel = "NPU"
-            hardwareColor = hardwareColor(for: .npu)
-            return
-        }
-
-        fps = Int(first.fps)
-        hardwareLabel = first.hardware.rawValue
-        hardwareColor = hardwareColor(for: first.hardware)
-
-        print(
-            "[DETECT]",
-            "conf:",
-            first.confidence,
-            "box:",
-            first.boundingBox
-        )
     }
 
     // MARK: - Published State Sync
@@ -323,11 +314,12 @@ final class MainViewModel: ObservableObject {
 
         hasRequestedInitialCameraPreview = true
 
+        inferenceEngine.start()
+
         startPulse()
         startHintAutoHide()
 
         startCameraPreview()
-        inferenceEngine.start()
     }
 
     func stop() {
@@ -343,6 +335,12 @@ final class MainViewModel: ObservableObject {
         cameraManager.onFrame = nil
         cameraManager.stop()
 
+        inferenceEngine.stop()
+
+        tracker.reset()
+        trailEffectEngine.clear()
+        trailOverlayView.debugBoundingBoxes = []
+
         videoFrameSource.onFrame = nil
         videoFrameSource.stop()
 
@@ -352,12 +350,55 @@ final class MainViewModel: ObservableObject {
 
         recordingManager.forceReset()
 
-        detections = []
-        fps = 0
-        hardwareLabel = "MOCK"
-        hardwareColor = Color(white: 0.6)
-        inferenceEngine.stop()
         appMode = .stopped
+    }
+
+    // MARK: - Inference Result
+
+    private func applyTrackedResults(_ tracked: [DetectionResult]) {
+        guard !tracked.isEmpty else {
+            fps = Int(inferenceEngine.currentFps)
+            trailOverlayView.debugBoundingBoxes = []
+            return
+        }
+
+        if let first = tracked.first {
+            fps = Int(first.fps)
+            hardwareLabel = first.hardware.label
+            hardwareColor = colorForHardware(first.hardware)
+        }
+
+        trailOverlayView.debugBoundingBoxes = tracked.map {
+            ($0.boundingBox, $0.trackId)
+        }
+
+        for detection in tracked {
+            guard detection.trackId > 0 else {
+                continue
+            }
+
+            trailEffectEngine.addPoint(
+                trackId: detection.trackId,
+                center: detection.center,
+                color: detection.dominantColor
+            )
+        }
+    }
+
+    private func colorForHardware(_ hardware: BeyTailInferenceHardware) -> Color {
+        switch hardware {
+        case .cpu:
+            return .orange
+
+        case .gpu:
+            return .blue
+
+        case .npu:
+            return .green
+
+        case .mock:
+            return Color(white: 0.6)
+        }
     }
 
     // MARK: - Video Picker Event
@@ -489,11 +530,15 @@ final class MainViewModel: ObservableObject {
             )
 
             self.videoFrameSource.onFrame = { [weak self] buffer in
-                guard let self else {
-                    return
-                }
+                let boxedBuffer = UncheckedSendableBox(value: buffer)
 
-                self.handleVideoFrame(buffer)
+                Task { @MainActor [weak self, boxedBuffer] in
+                    guard let self else {
+                        return
+                    }
+
+                    self.handleVideoFrame(boxedBuffer.value)
+                }
             }
 
             self.videoFrameSource.load(
@@ -564,6 +609,11 @@ final class MainViewModel: ObservableObject {
     }
 
     private func handleVideoFrame(_ buffer: CMSampleBuffer) {
+        guard appMode == .loadingVideo ||
+              appMode == .videoReady else {
+            return
+        }
+
         inferenceEngine.processFrame(buffer)
     }
 
@@ -622,7 +672,10 @@ final class MainViewModel: ObservableObject {
         }
 
         guard activeEvent == .startRecording else {
-            print("[RECORD] onStarted ignored, activeEvent:", String(describing: activeEvent))
+            print(
+                "[RECORD] onStarted ignored, activeEvent:",
+                String(describing: activeEvent)
+            )
             return
         }
 
@@ -691,7 +744,7 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        recordingManager.saveToPhotoLibrary(url: url) { (success: Bool) in
+        recordingManager.saveToPhotoLibrary(url: url) { success in
             print("[RECORD] saveToPhotoLibrary:", success)
         }
     }
@@ -760,7 +813,7 @@ final class MainViewModel: ObservableObject {
             self.recordingManager.forceReset()
 
             await self.clearImageResources(
-                policy: .beforeOpenVideoLibrary
+                policy: .returnToCamera
             )
 
             await self.startCameraPreviewAsync()
@@ -806,9 +859,14 @@ final class MainViewModel: ObservableObject {
         }
 
         let delay = minEventInterval - elapsed
+        let nanoseconds = UInt64(delay * 1_000_000_000)
 
+        try? await Task.sleep(nanoseconds: nanoseconds)
+    }
+
+    private func sleepMilliseconds(_ milliseconds: UInt64) async {
         try? await Task.sleep(
-            nanoseconds: UInt64(delay * 1_000_000_000)
+            nanoseconds: milliseconds * 1_000_000
         )
     }
 
@@ -830,10 +888,11 @@ final class MainViewModel: ObservableObject {
             recordingManager.forceReset()
         }
 
-        detections = []
-        fps = 0
-        hardwareLabel = "MOCK"
-        hardwareColor = Color(white: 0.6)
+        if policy.clearTracking {
+            tracker.reset()
+            trailEffectEngine.clear()
+            trailOverlayView.debugBoundingBoxes = []
+        }
 
         effectMenuVisible = false
 
@@ -860,7 +919,10 @@ final class MainViewModel: ObservableObject {
 
         guard appMode != .recording &&
               appMode != .stoppingRecording else {
-            print("[CAMERA] preview start ignored during recording state:", appMode)
+            print(
+                "[CAMERA] preview start ignored during recording state:",
+                appMode
+            )
             return
         }
 
@@ -868,17 +930,15 @@ final class MainViewModel: ObservableObject {
         syncPublishedState()
 
         cameraManager.onFrame = { [weak self] buffer in
-            guard let self else {
-                return
-            }
+            let boxedBuffer = UncheckedSendableBox(value: buffer)
 
-            guard self.appMode == .cameraPreview ||
-                  self.appMode == .preparingRecording ||
-                  self.appMode == .recording else {
-                return
-            }
+            Task { @MainActor [weak self, boxedBuffer] in
+                guard let self else {
+                    return
+                }
 
-            self.inferenceEngine.processFrame(buffer)
+                self.handleCameraFrame(boxedBuffer.value)
+            }
         }
 
         let started = await cameraManager.requestPermissionAndStartAsync()
@@ -891,6 +951,16 @@ final class MainViewModel: ObservableObject {
         syncPublishedState()
     }
 
+    private func handleCameraFrame(_ buffer: CMSampleBuffer) {
+        guard appMode == .cameraPreview ||
+              appMode == .recording ||
+              appMode == .preparingRecording else {
+            return
+        }
+
+        inferenceEngine.processFrame(buffer)
+    }
+
     private func stopCameraForExternalPicker() async {
         cameraManager.onFrame = nil
         videoFrameSource.stop()
@@ -898,32 +968,18 @@ final class MainViewModel: ObservableObject {
         await cameraManager.stopForPickerAsync()
 
         await Task.yield()
-        try? await Task.sleep(for: .milliseconds(180))
+        await sleepMilliseconds(180)
     }
 
     // MARK: - UI Helpers
-
-    private func hardwareColor(for hw: InferenceHardware) -> Color {
-        switch hw {
-        case .npu:
-            return Color(hex: 0x00FF88)
-
-        case .gpu:
-            return Color(hex: 0x88AAFF)
-
-        case .cpu:
-            return Color(hex: 0xFFAA00)
-
-        case .mock:
-            return Color(white: 0.6)
-        }
-    }
 
     private func startHintAutoHide() {
         hintTask?.cancel()
 
         hintTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(3.5))
+            try? await Task.sleep(
+                nanoseconds: 3_500_000_000
+            )
 
             guard let self else {
                 return
@@ -939,7 +995,9 @@ final class MainViewModel: ObservableObject {
         pulseScale = 1.0
 
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(100))
+            try? await Task.sleep(
+                nanoseconds: 100_000_000
+            )
 
             guard let self else {
                 return
