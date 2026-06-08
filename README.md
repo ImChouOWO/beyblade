@@ -60,6 +60,8 @@ ios/BeyTail/
 └── UI/
     ├── ContentView.swift      ← 主畫面
     ├── EffectMenuView.swift   ← 特效選單
+    ├── VideoFrameSource.swift
+    ├── VideoPlayerView.swift
     └── MainViewModel.swift    ← 狀態管理
 唯一缺的是模型檔本身（.tflite 或 .mlmodel），要自己拖進 Xcode，程式碼裡已經寫好讀取邏輯。
 
