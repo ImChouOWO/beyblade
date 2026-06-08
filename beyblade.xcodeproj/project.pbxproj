@@ -10,9 +10,23 @@
 		EC2BCF1C2FD3F86B004986A9 /* beyblade.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = beyblade.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		EC2BCF532FD3FDF0004986A9 /* Exceptions for "beyblade" folder in "beyblade" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				BeyTail/Info.plist,
+				Info.plist,
+			);
+			target = EC2BCF1B2FD3F86B004986A9 /* beyblade */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		EC2BCF1E2FD3F86B004986A9 /* beyblade */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				EC2BCF532FD3FDF0004986A9 /* Exceptions for "beyblade" folder in "beyblade" target */,
+			);
 			path = beyblade;
 			sourceTree = "<group>";
 		};
@@ -246,10 +260,16 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = U64ZR9F464;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = beyblade/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要讀取相簿中的影片進行陀螺辨識";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -288,10 +308,16 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = U64ZR9F464;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = beyblade/Info.plist;
+				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要讀取相簿中的影片進行陀螺辨識";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;

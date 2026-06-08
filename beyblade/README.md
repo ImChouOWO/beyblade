@@ -40,7 +40,6 @@ Android 版移植的最簡結構，用於 iOS 開發參考。
 沒有 `.mlmodel` 時自動啟用，行為與 Android mock 相同（兩顆陀螺繞圈）。
 
 ## 主要架構
-```
 ios/BeyTail/
 ├── BeyTailApp.swift          ← App 進入點
 ├── Camera/
@@ -70,4 +69,4 @@ BeyTail/                     ← 拖到這裡
 ├── BeyTailApp.swift
 ├── Camera/
 ├── ML/
-```
+...
