@@ -36,13 +36,11 @@ final class CameraManager: NSObject {
     private var isConfigured = false
     private var isSessionRunning = false
 
-    private var activeCameraDevice: AVCaptureDevice?
-    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
-
-    private var lastAppliedRotationAngle: CGFloat = -1
-
     private let orientationLock = NSLock()
     private var _currentVisionImageOrientation: CGImagePropertyOrientation = .right
+
+    private var lastAppliedVideoAngle: CGFloat = -1
+    private var lastValidDeviceOrientation: UIDeviceOrientation = .portrait
 
     // MARK: - Init
 
@@ -65,6 +63,7 @@ final class CameraManager: NSObject {
     }
 
     @objc private func deviceOrientationDidChange() {
+        updateDeviceOrientationState()
         updateVideoRotation()
     }
 
@@ -198,6 +197,7 @@ final class CameraManager: NSObject {
             return
         }
 
+        updateDeviceOrientationState()
         applyCurrentVideoRotation(force: true)
 
         guard !session.isRunning else {
@@ -246,12 +246,6 @@ final class CameraManager: NSObject {
             print("[ERROR] Back camera not found.")
             return
         }
-
-        activeCameraDevice = device
-        rotationCoordinator = AVCaptureDevice.RotationCoordinator(
-            device: device,
-            previewLayer: nil
-        )
 
         guard addCameraInput(device) else {
             isConfigured = false
@@ -341,6 +335,7 @@ final class CameraManager: NSObject {
                 return
             }
 
+            self.updateDeviceOrientationState()
             self.applyCurrentVideoRotation(force: false)
         }
     }
@@ -360,23 +355,17 @@ final class CameraManager: NSObject {
         to connection: AVCaptureConnection,
         force: Bool
     ) {
-        guard let rotationCoordinator else {
-            return
-        }
-
-        let angle = rotationCoordinator.videoRotationAngleForHorizonLevelCapture
-
-        guard angle.isFinite else {
-            return
-        }
+        let angle = videoRotationAngle(
+            for: lastValidDeviceOrientation
+        )
 
         let visionOrientation = visionImageOrientation(
-            forRotationAngle: angle
+            for: lastValidDeviceOrientation
         )
 
         setCurrentVisionImageOrientation(visionOrientation)
 
-        guard force || angle != lastAppliedRotationAngle else {
+        guard force || angle != lastAppliedVideoAngle else {
             return
         }
 
@@ -386,18 +375,41 @@ final class CameraManager: NSObject {
         }
 
         connection.videoRotationAngle = angle
-        lastAppliedRotationAngle = angle
+        lastAppliedVideoAngle = angle
 
         if connection.isVideoMirroringSupported {
             connection.isVideoMirrored = false
         }
 
         print(
-            "[CAMERA] apply videoRotationAngle:",
+            "[CAMERA] deviceOrientation:",
+            lastValidDeviceOrientation.rawValue,
+            "videoRotationAngle:",
             angle,
             "visionOrientation:",
-            visionOrientation
+            visionOrientation.rawValue
         )
+    }
+
+    private func updateDeviceOrientationState() {
+        let orientation = UIDevice.current.orientation
+
+        switch orientation {
+        case .portrait,
+             .portraitUpsideDown,
+             .landscapeLeft,
+             .landscapeRight:
+            lastValidDeviceOrientation = orientation
+
+        default:
+            break
+        }
+
+        let visionOrientation = visionImageOrientation(
+            for: lastValidDeviceOrientation
+        )
+
+        setCurrentVisionImageOrientation(visionOrientation)
     }
 
     private func setCurrentVisionImageOrientation(
@@ -408,23 +420,55 @@ final class CameraManager: NSObject {
         orientationLock.unlock()
     }
 
+    private func videoRotationAngle(
+        for deviceOrientation: UIDeviceOrientation
+    ) -> CGFloat {
+        /*
+         後鏡頭常用對應：
+         portrait          -> 90
+         landscapeRight    -> 0
+         landscapeLeft     -> 180
+         portraitUpsideDown -> 270
+         */
+        switch deviceOrientation {
+        case .portrait:
+            return 90
+
+        case .landscapeRight:
+            return 0
+
+        case .landscapeLeft:
+            return 180
+
+        case .portraitUpsideDown:
+            return 270
+
+        default:
+            return 90
+        }
+    }
+
     private func visionImageOrientation(
-        forRotationAngle angle: CGFloat
+        for deviceOrientation: UIDeviceOrientation
     ) -> CGImagePropertyOrientation {
-        let rounded = Int(round(angle / 90.0)) * 90
-        let normalized = ((rounded % 360) + 360) % 360
-
-        switch normalized {
-        case 0:
-            return .up
-
-        case 90:
+        /*
+         後鏡頭 raw pixelBuffer 給 Vision 的常用對應：
+         portrait          -> .right
+         landscapeLeft     -> .up
+         landscapeRight    -> .down
+         portraitUpsideDown -> .left
+         */
+        switch deviceOrientation {
+        case .portrait:
             return .right
 
-        case 180:
+        case .landscapeLeft:
+            return .up
+
+        case .landscapeRight:
             return .down
 
-        case 270:
+        case .portraitUpsideDown:
             return .left
 
         default:
@@ -465,6 +509,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
+        updateDeviceOrientationState()
+
         applyCurrentVideoRotation(
             to: connection,
             force: false

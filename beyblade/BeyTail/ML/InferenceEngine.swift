@@ -33,13 +33,21 @@ final class InferenceEngine: @unchecked Sendable {
     private let nmsIoUThreshold: CGFloat = 0.35
     private let maxOutputDetections = 2
 
-    private let modelInputSize = CGSize(width: 640, height: 640)
+    /*
+     這個值代表 YOLO raw output bbox 座標的基準尺寸。
+     這版會優先從 CoreML input image constraint 自動讀取。
+     如果讀不到，會使用 640x640 fallback。
+     */
+    private var modelInputSize = CGSize(width: 320, height: 320)
 
     private let singleClassId = 0
 
+    private var didPrintModelDescription = false
+    private var didPrintFrameDebug = false
     private var didPrintRawOutputInfo = false
     private var didPrintFirstRows = false
     private var didPrintKeptRows = false
+    private var didPrintCoordinateDebug = false
 
     var onResult: (([DetectionResult]) -> Void)?
 
@@ -59,6 +67,13 @@ final class InferenceEngine: @unchecked Sendable {
                 let mlModel = try MLModel(
                     contentsOf: modelURL,
                     configuration: config
+                )
+
+                self.modelInputSize = Self.detectModelInputSize(from: mlModel)
+
+                Self.printModelDescriptionDebug(
+                    mlModel,
+                    resolvedModelInputSize: self.modelInputSize
                 )
 
                 let vnModel = try VNCoreMLModel(for: mlModel)
@@ -110,6 +125,119 @@ final class InferenceEngine: @unchecked Sendable {
         return request
     }
 
+    // MARK: - Model Debug
+
+    private static func detectModelInputSize(
+        from mlModel: MLModel
+    ) -> CGSize {
+        for input in mlModel.modelDescription.inputDescriptionsByName {
+            if let imageConstraint = input.value.imageConstraint {
+                let width = imageConstraint.pixelsWide
+                let height = imageConstraint.pixelsHigh
+
+                if width > 0,
+                   height > 0 {
+                    return CGSize(
+                        width: width,
+                        height: height
+                    )
+                }
+            }
+
+            if let multiArrayConstraint = input.value.multiArrayConstraint {
+                let shape = multiArrayConstraint.shape.map {
+                    $0.intValue
+                }
+
+                if shape.count >= 2 {
+                    let possibleHeight = shape[shape.count - 2]
+                    let possibleWidth = shape[shape.count - 1]
+
+                    if possibleWidth > 0,
+                       possibleHeight > 0 {
+                        return CGSize(
+                            width: possibleWidth,
+                            height: possibleHeight
+                        )
+                    }
+                }
+            }
+        }
+
+        return CGSize(width: 640, height: 640)
+    }
+
+    private static func printModelDescriptionDebug(
+        _ mlModel: MLModel,
+        resolvedModelInputSize: CGSize
+    ) {
+        print("========== [MODEL DESCRIPTION DEBUG] ==========")
+
+        print(
+            "[MODEL RESOLVED INPUT SIZE]",
+            "width:",
+            resolvedModelInputSize.width,
+            "height:",
+            resolvedModelInputSize.height
+        )
+
+        print("---------- [MODEL INPUTS] ----------")
+
+        for input in mlModel.modelDescription.inputDescriptionsByName {
+            print("[MODEL INPUT]", input.key)
+            print("[MODEL INPUT TYPE]", input.value.type.rawValue)
+
+            if let imageConstraint = input.value.imageConstraint {
+                print(
+                    "[MODEL INPUT IMAGE]",
+                    "width:",
+                    imageConstraint.pixelsWide,
+                    "height:",
+                    imageConstraint.pixelsHigh
+                )
+            }
+
+            if let multiArrayConstraint = input.value.multiArrayConstraint {
+                print(
+                    "[MODEL INPUT MULTIARRAY]",
+                    "shape:",
+                    multiArrayConstraint.shape,
+                    "dataType:",
+                    multiArrayConstraint.dataType.rawValue
+                )
+            }
+        }
+
+        print("---------- [MODEL OUTPUTS] ----------")
+
+        for output in mlModel.modelDescription.outputDescriptionsByName {
+            print("[MODEL OUTPUT]", output.key)
+            print("[MODEL OUTPUT TYPE]", output.value.type.rawValue)
+
+            if let imageConstraint = output.value.imageConstraint {
+                print(
+                    "[MODEL OUTPUT IMAGE]",
+                    "width:",
+                    imageConstraint.pixelsWide,
+                    "height:",
+                    imageConstraint.pixelsHigh
+                )
+            }
+
+            if let multiArrayConstraint = output.value.multiArrayConstraint {
+                print(
+                    "[MODEL OUTPUT MULTIARRAY]",
+                    "shape:",
+                    multiArrayConstraint.shape,
+                    "dataType:",
+                    multiArrayConstraint.dataType.rawValue
+                )
+            }
+        }
+
+        print("===============================================")
+    }
+
     // MARK: - Public API
 
     func start() {
@@ -153,6 +281,22 @@ final class InferenceEngine: @unchecked Sendable {
         let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
         let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
         let frameOrientation = orientation
+
+        if !didPrintFrameDebug {
+            didPrintFrameDebug = true
+
+            print(
+                "[FRAME DEBUG]",
+                "pixelBufferWidth:",
+                frameWidth,
+                "pixelBufferHeight:",
+                frameHeight,
+                "orientationRawValue:",
+                frameOrientation.rawValue,
+                "modelInputSize:",
+                modelInputSize
+            )
+        }
 
         let boxedPixelBuffer = InferenceUncheckedSendableBox(
             value: pixelBuffer
@@ -313,7 +457,7 @@ final class InferenceEngine: @unchecked Sendable {
                     "[WARN] output:",
                     feature.featureName,
                     "type:",
-                    feature.featureValue.type
+                    feature.featureValue.type.rawValue
                 )
 
                 if let array = feature.featureValue.multiArrayValue {
@@ -485,6 +629,7 @@ final class InferenceEngine: @unchecked Sendable {
 
             if !didPrintKeptRows, keptPrintCount < 5 {
                 keptPrintCount += 1
+
                 print(
                     "[KEEP]",
                     "x1:", x1Raw,
@@ -569,6 +714,23 @@ final class InferenceEngine: @unchecked Sendable {
             sourceFrameSize: sourceFrameSize
         )
 
+        if !didPrintCoordinateDebug {
+            didPrintCoordinateDebug = true
+
+            print(
+                "[COORD DEBUG]",
+                "raw:",
+                "x1:", rawX1,
+                "y1:", rawY1,
+                "x2:", rawX2,
+                "y2:", rawY2,
+                "maxCoordinate:", maxCoordinate,
+                "coordinateSpace:", coordinateSpace,
+                "modelInputSize:", modelInputSize,
+                "sourceFrameSize:", sourceFrameSize
+            )
+        }
+
         let normalized = normalizeYOLOCoordinates(
             x1: rawX1,
             y1: rawY1,
@@ -624,7 +786,7 @@ final class InferenceEngine: @unchecked Sendable {
             modelInputSize.height
         )
 
-        if maxCoordinate <= modelMax * 1.25 {
+        if maxCoordinate <= modelMax * 1.50 {
             return .modelInputPixel
         }
 
