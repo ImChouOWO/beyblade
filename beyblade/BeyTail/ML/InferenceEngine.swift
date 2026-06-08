@@ -8,9 +8,6 @@ private struct InferenceUncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
 }
 
-// 對應 Android InferenceEngine.kt
-// 有 CoreML 模型 → 真實推論
-// 無模型 → frame-driven mock 模式
 final class InferenceEngine: @unchecked Sendable {
 
     let isMockMode: Bool
@@ -30,17 +27,50 @@ final class InferenceEngine: @unchecked Sendable {
     private var lastFpsTime = CACurrentMediaTime()
     private(set) var currentFps: Float = 0
 
-    private let confidenceThreshold: Float = 0.35
-    private let nmsIoUThreshold: CGFloat = 0.45
+    private var activeFrameSize = CGSize(width: 1, height: 1)
 
     /*
-     如果你的模型是 YOLO 640x640 匯出的 raw output，
-     且輸出座標是 pixel 座標，這裡用 640 轉成 normalized 0...1。
-     如果輸出本來就是 normalized，程式會自動判斷不除以 640。
-     */
-    private let modelInputSize: CGFloat = 640.0
+     YOLOv10 standard output:
+     [1, 300, 6]
 
+     each row:
+     [x1, y1, x2, y2, confidence, classId]
+     */
+    private let confidenceThreshold: Float = 0.30
+    private let nmsIoUThreshold: CGFloat = 0.35
+    private let maxOutputDetections = 2
+
+    private let modelInputSize = CGSize(width: 640, height: 640)
+
+    /*
+     單類別多目標偵測。
+     若你的模型只有一類，classId 應為 0。
+     */
+    private let singleClassId = 0
+
+    /*
+     bbox 方向修正。
+
+     你目前 imageOrientation() = .right。
+     iPhone portrait camera 常見需要把 YOLO output 轉到 portrait overlay 座標。
+
+     測試順序：
+     1. rotateRight
+     2. rotateLeft
+     3. flipY
+     4. none
+     */
+    private enum BBoxOrientationMode {
+        case none
+        case rotateRight
+        case rotateLeft
+        case flipY
+    }
+
+    private let bboxOrientationMode: BBoxOrientationMode = .none
     private var didPrintRawOutputInfo = false
+    private var didPrintFirstRows = false
+    private var didPrintKeptRows = false
 
     var onResult: (([DetectionResult]) -> Void)?
 
@@ -106,6 +136,10 @@ final class InferenceEngine: @unchecked Sendable {
             completionHandler: onResult
         )
 
+        /*
+         scaleFill 代表 Vision 會把來源 frame 拉伸到模型輸入尺寸。
+         YOLOv10 raw bbox 若是 640x640 座標，會在後面除以 modelInputSize。
+         */
         request.imageCropAndScaleOption = .scaleFill
 
         return request
@@ -148,11 +182,18 @@ final class InferenceEngine: @unchecked Sendable {
             return
         }
 
+        let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
+
         let boxedPixelBuffer = InferenceUncheckedSendableBox(
             value: pixelBuffer
         )
 
-        inferenceQueue.async { [weak self, boxedPixelBuffer, request] in
+        let boxedRequest = InferenceUncheckedSendableBox(
+            value: request
+        )
+
+        inferenceQueue.async { [weak self, boxedPixelBuffer, boxedRequest] in
             guard let self else {
                 return
             }
@@ -163,6 +204,11 @@ final class InferenceEngine: @unchecked Sendable {
 
             self.isProcessing = true
 
+            self.activeFrameSize = CGSize(
+                width: frameWidth,
+                height: frameHeight
+            )
+
             let handler = VNImageRequestHandler(
                 cvPixelBuffer: boxedPixelBuffer.value,
                 orientation: self.imageOrientation(),
@@ -170,7 +216,7 @@ final class InferenceEngine: @unchecked Sendable {
             )
 
             do {
-                try handler.perform([request])
+                try handler.perform([boxedRequest.value])
             } catch {
                 print(
                     "[ERROR] VNImageRequestHandler perform failed:",
@@ -188,9 +234,9 @@ final class InferenceEngine: @unchecked Sendable {
 
     private func imageOrientation() -> CGImagePropertyOrientation {
         /*
-         目前先以 iPhone 直向 portrait 為主。
-         如果 bbox 方向錯誤，可嘗試：
-         .right / .left / .up / .down
+         iPhone portrait camera 常見是 .right。
+         如果 bbox 方向錯，可嘗試：
+         .up / .down / .left / .right
          */
         return .right
     }
@@ -244,13 +290,13 @@ final class InferenceEngine: @unchecked Sendable {
         }
     }
 
-    // MARK: - Vision Object Detector Output
+    // MARK: - VNRecognizedObjectObservation Output
 
     private func handleObjectObservations(
         _ objects: [VNRecognizedObjectObservation]
     ) {
         let detections = objects
-            .prefix(10)
+            .prefix(100)
             .compactMap { obs -> DetectionResult? in
                 let confidence: Float
 
@@ -267,10 +313,9 @@ final class InferenceEngine: @unchecked Sendable {
                 /*
                  VNRecognizedObjectObservation.boundingBox 是 normalized 0...1，
                  原點在左下角。
-
-                 DetectionResult / UI 使用左上座標，因此這裡翻轉 Y。
+                 UI / DetectionResult 使用左上角，因此這裡翻轉 Y。
                  */
-                let flipped = CGRect(
+                let rect = CGRect(
                     x: obs.boundingBox.minX,
                     y: 1.0 - obs.boundingBox.maxY,
                     width: obs.boundingBox.width,
@@ -278,21 +323,26 @@ final class InferenceEngine: @unchecked Sendable {
                 )
 
                 return DetectionResult(
-                    boundingBox: clampNormalizedRect(flipped),
+                    boundingBox: clampNormalizedRect(rect),
                     confidence: confidence,
                     fps: currentFps,
                     hardware: BeyTailInferenceHardware.npu,
                     trackId: 0,
-                    dominantColor: .white
+                    dominantColor: UIColor(hex: 0x00DDFF)
                 )
             }
 
-        DispatchQueue.main.async { [weak self, detections] in
-            self?.onResult?(detections)
+        let filtered = nonMaximumSuppression(
+            detections,
+            iouThreshold: nmsIoUThreshold
+        )
+
+        DispatchQueue.main.async { [weak self, filtered] in
+            self?.onResult?(filtered)
         }
     }
 
-    // MARK: - YOLO Raw Tensor Output
+    // MARK: - YOLOv10 Raw Tensor Output
 
     private func handleRawFeatureObservations(
         _ features: [VNCoreMLFeatureValueObservation]
@@ -300,7 +350,7 @@ final class InferenceEngine: @unchecked Sendable {
         if !didPrintRawOutputInfo {
             didPrintRawOutputInfo = true
 
-            print("[WARN] CoreML returned raw feature outputs. Decode as YOLO tensor.")
+            print("[WARN] CoreML returned raw feature outputs. Decode as YOLOv10 tensor.")
             print("[WARN] raw output count:", features.count)
 
             for feature in features {
@@ -326,10 +376,15 @@ final class InferenceEngine: @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 self?.onResult?([])
             }
+
             return
         }
 
-        let decoded = decodeYOLOOutput(array)
+        let decoded = decodeYOLOv10Output(
+            array,
+            sourceFrameSize: activeFrameSize
+        )
+
         let filtered = nonMaximumSuppression(
             decoded,
             iouThreshold: nmsIoUThreshold
@@ -340,25 +395,26 @@ final class InferenceEngine: @unchecked Sendable {
         }
     }
 
-    private func decodeYOLOOutput(
-        _ array: MLMultiArray
+    private enum YOLOOutputLayout {
+        case rowsFirst
+        case channelsFirst
+    }
+
+    private func decodeYOLOv10Output(
+        _ array: MLMultiArray,
+        sourceFrameSize: CGSize
     ) -> [DetectionResult] {
-        let shape = array.shape.map { $0.intValue }
+        let shape = array.shape.map {
+            $0.intValue
+        }
 
-        /*
-         目前你的模型輸出：
-         [1, 300, 6]
-
-         每一筆預期為：
-         [x1, y1, x2, y2, confidence, classId]
-         */
         guard shape.count == 3 else {
-            print("[ERROR] Unsupported YOLO output rank:", shape)
+            print("[ERROR] Unsupported YOLOv10 output rank:", shape)
             return []
         }
 
         guard shape[0] == 1 else {
-            print("[ERROR] Unsupported YOLO batch size:", shape)
+            print("[ERROR] Unsupported YOLOv10 batch size:", shape)
             return []
         }
 
@@ -375,75 +431,121 @@ final class InferenceEngine: @unchecked Sendable {
             valueCount = shape[1]
             layout = .channelsFirst
         } else {
-            print("[ERROR] Unsupported YOLO output shape:", shape)
+            print("[ERROR] Unsupported YOLOv10 output shape:", shape)
             return []
         }
 
         guard valueCount >= 6 else {
-            print("[ERROR] YOLO output value count < 6:", shape)
+            print("[ERROR] YOLOv10 output value count < 6:", shape)
             return []
         }
 
         var detections: [DetectionResult] = []
+        var keptPrintCount = 0
 
-        for index in 0..<rowCount {
-            let v0 = yoloValue(
+        for row in 0..<rowCount {
+            let x1Raw = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 0
             )
 
-            let v1 = yoloValue(
+            let y1Raw = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 1
             )
 
-            let v2 = yoloValue(
+            let x2Raw = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 2
             )
 
-            let v3 = yoloValue(
+            let y2Raw = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 3
             )
 
             let confidence = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 4
             )
 
             let classIdFloat = yoloValue(
                 array,
                 layout: layout,
-                row: index,
+                row: row,
                 col: 5
             )
+
+            if !didPrintFirstRows, row < 5 {
+                print(
+                    "[DEBUG] row:",
+                    row,
+                    "x1:", x1Raw,
+                    "y1:", y1Raw,
+                    "x2:", x2Raw,
+                    "y2:", y2Raw,
+                    "conf:", confidence,
+                    "class:", classIdFloat
+                )
+            }
+
+            guard x1Raw.isFinite,
+                  y1Raw.isFinite,
+                  x2Raw.isFinite,
+                  y2Raw.isFinite,
+                  confidence.isFinite,
+                  classIdFloat.isFinite else {
+                continue
+            }
 
             guard confidence >= confidenceThreshold else {
                 continue
             }
 
-            guard let rect = makeYOLOBoundingBox(
-                v0: v0,
-                v1: v1,
-                v2: v2,
-                v3: v3
+            let classId = Int(classIdFloat.rounded())
+
+            guard classId == singleClassId else {
+                continue
+            }
+
+            guard let rect = makeYOLOv10XYXYBoundingBox(
+                x1: x1Raw,
+                y1: y1Raw,
+                x2: x2Raw,
+                y2: y2Raw,
+                sourceFrameSize: sourceFrameSize
             ) else {
                 continue
             }
 
-            let classId = Int(classIdFloat.rounded())
-            let color = colorForClass(classId)
+            if !didPrintKeptRows, keptPrintCount < 5 {
+                keptPrintCount += 1
+                print(
+                    "[KEEP]",
+                    "x1:", x1Raw,
+                    "y1:", y1Raw,
+                    "x2:", x2Raw,
+                    "y2:", y2Raw,
+                    "conf:", confidence,
+                    "class:", classIdFloat,
+                    "mappedRect:", rect
+                )
+            }
+
+            /*
+             依你的要求：先不要做面積篩選。
+             所以這裡不使用 minBoxAreaRatio / maxBoxAreaRatio。
+             */
 
             let detection = DetectionResult(
                 boundingBox: rect,
@@ -451,18 +553,21 @@ final class InferenceEngine: @unchecked Sendable {
                 fps: currentFps,
                 hardware: BeyTailInferenceHardware.npu,
                 trackId: 0,
-                dominantColor: color
+                dominantColor: UIColor(hex: 0x00DDFF)
             )
 
             detections.append(detection)
         }
 
-        return detections
-    }
+        if !didPrintFirstRows {
+            didPrintFirstRows = true
+        }
 
-    private enum YOLOOutputLayout {
-        case rowsFirst
-        case channelsFirst
+        if !didPrintKeptRows, keptPrintCount > 0 {
+            didPrintKeptRows = true
+        }
+
+        return detections
     }
 
     private func yoloValue(
@@ -492,67 +597,63 @@ final class InferenceEngine: @unchecked Sendable {
         return array[indexes].floatValue
     }
 
-    private func makeYOLOBoundingBox(
-        v0: Float,
-        v1: Float,
-        v2: Float,
-        v3: Float
+    private func makeYOLOv10XYXYBoundingBox(
+        x1: Float,
+        y1: Float,
+        x2: Float,
+        y2: Float,
+        sourceFrameSize: CGSize
     ) -> CGRect? {
         /*
-         優先判斷為 xyxy：
+         標準 YOLOv10 格式：
          [x1, y1, x2, y2]
-         如果 x2 <= x1 或 y2 <= y1，再退回 cxcywh：
-         [cx, cy, w, h]
+
+         先轉成 normalized rect，再根據 bboxOrientationMode 做方向修正。
          */
 
-        let a = CGFloat(v0)
-        let b = CGFloat(v1)
-        let c = CGFloat(v2)
-        let d = CGFloat(v3)
+        let rawX1 = CGFloat(x1)
+        let rawY1 = CGFloat(y1)
+        let rawX2 = CGFloat(x2)
+        let rawY2 = CGFloat(y2)
 
         let maxCoordinate = max(
-            abs(a),
-            abs(b),
-            abs(c),
-            abs(d)
+            max(abs(rawX1), abs(rawY1)),
+            max(abs(rawX2), abs(rawY2))
         )
 
-        let divisor: CGFloat = maxCoordinate > 2.0 ? modelInputSize : 1.0
+        let coordinateSpace = inferCoordinateSpace(
+            maxCoordinate: maxCoordinate,
+            sourceFrameSize: sourceFrameSize
+        )
 
-        let x0 = a / divisor
-        let y0 = b / divisor
-        let x1 = c / divisor
-        let y1 = d / divisor
+        let normalized = normalizeYOLOCoordinates(
+            x1: rawX1,
+            y1: rawY1,
+            x2: rawX2,
+            y2: rawY2,
+            coordinateSpace: coordinateSpace,
+            sourceFrameSize: sourceFrameSize
+        )
 
-        let rect: CGRect
+        let nx1 = normalized.0
+        let ny1 = normalized.1
+        let nx2 = normalized.2
+        let ny2 = normalized.3
 
-        if x1 > x0, y1 > y0 {
-            rect = CGRect(
-                x: x0,
-                y: y0,
-                width: x1 - x0,
-                height: y1 - y0
-            )
-        } else {
-            let cx = a / divisor
-            let cy = b / divisor
-            let w = c / divisor
-            let h = d / divisor
-
-            guard w > 0,
-                  h > 0 else {
-                return nil
-            }
-
-            rect = CGRect(
-                x: cx - w / 2.0,
-                y: cy - h / 2.0,
-                width: w,
-                height: h
-            )
+        guard nx2 > nx1,
+              ny2 > ny1 else {
+            return nil
         }
 
-        let clamped = clampNormalizedRect(rect)
+        let rawRect = CGRect(
+            x: nx1,
+            y: ny1,
+            width: nx2 - nx1,
+            height: ny2 - ny1
+        )
+
+        let orientedRect = applyBBoxOrientation(rawRect)
+        let clamped = clampNormalizedRect(orientedRect)
 
         guard clamped.width > 0.001,
               clamped.height > 0.001 else {
@@ -562,13 +663,164 @@ final class InferenceEngine: @unchecked Sendable {
         return clamped
     }
 
+    private func applyBBoxOrientation(
+        _ rect: CGRect
+    ) -> CGRect {
+        switch bboxOrientationMode {
+        case .none:
+            return rect
+
+        case .flipY:
+            return CGRect(
+                x: rect.minX,
+                y: 1.0 - rect.maxY,
+                width: rect.width,
+                height: rect.height
+            )
+
+        case .rotateRight:
+            /*
+             normalized point transform:
+             old(x, y) -> new(1 - y, x)
+             */
+            let p1 = CGPoint(
+                x: 1.0 - rect.minY,
+                y: rect.minX
+            )
+
+            let p2 = CGPoint(
+                x: 1.0 - rect.maxY,
+                y: rect.maxX
+            )
+
+            return rectFromPoints(p1, p2)
+
+        case .rotateLeft:
+            /*
+             normalized point transform:
+             old(x, y) -> new(y, 1 - x)
+             */
+            let p1 = CGPoint(
+                x: rect.minY,
+                y: 1.0 - rect.minX
+            )
+
+            let p2 = CGPoint(
+                x: rect.maxY,
+                y: 1.0 - rect.maxX
+            )
+
+            return rectFromPoints(p1, p2)
+        }
+    }
+
+    private func rectFromPoints(
+        _ a: CGPoint,
+        _ b: CGPoint
+    ) -> CGRect {
+        let minX = min(a.x, b.x)
+        let minY = min(a.y, b.y)
+        let maxX = max(a.x, b.x)
+        let maxY = max(a.y, b.y)
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: maxX - minX,
+            height: maxY - minY
+        )
+    }
+
+    private enum YOLOCoordinateSpace {
+        case normalized
+        case modelInputPixel
+        case sourceFramePixel
+    }
+
+    private func inferCoordinateSpace(
+        maxCoordinate: CGFloat,
+        sourceFrameSize: CGSize
+    ) -> YOLOCoordinateSpace {
+        if maxCoordinate <= 2.0 {
+            return .normalized
+        }
+
+        let modelMax = max(
+            modelInputSize.width,
+            modelInputSize.height
+        )
+
+        if maxCoordinate <= modelMax * 1.25 {
+            return .modelInputPixel
+        }
+
+        return .sourceFramePixel
+    }
+
+    private func normalizeYOLOCoordinates(
+        x1: CGFloat,
+        y1: CGFloat,
+        x2: CGFloat,
+        y2: CGFloat,
+        coordinateSpace: YOLOCoordinateSpace,
+        sourceFrameSize: CGSize
+    ) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+        switch coordinateSpace {
+        case .normalized:
+            return (
+                x1,
+                y1,
+                x2,
+                y2
+            )
+
+        case .modelInputPixel:
+            return (
+                x1 / modelInputSize.width,
+                y1 / modelInputSize.height,
+                x2 / modelInputSize.width,
+                y2 / modelInputSize.height
+            )
+
+        case .sourceFramePixel:
+            let safeWidth = max(sourceFrameSize.width, 1.0)
+            let safeHeight = max(sourceFrameSize.height, 1.0)
+
+            return (
+                x1 / safeWidth,
+                y1 / safeHeight,
+                x2 / safeWidth,
+                y2 / safeHeight
+            )
+        }
+    }
+
     private func clampNormalizedRect(
         _ rect: CGRect
     ) -> CGRect {
-        let minX = clamp(rect.minX, lower: 0.0, upper: 1.0)
-        let minY = clamp(rect.minY, lower: 0.0, upper: 1.0)
-        let maxX = clamp(rect.maxX, lower: 0.0, upper: 1.0)
-        let maxY = clamp(rect.maxY, lower: 0.0, upper: 1.0)
+        let minX = clamp(
+            rect.minX,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let minY = clamp(
+            rect.minY,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let maxX = clamp(
+            rect.maxX,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let maxY = clamp(
+            rect.maxY,
+            lower: 0.0,
+            upper: 1.0
+        )
 
         return CGRect(
             x: minX,
@@ -584,22 +836,6 @@ final class InferenceEngine: @unchecked Sendable {
         upper: CGFloat
     ) -> CGFloat {
         min(max(value, lower), upper)
-    }
-
-    private func colorForClass(_ classId: Int) -> UIColor {
-        switch classId {
-        case 0:
-            return UIColor(hex: 0x00DDFF)
-
-        case 1:
-            return UIColor(hex: 0xFF00CC)
-
-        case 2:
-            return UIColor(hex: 0xFFD400)
-
-        default:
-            return .white
-        }
     }
 
     // MARK: - NMS
@@ -634,7 +870,7 @@ final class InferenceEngine: @unchecked Sendable {
             }
         }
 
-        return selected
+        return Array(selected.prefix(maxOutputDetections))
     }
 
     private func iou(

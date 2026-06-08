@@ -125,6 +125,22 @@ final class MainViewModel: ObservableObject {
     private var isStartingCameraPreview = false
     private var hasRequestedInitialCameraPreview = false
 
+    /*
+     最小修正重點：
+     記錄目前送進模型的 frame size，用於 aspectFill bbox 補償。
+
+     DetectionResult.boundingBox 仍維持 normalized 0...1。
+     但在送給 TrailOverlayView 前，會根據 source frame 與 overlay size
+     做 aspectFill crop offset 修正。
+     */
+    private var latestSourceFrameSize = CGSize(width: 1, height: 1)
+
+    /*
+     如果你發現修正後 bbox 反而偏移，可以先改成 false。
+     代表你的模型輸出可能已經是畫面顯示座標，不需要 aspectFill 補償。
+     */
+    private let enableAspectFillBBoxMapping = false
+
     // MARK: - Init
 
     init() {
@@ -368,19 +384,28 @@ final class MainViewModel: ObservableObject {
             hardwareColor = colorForHardware(first.hardware)
         }
 
-        trailOverlayView.debugBoundingBoxes = tracked.map {
-            ($0.boundingBox, $0.trackId)
+        /*
+         最小修正：
+         不改 DetectionResult、不改 TrailOverlayView。
+         只在寫入 overlay 前，把 bbox 做 aspectFill 顯示座標映射。
+         */
+        let mappedResults = tracked.map {
+            mapDetectionToOverlaySpace($0)
         }
 
-        for detection in tracked {
-            guard detection.trackId > 0 else {
+        trailOverlayView.debugBoundingBoxes = mappedResults.map {
+            ($0.displayRect, $0.trackId)
+        }
+
+        for result in mappedResults {
+            guard result.trackId > 0 else {
                 continue
             }
 
             trailEffectEngine.addPoint(
-                trackId: detection.trackId,
-                center: detection.center,
-                color: detection.dominantColor
+                trackId: result.trackId,
+                center: result.displayCenter,
+                color: result.color
             )
         }
     }
@@ -399,6 +424,188 @@ final class MainViewModel: ObservableObject {
         case .mock:
             return Color(white: 0.6)
         }
+    }
+
+    // MARK: - AspectFill BBox Mapping
+
+    private struct DisplayDetection {
+        let displayRect: CGRect
+        let displayCenter: CGPoint
+        let trackId: Int
+        let color: UIColor
+    }
+
+    private func mapDetectionToOverlaySpace(
+        _ detection: DetectionResult
+    ) -> DisplayDetection {
+        let mappedRect = mapNormalizedRectToAspectFillOverlay(
+            detection.boundingBox
+        )
+
+        return DisplayDetection(
+            displayRect: mappedRect,
+            displayCenter: CGPoint(
+                x: mappedRect.midX,
+                y: mappedRect.midY
+            ),
+            trackId: detection.trackId,
+            color: detection.dominantColor
+        )
+    }
+
+    private func mapNormalizedRectToAspectFillOverlay(
+        _ normalizedRect: CGRect
+    ) -> CGRect {
+        guard enableAspectFillBBoxMapping else {
+            return clampNormalizedRect(normalizedRect)
+        }
+
+        let overlaySize = trailOverlayView.bounds.size
+
+        guard overlaySize.width > 1,
+              overlaySize.height > 1,
+              latestSourceFrameSize.width > 1,
+              latestSourceFrameSize.height > 1 else {
+            return clampNormalizedRect(normalizedRect)
+        }
+
+        let sourceSize = orientedSourceSizeForCurrentOverlay(
+            rawSourceSize: latestSourceFrameSize,
+            overlaySize: overlaySize
+        )
+
+        let scale = max(
+            overlaySize.width / sourceSize.width,
+            overlaySize.height / sourceSize.height
+        )
+
+        let scaledWidth = sourceSize.width * scale
+        let scaledHeight = sourceSize.height * scale
+
+        let offsetX = (overlaySize.width - scaledWidth) / 2.0
+        let offsetY = (overlaySize.height - scaledHeight) / 2.0
+
+        let sourceRect = CGRect(
+            x: normalizedRect.minX * sourceSize.width,
+            y: normalizedRect.minY * sourceSize.height,
+            width: normalizedRect.width * sourceSize.width,
+            height: normalizedRect.height * sourceSize.height
+        )
+
+        let displayRect = CGRect(
+            x: sourceRect.minX * scale + offsetX,
+            y: sourceRect.minY * scale + offsetY,
+            width: sourceRect.width * scale,
+            height: sourceRect.height * scale
+        )
+
+        let normalizedDisplayRect = CGRect(
+            x: displayRect.minX / overlaySize.width,
+            y: displayRect.minY / overlaySize.height,
+            width: displayRect.width / overlaySize.width,
+            height: displayRect.height / overlaySize.height
+        )
+
+        return clampNormalizedRect(normalizedDisplayRect)
+    }
+
+    private func orientedSourceSizeForCurrentOverlay(
+        rawSourceSize: CGSize,
+        overlaySize: CGSize
+    ) -> CGSize {
+        /*
+         AVCaptureVideoDataOutput 的 pixelBuffer 常見是 landscape：
+         1920x1080 / 1280x720。
+
+         但 iPhone portrait 預覽通常是 portrait。
+         若 overlay 是 portrait 而 source 是 landscape，這裡交換寬高，
+         避免 aspectFill 計算使用錯誤的比例。
+         */
+        let overlayIsPortrait = overlaySize.height >= overlaySize.width
+        let sourceIsLandscape = rawSourceSize.width > rawSourceSize.height
+
+        if overlayIsPortrait && sourceIsLandscape {
+            return CGSize(
+                width: rawSourceSize.height,
+                height: rawSourceSize.width
+            )
+        }
+
+        let overlayIsLandscape = overlaySize.width > overlaySize.height
+        let sourceIsPortrait = rawSourceSize.height > rawSourceSize.width
+
+        if overlayIsLandscape && sourceIsPortrait {
+            return CGSize(
+                width: rawSourceSize.height,
+                height: rawSourceSize.width
+            )
+        }
+
+        return rawSourceSize
+    }
+
+    private func clampNormalizedRect(
+        _ rect: CGRect
+    ) -> CGRect {
+        let minX = clamp(
+            rect.minX,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let minY = clamp(
+            rect.minY,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let maxX = clamp(
+            rect.maxX,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        let maxY = clamp(
+            rect.maxY,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0, maxX - minX),
+            height: max(0.0, maxY - minY)
+        )
+    }
+
+    private func clamp(
+        _ value: CGFloat,
+        lower: CGFloat,
+        upper: CGFloat
+    ) -> CGFloat {
+        min(max(value, lower), upper)
+    }
+
+    private func updateLatestSourceFrameSize(
+        from buffer: CMSampleBuffer
+    ) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else {
+            return
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        guard width > 0,
+              height > 0 else {
+            return
+        }
+
+        latestSourceFrameSize = CGSize(
+            width: width,
+            height: height
+        )
     }
 
     // MARK: - Video Picker Event
@@ -614,6 +821,7 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        updateLatestSourceFrameSize(from: buffer)
         inferenceEngine.processFrame(buffer)
     }
 
@@ -958,6 +1166,7 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        updateLatestSourceFrameSize(from: buffer)
         inferenceEngine.processFrame(buffer)
     }
 
