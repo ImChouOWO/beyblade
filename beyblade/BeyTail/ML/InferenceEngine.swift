@@ -8,13 +8,23 @@ import UIKit
 // 無模型 → frame-driven mock 模式
 //
 // 重要：
-// 舊版 mock 使用 Timer 連續輸出結果，會造成影片結束後仍持續 inference。
-// 這版改為只有 processFrame(...) 被呼叫時才產生 mock 結果。
+// 1. mock 不使用 Timer，只在 processFrame(...) 被呼叫時輸出結果。
+// 2. 真實模型使用 Vision + CoreML。
+// 3. 若 CoreML 輸出不是 VNRecognizedObjectObservation，會先印出 raw output 資訊。
 final class InferenceEngine: @unchecked Sendable {
 
     let isMockMode: Bool
 
+    private let modelName: String
     private var model: VNCoreMLModel?
+    private var request: VNCoreMLRequest?
+
+    private let inferenceQueue = DispatchQueue(
+        label: "com.beytail.inference.engine",
+        qos: .userInitiated
+    )
+
+    private var isProcessing = false
 
     private var frameCount = 0
     private var lastFpsTime = CACurrentMediaTime()
@@ -24,23 +34,69 @@ final class InferenceEngine: @unchecked Sendable {
 
     // MARK: - Init
 
-    init() {
-        if let modelURL = Bundle.main.url(
-            forResource: "beyblade_detector",
-            withExtension: "mlmodelc"
-        ),
-           let mlModel = try? MLModel(contentsOf: modelURL),
-           let vnModel = try? VNCoreMLModel(for: mlModel) {
+    init(modelName: String = "best") {
+        self.modelName = modelName
 
-            model = vnModel
-            isMockMode = false
-            print("[INFO] CoreML model loaded:", modelURL.lastPathComponent)
+        if let modelURL = Bundle.main.url(
+            forResource: modelName,
+            withExtension: "mlmodelc"
+        ) {
+            do {
+                let config = MLModelConfiguration()
+                config.computeUnits = .all
+
+                let mlModel = try MLModel(
+                    contentsOf: modelURL,
+                    configuration: config
+                )
+
+                let vnModel = try VNCoreMLModel(for: mlModel)
+
+                self.model = vnModel
+                self.isMockMode = false
+
+                self.request = Self.makeRequest(
+                    model: vnModel,
+                    onResult: { [weak self] request, error in
+                        self?.handleVisionResult(
+                            request: request,
+                            error: error
+                        )
+                    }
+                )
+
+                print("[INFO] CoreML model loaded:", modelURL.lastPathComponent)
+
+            } catch {
+                self.model = nil
+                self.request = nil
+                self.isMockMode = true
+
+                print("[ERROR] CoreML model load failed:", error.localizedDescription)
+                print("[INFO] Use frame-driven MOCK mode:", modelName)
+            }
 
         } else {
-            model = nil
-            isMockMode = true
-            print("[INFO] CoreML model not found. Use frame-driven MOCK mode.")
+            self.model = nil
+            self.request = nil
+            self.isMockMode = true
+
+            print("[INFO] CoreML model not found. Use frame-driven MOCK mode:", modelName)
         }
+    }
+
+    private static func makeRequest(
+        model: VNCoreMLModel,
+        onResult: @escaping (VNRequest, Error?) -> Void
+    ) -> VNCoreMLRequest {
+        let request = VNCoreMLRequest(
+            model: model,
+            completionHandler: onResult
+        )
+
+        request.imageCropAndScaleOption = .scaleFill
+
+        return request
     }
 
     // MARK: - Public API
@@ -48,11 +104,20 @@ final class InferenceEngine: @unchecked Sendable {
     func start() {
         if isMockMode {
             print("[INFO] InferenceEngine mock mode enabled. No Timer is used.")
+        } else {
+            print("[INFO] InferenceEngine started:", modelName)
         }
     }
 
     func stop() {
-        // Frame-driven mock 不需要 Timer，因此這裡不做額外工作。
+        inferenceQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            self.isProcessing = false
+        }
+
         print("[INFO] InferenceEngine stop")
     }
 
@@ -63,35 +128,124 @@ final class InferenceEngine: @unchecked Sendable {
             return
         }
 
-        guard let model else {
-            return
-        }
-
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             print("[WARN] Cannot get pixelBuffer from sampleBuffer.")
             return
         }
 
-        let request = VNCoreMLRequest(model: model) { [weak self] request, error in
-            guard let self else { return }
+        guard let request else {
+            return
+        }
 
-            if let error {
-                print("[ERROR] Vision request failed:", error.localizedDescription)
+        inferenceQueue.async { [weak self, pixelBuffer, request] in
+            guard let self else {
                 return
             }
 
-            guard let results = request.results as? [VNRecognizedObjectObservation] else {
+            if self.isProcessing {
+                return
+            }
+
+            self.isProcessing = true
+
+            let handler = VNImageRequestHandler(
+                cvPixelBuffer: pixelBuffer,
+                orientation: self.imageOrientation(),
+                options: [:]
+            )
+
+            do {
+                try handler.perform([request])
+            } catch {
+                print("[ERROR] VNImageRequestHandler perform failed:", error.localizedDescription)
+
+                self.isProcessing = false
+
                 DispatchQueue.main.async {
                     self.onResult?([])
                 }
-                return
+            }
+        }
+    }
+
+    private func imageOrientation() -> CGImagePropertyOrientation {
+        /*
+         目前先以 iPhone 直向 portrait 為主。
+         如果畫面 bbox 旋轉或方向錯誤，通常要在這裡調整：
+         .right / .left / .up / .down
+         */
+        return .right
+    }
+
+    // MARK: - Vision Result
+
+    private func handleVisionResult(
+        request: VNRequest,
+        error: Error?
+    ) {
+        defer {
+            inferenceQueue.async { [weak self] in
+                self?.isProcessing = false
+            }
+        }
+
+        if let error {
+            print("[ERROR] Vision request failed:", error.localizedDescription)
+
+            DispatchQueue.main.async { [weak self] in
+                self?.onResult?([])
             }
 
-            self.updateFps()
+            return
+        }
 
-            let detections = results.prefix(10).map { obs -> DetectionResult in
-                // VNRecognizedObjectObservation.boundingBox 是左下原點。
-                // UI / CoreGraphics 常用左上原點，所以翻轉 Y。
+        updateFps()
+
+        guard let results = request.results else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onResult?([])
+            }
+
+            return
+        }
+
+        if let objects = results as? [VNRecognizedObjectObservation] {
+            handleObjectObservations(objects)
+            return
+        }
+
+        if let features = results as? [VNCoreMLFeatureValueObservation] {
+            handleRawFeatureObservations(features)
+            return
+        }
+
+        print("[WARN] Unsupported Vision result type:", type(of: results.first))
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onResult?([])
+        }
+    }
+
+    private func handleObjectObservations(
+        _ objects: [VNRecognizedObjectObservation]
+    ) {
+        let detections = objects
+            .prefix(10)
+            .compactMap { obs -> DetectionResult? in
+                let confidence: Float
+
+                if let bestLabel = obs.labels.first {
+                    confidence = bestLabel.confidence
+                } else {
+                    confidence = obs.confidence
+                }
+
+                /*
+                 VNRecognizedObjectObservation.boundingBox 是 normalized 0...1，
+                 且座標原點在左下角。
+
+                 目前 DetectionResult / UI 使用左上座標，因此這裡翻轉 Y。
+                 */
                 let flipped = CGRect(
                     x: obs.boundingBox.minX,
                     y: 1.0 - obs.boundingBox.maxY,
@@ -101,32 +255,56 @@ final class InferenceEngine: @unchecked Sendable {
 
                 return DetectionResult(
                     boundingBox: flipped,
-                    confidence: obs.confidence,
-                    fps: self.currentFps,
+                    confidence: confidence,
+                    fps: currentFps,
                     hardware: .npu,
-                    dominantColor: self.sampleColor(
-                        pixelBuffer: pixelBuffer,
-                        normRect: flipped
-                    )
+                    trackId: 0,
+                    dominantColor: .white
                 )
             }
 
-            DispatchQueue.main.async {
-                self.onResult?(detections)
+        DispatchQueue.main.async { [weak self, detections] in
+            self?.onResult?(detections)
+        }
+    }
+
+    private func handleRawFeatureObservations(
+        _ features: [VNCoreMLFeatureValueObservation]
+    ) {
+        /*
+         如果你看到這個 log，代表 CoreML 模型不是 Vision Object Detector 格式，
+         可能是 YOLOv10 raw tensor output。
+
+         這種情況下一步要做 YOLOv10 output decode：
+         1. 讀 MLMultiArray
+         2. 解析 box / confidence / class
+         3. 做 threshold
+         4. 必要時做 NMS
+         */
+
+        print("[WARN] CoreML returned raw feature outputs. Need YOLO tensor decode.")
+        print("[WARN] raw output count:", features.count)
+
+        for feature in features {
+            print(
+                "[WARN] output:",
+                feature.featureName,
+                "type:",
+                feature.featureValue.type
+            )
+
+            if let array = feature.featureValue.multiArrayValue {
+                print(
+                    "[WARN] MLMultiArray shape:",
+                    array.shape,
+                    "dataType:",
+                    array.dataType.rawValue
+                )
             }
         }
 
-        request.imageCropAndScaleOption = .scaleFill
-
-        let handler = VNImageRequestHandler(
-            cvPixelBuffer: pixelBuffer,
-            orientation: .up
-        )
-
-        do {
-            try handler.perform([request])
-        } catch {
-            print("[ERROR] VNImageRequestHandler perform failed:", error.localizedDescription)
+        DispatchQueue.main.async { [weak self] in
+            self?.onResult?([])
         }
     }
 
@@ -178,6 +356,7 @@ final class InferenceEngine: @unchecked Sendable {
                 confidence: 0.95,
                 fps: fps,
                 hardware: .mock,
+                trackId: 0,
                 dominantColor: UIColor(hex: 0x00DDFF)
             ),
             DetectionResult(
@@ -190,81 +369,13 @@ final class InferenceEngine: @unchecked Sendable {
                 confidence: 0.91,
                 fps: fps,
                 hardware: .mock,
+                trackId: 1,
                 dominantColor: UIColor(hex: 0xFF00CC)
             )
         ]
 
-        DispatchQueue.main.async {
-            self.onResult?(detections)
+        DispatchQueue.main.async { [weak self, detections] in
+            self?.onResult?(detections)
         }
-    }
-
-    // MARK: - Color Sampling
-
-    private func sampleColor(
-        pixelBuffer: CVPixelBuffer,
-        normRect: CGRect
-    ) -> UIColor {
-
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-
-        defer {
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
-        }
-
-        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
-            return .white
-        }
-
-        let w = CVPixelBufferGetWidth(pixelBuffer)
-        let h = CVPixelBufferGetHeight(pixelBuffer)
-        let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let buf = base.assumingMemoryBound(to: UInt8.self)
-
-        let x0 = max(0, min(w - 1, Int(normRect.minX * CGFloat(w))))
-        let y0 = max(0, min(h - 1, Int(normRect.minY * CGFloat(h))))
-        let x1 = max(0, min(w, Int(normRect.maxX * CGFloat(w))))
-        let y1 = max(0, min(h, Int(normRect.maxY * CGFloat(h))))
-
-        guard x1 > x0, y1 > y0 else {
-            return .white
-        }
-
-        let step = max(1, (x1 - x0) / 5)
-
-        var rSum = 0
-        var gSum = 0
-        var bSum = 0
-        var n = 0
-
-        var y = y0
-        while y < y1 {
-            var x = x0
-
-            while x < x1 {
-                let off = y * rowBytes + x * 4
-
-                // 32BGRA 記憶體順序通常是 B, G, R, A
-                bSum += Int(buf[off])
-                gSum += Int(buf[off + 1])
-                rSum += Int(buf[off + 2])
-
-                n += 1
-                x += step
-            }
-
-            y += step
-        }
-
-        guard n > 0 else {
-            return .white
-        }
-
-        return UIColor(
-            red: CGFloat(rSum / n) / 255.0,
-            green: CGFloat(gSum / n) / 255.0,
-            blue: CGFloat(bSum / n) / 255.0,
-            alpha: 1.0
-        )
     }
 }

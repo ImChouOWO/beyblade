@@ -32,6 +32,7 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var canReturnToCamera = false
 
     @Published private(set) var loadingText = ""
+    @Published private(set) var detections: [DetectionResult] = []
 
     // MARK: - Components
 
@@ -40,6 +41,7 @@ final class MainViewModel: ObservableObject {
     let trailOverlayView  = TrailOverlayView()
     let videoFrameSource  = VideoFrameSource()
     let recordingManager  = RecordingManager()
+    let inferenceEngine = InferenceEngine(modelName: "best")
 
     // MARK: - Event State
 
@@ -116,11 +118,13 @@ final class MainViewModel: ObservableObject {
         trailOverlayView.currentEffect = selectedEffect
 
         videoFrameSource.onEnded = { [weak self] in
-            guard let self else {
-                return
-            }
+            Task { @MainActor [weak self] in
+                guard let self else {
+                    return
+                }
 
-            self.handleVideoEnded()
+                self.handleVideoEnded()
+            }
         }
 
         recordingManager.onStarted = { [weak self] success in
@@ -143,7 +147,42 @@ final class MainViewModel: ObservableObject {
             }
         }
 
+        inferenceEngine.onResult = { [weak self] detections in
+            Task { @MainActor [weak self, detections] in
+                guard let self else {
+                    return
+                }
+
+                self.handleDetectorDetections(detections)
+            }
+        }
+
         syncPublishedState()
+    }
+
+    // MARK: - Detection
+
+    private func handleDetectorDetections(_ detections: [DetectionResult]) {
+        self.detections = detections
+
+        guard let first = detections.first else {
+            fps = 0
+            hardwareLabel = "NPU"
+            hardwareColor = hardwareColor(for: .npu)
+            return
+        }
+
+        fps = Int(first.fps)
+        hardwareLabel = first.hardware.rawValue
+        hardwareColor = hardwareColor(for: first.hardware)
+
+        print(
+            "[DETECT]",
+            "conf:",
+            first.confidence,
+            "box:",
+            first.boundingBox
+        )
     }
 
     // MARK: - Published State Sync
@@ -287,11 +326,8 @@ final class MainViewModel: ObservableObject {
         startPulse()
         startHintAutoHide()
 
-        /*
-         第 4 步重點：
-         App 啟動時只啟動攝影機預覽，不啟動錄影。
-         */
         startCameraPreview()
+        inferenceEngine.start()
     }
 
     func stop() {
@@ -316,6 +352,11 @@ final class MainViewModel: ObservableObject {
 
         recordingManager.forceReset()
 
+        detections = []
+        fps = 0
+        hardwareLabel = "MOCK"
+        hardwareColor = Color(white: 0.6)
+        inferenceEngine.stop()
         appMode = .stopped
     }
 
@@ -459,18 +500,22 @@ final class MainViewModel: ObservableObject {
                 url: url,
                 autoPlay: true,
                 onReady: { [weak self] in
-                    guard let self else {
-                        return
-                    }
+                    Task { @MainActor [weak self] in
+                        guard let self else {
+                            return
+                        }
 
-                    self.handleVideoReady()
+                        self.handleVideoReady()
+                    }
                 },
                 onFailed: { [weak self] message in
-                    guard let self else {
-                        return
-                    }
+                    Task { @MainActor [weak self, message] in
+                        guard let self else {
+                            return
+                        }
 
-                    self.handleVideoLoadFailed(message: message)
+                        self.handleVideoLoadFailed(message: message)
+                    }
                 }
             )
         }
@@ -519,10 +564,7 @@ final class MainViewModel: ObservableObject {
     }
 
     private func handleVideoFrame(_ buffer: CMSampleBuffer) {
-        /*
-         預留模型偵測接口。
-         第 4 步不處理模型推論。
-         */
+        inferenceEngine.processFrame(buffer)
     }
 
     // MARK: - Recording Event
@@ -788,6 +830,11 @@ final class MainViewModel: ObservableObject {
             recordingManager.forceReset()
         }
 
+        detections = []
+        fps = 0
+        hardwareLabel = "MOCK"
+        hardwareColor = Color(white: 0.6)
+
         effectMenuVisible = false
 
         await Task.yield()
@@ -820,13 +867,20 @@ final class MainViewModel: ObservableObject {
         isStartingCameraPreview = true
         syncPublishedState()
 
-        cameraManager.onFrame = nil
+        cameraManager.onFrame = { [weak self] buffer in
+            guard let self else {
+                return
+            }
 
-        /*
-         第 4 步重點：
-         只啟動 camera session 作為預覽來源。
-         不呼叫 recordingManager.startRecording()。
-         */
+            guard self.appMode == .cameraPreview ||
+                  self.appMode == .preparingRecording ||
+                  self.appMode == .recording else {
+                return
+            }
+
+            self.inferenceEngine.processFrame(buffer)
+        }
+
         let started = await cameraManager.requestPermissionAndStartAsync()
 
         if !started {
@@ -848,6 +902,22 @@ final class MainViewModel: ObservableObject {
     }
 
     // MARK: - UI Helpers
+
+    private func hardwareColor(for hw: InferenceHardware) -> Color {
+        switch hw {
+        case .npu:
+            return Color(hex: 0x00FF88)
+
+        case .gpu:
+            return Color(hex: 0x88AAFF)
+
+        case .cpu:
+            return Color(hex: 0xFFAA00)
+
+        case .mock:
+            return Color(white: 0.6)
+        }
+    }
 
     private func startHintAutoHide() {
         hintTask?.cancel()
