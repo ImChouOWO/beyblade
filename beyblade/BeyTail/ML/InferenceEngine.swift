@@ -30,6 +30,18 @@ final class InferenceEngine: @unchecked Sendable {
     private var lastFpsTime = CACurrentMediaTime()
     private(set) var currentFps: Float = 0
 
+    private let confidenceThreshold: Float = 0.35
+    private let nmsIoUThreshold: CGFloat = 0.45
+
+    /*
+     如果你的模型是 YOLO 640x640 匯出的 raw output，
+     且輸出座標是 pixel 座標，這裡用 640 轉成 normalized 0...1。
+     如果輸出本來就是 normalized，程式會自動判斷不除以 640。
+     */
+    private let modelInputSize: CGFloat = 640.0
+
+    private var didPrintRawOutputInfo = false
+
     var onResult: (([DetectionResult]) -> Void)?
 
     // MARK: - Init
@@ -136,7 +148,9 @@ final class InferenceEngine: @unchecked Sendable {
             return
         }
 
-        let boxedPixelBuffer = InferenceUncheckedSendableBox(value: pixelBuffer)
+        let boxedPixelBuffer = InferenceUncheckedSendableBox(
+            value: pixelBuffer
+        )
 
         inferenceQueue.async { [weak self, boxedPixelBuffer, request] in
             guard let self else {
@@ -158,7 +172,10 @@ final class InferenceEngine: @unchecked Sendable {
             do {
                 try handler.perform([request])
             } catch {
-                print("[ERROR] VNImageRequestHandler perform failed:", error.localizedDescription)
+                print(
+                    "[ERROR] VNImageRequestHandler perform failed:",
+                    error.localizedDescription
+                )
 
                 self.isProcessing = false
 
@@ -172,7 +189,7 @@ final class InferenceEngine: @unchecked Sendable {
     private func imageOrientation() -> CGImagePropertyOrientation {
         /*
          目前先以 iPhone 直向 portrait 為主。
-         如果 bbox 旋轉或方向錯誤，可嘗試：
+         如果 bbox 方向錯誤，可嘗試：
          .right / .left / .up / .down
          */
         return .right
@@ -227,6 +244,8 @@ final class InferenceEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - Vision Object Detector Output
+
     private func handleObjectObservations(
         _ objects: [VNRecognizedObjectObservation]
     ) {
@@ -239,6 +258,10 @@ final class InferenceEngine: @unchecked Sendable {
                     confidence = bestLabel.confidence
                 } else {
                     confidence = obs.confidence
+                }
+
+                guard confidence >= confidenceThreshold else {
+                    return nil
                 }
 
                 /*
@@ -255,7 +278,7 @@ final class InferenceEngine: @unchecked Sendable {
                 )
 
                 return DetectionResult(
-                    boundingBox: flipped,
+                    boundingBox: clampNormalizedRect(flipped),
                     confidence: confidence,
                     fps: currentFps,
                     hardware: BeyTailInferenceHardware.npu,
@@ -269,44 +292,371 @@ final class InferenceEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - YOLO Raw Tensor Output
+
     private func handleRawFeatureObservations(
         _ features: [VNCoreMLFeatureValueObservation]
     ) {
-        /*
-         如果看到這個 log，代表 CoreML 模型不是 Vision Object Detector 格式，
-         可能是 YOLO raw tensor output。
+        if !didPrintRawOutputInfo {
+            didPrintRawOutputInfo = true
 
-         下一步需要補 YOLO output decode：
-         1. 讀取 MLMultiArray
-         2. 解析 bbox / confidence / class
-         3. threshold
-         4. NMS
-         */
+            print("[WARN] CoreML returned raw feature outputs. Decode as YOLO tensor.")
+            print("[WARN] raw output count:", features.count)
 
-        print("[WARN] CoreML returned raw feature outputs. Need YOLO tensor decode.")
-        print("[WARN] raw output count:", features.count)
-
-        for feature in features {
-            print(
-                "[WARN] output:",
-                feature.featureName,
-                "type:",
-                feature.featureValue.type
-            )
-
-            if let array = feature.featureValue.multiArrayValue {
+            for feature in features {
                 print(
-                    "[WARN] MLMultiArray shape:",
-                    array.shape,
-                    "dataType:",
-                    array.dataType.rawValue
+                    "[WARN] output:",
+                    feature.featureName,
+                    "type:",
+                    feature.featureValue.type
                 )
+
+                if let array = feature.featureValue.multiArrayValue {
+                    print(
+                        "[WARN] MLMultiArray shape:",
+                        array.shape,
+                        "dataType:",
+                        array.dataType.rawValue
+                    )
+                }
             }
         }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.onResult?([])
+        guard let array = features.first?.featureValue.multiArrayValue else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onResult?([])
+            }
+            return
         }
+
+        let decoded = decodeYOLOOutput(array)
+        let filtered = nonMaximumSuppression(
+            decoded,
+            iouThreshold: nmsIoUThreshold
+        )
+
+        DispatchQueue.main.async { [weak self, filtered] in
+            self?.onResult?(filtered)
+        }
+    }
+
+    private func decodeYOLOOutput(
+        _ array: MLMultiArray
+    ) -> [DetectionResult] {
+        let shape = array.shape.map { $0.intValue }
+
+        /*
+         目前你的模型輸出：
+         [1, 300, 6]
+
+         每一筆預期為：
+         [x1, y1, x2, y2, confidence, classId]
+         */
+        guard shape.count == 3 else {
+            print("[ERROR] Unsupported YOLO output rank:", shape)
+            return []
+        }
+
+        guard shape[0] == 1 else {
+            print("[ERROR] Unsupported YOLO batch size:", shape)
+            return []
+        }
+
+        let rowCount: Int
+        let valueCount: Int
+        let layout: YOLOOutputLayout
+
+        if shape[2] >= 6 {
+            rowCount = shape[1]
+            valueCount = shape[2]
+            layout = .rowsFirst
+        } else if shape[1] >= 6 {
+            rowCount = shape[2]
+            valueCount = shape[1]
+            layout = .channelsFirst
+        } else {
+            print("[ERROR] Unsupported YOLO output shape:", shape)
+            return []
+        }
+
+        guard valueCount >= 6 else {
+            print("[ERROR] YOLO output value count < 6:", shape)
+            return []
+        }
+
+        var detections: [DetectionResult] = []
+
+        for index in 0..<rowCount {
+            let v0 = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 0
+            )
+
+            let v1 = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 1
+            )
+
+            let v2 = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 2
+            )
+
+            let v3 = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 3
+            )
+
+            let confidence = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 4
+            )
+
+            let classIdFloat = yoloValue(
+                array,
+                layout: layout,
+                row: index,
+                col: 5
+            )
+
+            guard confidence >= confidenceThreshold else {
+                continue
+            }
+
+            guard let rect = makeYOLOBoundingBox(
+                v0: v0,
+                v1: v1,
+                v2: v2,
+                v3: v3
+            ) else {
+                continue
+            }
+
+            let classId = Int(classIdFloat.rounded())
+            let color = colorForClass(classId)
+
+            let detection = DetectionResult(
+                boundingBox: rect,
+                confidence: confidence,
+                fps: currentFps,
+                hardware: BeyTailInferenceHardware.npu,
+                trackId: 0,
+                dominantColor: color
+            )
+
+            detections.append(detection)
+        }
+
+        return detections
+    }
+
+    private enum YOLOOutputLayout {
+        case rowsFirst
+        case channelsFirst
+    }
+
+    private func yoloValue(
+        _ array: MLMultiArray,
+        layout: YOLOOutputLayout,
+        row: Int,
+        col: Int
+    ) -> Float {
+        let indexes: [NSNumber]
+
+        switch layout {
+        case .rowsFirst:
+            indexes = [
+                NSNumber(value: 0),
+                NSNumber(value: row),
+                NSNumber(value: col)
+            ]
+
+        case .channelsFirst:
+            indexes = [
+                NSNumber(value: 0),
+                NSNumber(value: col),
+                NSNumber(value: row)
+            ]
+        }
+
+        return array[indexes].floatValue
+    }
+
+    private func makeYOLOBoundingBox(
+        v0: Float,
+        v1: Float,
+        v2: Float,
+        v3: Float
+    ) -> CGRect? {
+        /*
+         優先判斷為 xyxy：
+         [x1, y1, x2, y2]
+         如果 x2 <= x1 或 y2 <= y1，再退回 cxcywh：
+         [cx, cy, w, h]
+         */
+
+        let a = CGFloat(v0)
+        let b = CGFloat(v1)
+        let c = CGFloat(v2)
+        let d = CGFloat(v3)
+
+        let maxCoordinate = max(
+            abs(a),
+            abs(b),
+            abs(c),
+            abs(d)
+        )
+
+        let divisor: CGFloat = maxCoordinate > 2.0 ? modelInputSize : 1.0
+
+        let x0 = a / divisor
+        let y0 = b / divisor
+        let x1 = c / divisor
+        let y1 = d / divisor
+
+        let rect: CGRect
+
+        if x1 > x0, y1 > y0 {
+            rect = CGRect(
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0
+            )
+        } else {
+            let cx = a / divisor
+            let cy = b / divisor
+            let w = c / divisor
+            let h = d / divisor
+
+            guard w > 0,
+                  h > 0 else {
+                return nil
+            }
+
+            rect = CGRect(
+                x: cx - w / 2.0,
+                y: cy - h / 2.0,
+                width: w,
+                height: h
+            )
+        }
+
+        let clamped = clampNormalizedRect(rect)
+
+        guard clamped.width > 0.001,
+              clamped.height > 0.001 else {
+            return nil
+        }
+
+        return clamped
+    }
+
+    private func clampNormalizedRect(
+        _ rect: CGRect
+    ) -> CGRect {
+        let minX = clamp(rect.minX, lower: 0.0, upper: 1.0)
+        let minY = clamp(rect.minY, lower: 0.0, upper: 1.0)
+        let maxX = clamp(rect.maxX, lower: 0.0, upper: 1.0)
+        let maxY = clamp(rect.maxY, lower: 0.0, upper: 1.0)
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0, maxX - minX),
+            height: max(0.0, maxY - minY)
+        )
+    }
+
+    private func clamp(
+        _ value: CGFloat,
+        lower: CGFloat,
+        upper: CGFloat
+    ) -> CGFloat {
+        min(max(value, lower), upper)
+    }
+
+    private func colorForClass(_ classId: Int) -> UIColor {
+        switch classId {
+        case 0:
+            return UIColor(hex: 0x00DDFF)
+
+        case 1:
+            return UIColor(hex: 0xFF00CC)
+
+        case 2:
+            return UIColor(hex: 0xFFD400)
+
+        default:
+            return .white
+        }
+    }
+
+    // MARK: - NMS
+
+    private func nonMaximumSuppression(
+        _ detections: [DetectionResult],
+        iouThreshold: CGFloat
+    ) -> [DetectionResult] {
+        let sorted = detections.sorted {
+            $0.confidence > $1.confidence
+        }
+
+        var selected: [DetectionResult] = []
+
+        for detection in sorted {
+            var shouldKeep = true
+
+            for kept in selected {
+                let overlap = iou(
+                    detection.boundingBox,
+                    kept.boundingBox
+                )
+
+                if overlap > iouThreshold {
+                    shouldKeep = false
+                    break
+                }
+            }
+
+            if shouldKeep {
+                selected.append(detection)
+            }
+        }
+
+        return selected
+    }
+
+    private func iou(
+        _ a: CGRect,
+        _ b: CGRect
+    ) -> CGFloat {
+        let intersection = a.intersection(b)
+
+        if intersection.isNull ||
+           intersection.width <= 0 ||
+           intersection.height <= 0 {
+            return 0
+        }
+
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = a.width * a.height + b.width * b.height - intersectionArea
+
+        guard unionArea > 0 else {
+            return 0
+        }
+
+        return intersectionArea / unionArea
     }
 
     // MARK: - FPS
