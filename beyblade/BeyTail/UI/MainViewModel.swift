@@ -1,15 +1,5 @@
 import SwiftUI
-import Combine
 import AVFoundation
-import UIKit
-
-final class UncheckedSendableBox<T>: @unchecked Sendable {
-    let value: T
-
-    init(_ value: T) {
-        self.value = value
-    }
-}
 
 @MainActor
 final class MainViewModel: ObservableObject {
@@ -24,80 +14,98 @@ final class MainViewModel: ObservableObject {
     }
 
     @Published var effectMenuVisible = false
-    @Published var isRecording = false
-    @Published var fps: Int = 0
-    @Published var hardwareLabel = "MOCK"
-    @Published var hardwareColor = Color(white: 0.6)
+
+    @Published private(set) var isRecording = false
+    @Published private(set) var fps: Int = 0
+    @Published private(set) var hardwareLabel = "MOCK"
+    @Published private(set) var hardwareColor = Color(white: 0.6)
     @Published var hintVisible = true
     @Published var pulseScale: CGFloat = 1.0
 
-    @Published var isUsingVideoFile = false
-    @Published var isVideoLoading = false
-    @Published var isSwitchingInputSource = false
+    @Published private(set) var isUsingVideoFile = false
+    @Published private(set) var isVideoLoading = false
+    @Published private(set) var isSwitchingInputSource = false
 
-    @Published var canOpenVideoLibrary = true
-    @Published var canToggleRecording = true
-    @Published var canReturnToCamera = false
+    @Published private(set) var canOpenVideoLibrary = true
+    @Published private(set) var canToggleRecording = true
+    @Published private(set) var canReturnToCamera = false
+
+    @Published private(set) var loadingText = ""
 
     // MARK: - Components
 
     let cameraManager     = CameraManager()
-    let inferenceEngine   = InferenceEngine()
     let trailEffectEngine = TrailEffectEngine()
-    let tracker           = BeybladeTracker()
-    let recordingManager  = RecordingManager()
     let trailOverlayView  = TrailOverlayView()
     let videoFrameSource  = VideoFrameSource()
+    let recordingManager  = RecordingManager()
 
-    // MARK: - Mode State
+    // MARK: - Event State
 
-    private enum ModeState: Equatable {
-        case cameraIdle
-        case preparingRecording
-        case recording
-        case stoppingRecording
-        case preparingVideoPicker
+    private enum UIEvent: Equatable {
+        case openVideoLibrary
+        case loadPickedVideo
+        case startRecording
+        case stopRecording
+        case returnToCamera
+    }
+
+    private enum AppMode: Equatable {
+        case cameraPreview
+        case preparingVideoLibrary
         case videoPickerPresented
         case loadingVideo
         case videoReady
         case videoEnded
-        case switchingToCamera
+        case preparingRecording
+        case recording
+        case stoppingRecording
+        case recovering
         case stopped
     }
 
-    private var modeState: ModeState = .cameraIdle {
+    private struct ResourceClearPolicy {
+        let clearLoadedVideo: Bool
+        let clearRecordedPreview: Bool
+
+        static let none = ResourceClearPolicy(
+            clearLoadedVideo: false,
+            clearRecordedPreview: false
+        )
+
+        static let beforeOpenVideoLibrary = ResourceClearPolicy(
+            clearLoadedVideo: true,
+            clearRecordedPreview: true
+        )
+
+        static let beforeStartRecording = ResourceClearPolicy(
+            clearLoadedVideo: true,
+            clearRecordedPreview: true
+        )
+    }
+
+    private var appMode: AppMode = .cameraPreview {
         didSet {
-            print("[STATE] modeState:", oldValue, "->", modeState)
-
+            print("[STATE] appMode:", oldValue, "->", appMode)
             syncPublishedState()
-
-            print(
-                "[STATE] isVideoLoading:",
-                isVideoLoading,
-                "isSwitchingInputSource:",
-                isSwitchingInputSource,
-                "canOpenVideoLibrary:",
-                canOpenVideoLibrary,
-                "canToggleRecording:",
-                canToggleRecording,
-                "canReturnToCamera:",
-                canReturnToCamera,
-                "isRecording:",
-                isRecording
-            )
         }
     }
 
-    // MARK: - Runtime State
+    private var modeBeforePicker: AppMode = .cameraPreview
+
+    private var activeEvent: UIEvent? {
+        didSet {
+            syncPublishedState()
+        }
+    }
+
+    private var lastEventFinishedAt = Date.distantPast
+    private let minEventInterval: TimeInterval = 0.45
 
     private var hintTask: Task<Void, Never>?
-    private var videoLoadingTimeoutTask: Task<Void, Never>?
-    private var recordingStartTimeoutTask: Task<Void, Never>?
-    private var recordingStopTimeoutTask: Task<Void, Never>?
 
-    private var operationID = UUID()
-    private var isMediaOperationRunning = false
-    private var lastRecordingToggleAt: CFTimeInterval = 0
+    private var isStartingCameraPreview = false
+    private var hasRequestedInitialCameraPreview = false
 
     // MARK: - Init
 
@@ -106,32 +114,30 @@ final class MainViewModel: ObservableObject {
         trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
         trailOverlayView.currentEffect = selectedEffect
 
-        inferenceEngine.onResult = { [weak self] detections in
-            guard let self else { return }
-
-            let tracked = self.tracker.update(detections)
-            self.applyTrackedResults(tracked)
-        }
-
-        videoFrameSource.onFrame = nil
-
         videoFrameSource.onEnded = { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                self.handleVideoEnded()
+            guard let self else {
+                return
             }
+
+            self.handleVideoEnded()
         }
 
         recordingManager.onStarted = { [weak self] success in
             Task { @MainActor [weak self, success] in
-                guard let self else { return }
+                guard let self else {
+                    return
+                }
+
                 self.handleRecordingStarted(success: success)
             }
         }
 
         recordingManager.onStopped = { [weak self] url in
             Task { @MainActor [weak self, url] in
-                guard let self else { return }
+                guard let self else {
+                    return
+                }
+
                 self.handleRecordingStopped(url: url)
             }
         }
@@ -142,41 +148,19 @@ final class MainViewModel: ObservableObject {
     // MARK: - Published State Sync
 
     private func syncPublishedState() {
-        switch modeState {
-        case .cameraIdle:
+        switch appMode {
+        case .cameraPreview:
+            isRecording = false
             isUsingVideoFile = false
             isVideoLoading = false
-            isSwitchingInputSource = false
-            canOpenVideoLibrary = true
-            canToggleRecording = true
+            isSwitchingInputSource = isStartingCameraPreview
+            canOpenVideoLibrary = !isStartingCameraPreview
+            canToggleRecording = !isStartingCameraPreview
             canReturnToCamera = false
 
-        case .preparingRecording:
-            isUsingVideoFile = false
-            isVideoLoading = false
-            isSwitchingInputSource = true
-            canOpenVideoLibrary = false
-            canToggleRecording = false
-            canReturnToCamera = false
-
-        case .recording:
-            isUsingVideoFile = false
-            isVideoLoading = false
-            isSwitchingInputSource = false
-            canOpenVideoLibrary = false
-            canToggleRecording = true
-            canReturnToCamera = false
-
-        case .stoppingRecording:
-            isUsingVideoFile = false
-            isVideoLoading = false
-            isSwitchingInputSource = true
-            canOpenVideoLibrary = false
-            canToggleRecording = false
-            canReturnToCamera = false
-
-        case .preparingVideoPicker:
-            isUsingVideoFile = false
+        case .preparingVideoLibrary:
+            isRecording = false
+            isUsingVideoFile = shouldShowPreviousVideoWhilePickerActive()
             isVideoLoading = false
             isSwitchingInputSource = true
             canOpenVideoLibrary = false
@@ -184,7 +168,8 @@ final class MainViewModel: ObservableObject {
             canReturnToCamera = false
 
         case .videoPickerPresented:
-            isUsingVideoFile = false
+            isRecording = false
+            isUsingVideoFile = shouldShowPreviousVideoWhilePickerActive()
             isVideoLoading = false
             isSwitchingInputSource = false
             canOpenVideoLibrary = false
@@ -192,6 +177,7 @@ final class MainViewModel: ObservableObject {
             canReturnToCamera = false
 
         case .loadingVideo:
+            isRecording = false
             isUsingVideoFile = true
             isVideoLoading = true
             isSwitchingInputSource = false
@@ -200,6 +186,7 @@ final class MainViewModel: ObservableObject {
             canReturnToCamera = false
 
         case .videoReady:
+            isRecording = false
             isUsingVideoFile = true
             isVideoLoading = false
             isSwitchingInputSource = false
@@ -208,6 +195,7 @@ final class MainViewModel: ObservableObject {
             canReturnToCamera = true
 
         case .videoEnded:
+            isRecording = false
             isUsingVideoFile = true
             isVideoLoading = false
             isSwitchingInputSource = false
@@ -215,7 +203,35 @@ final class MainViewModel: ObservableObject {
             canToggleRecording = true
             canReturnToCamera = true
 
-        case .switchingToCamera:
+        case .preparingRecording:
+            isRecording = false
+            isUsingVideoFile = false
+            isVideoLoading = false
+            isSwitchingInputSource = true
+            canOpenVideoLibrary = false
+            canToggleRecording = false
+            canReturnToCamera = false
+
+        case .recording:
+            isRecording = true
+            isUsingVideoFile = false
+            isVideoLoading = false
+            isSwitchingInputSource = false
+            canOpenVideoLibrary = false
+            canToggleRecording = true
+            canReturnToCamera = false
+
+        case .stoppingRecording:
+            isRecording = false
+            isUsingVideoFile = false
+            isVideoLoading = false
+            isSwitchingInputSource = true
+            canOpenVideoLibrary = false
+            canToggleRecording = false
+            canReturnToCamera = false
+
+        case .recovering:
+            isRecording = false
             isUsingVideoFile = false
             isVideoLoading = false
             isSwitchingInputSource = true
@@ -224,6 +240,7 @@ final class MainViewModel: ObservableObject {
             canReturnToCamera = false
 
         case .stopped:
+            isRecording = false
             isUsingVideoFile = false
             isVideoLoading = false
             isSwitchingInputSource = false
@@ -231,200 +248,167 @@ final class MainViewModel: ObservableObject {
             canToggleRecording = false
             canReturnToCamera = false
         }
+
+        if activeEvent != nil {
+            canOpenVideoLibrary = false
+            canToggleRecording = false
+            canReturnToCamera = false
+
+            if appMode != .videoPickerPresented {
+                isSwitchingInputSource = true
+            }
+        }
+    }
+
+    private func shouldShowPreviousVideoWhilePickerActive() -> Bool {
+        switch modeBeforePicker {
+        case .videoReady, .videoEnded:
+            return videoFrameSource.hasActiveItem
+
+        default:
+            return false
+        }
     }
 
     // MARK: - Lifecycle
 
     func start() {
-        if modeState == .stopped {
-            modeState = .cameraIdle
+        if appMode == .stopped {
+            appMode = .cameraPreview
         }
 
-        inferenceEngine.start()
-        startPulse()
-        startHintAutoHide()
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.startInitialCamera()
-        }
-    }
-
-    func stop() {
-        invalidateCurrentOperation()
-        isMediaOperationRunning = false
-
-        cancelVideoLoadingTimeout()
-        cancelRecordingStartTimeout()
-        cancelRecordingStopTimeout()
-
-        if isRecording || recordingManager.isRecording {
-            recordingManager.stopRecording()
-        }
-
-        cameraManager.onFrame = nil
-        cameraManager.stop()
-        videoFrameSource.stop()
-        inferenceEngine.stop()
-
-        isRecording = false
-        hintTask?.cancel()
-        hintTask = nil
-
-        modeState = .stopped
-    }
-
-    private func startInitialCamera() async {
-        guard beginMediaOperation(name: "startInitialCamera") != nil else {
+        guard !hasRequestedInitialCameraPreview else {
             return
         }
 
-        modeState = .switchingToCamera
+        hasRequestedInitialCameraPreview = true
 
-        let started = await configureCameraInputAsync(releaseVideoBeforeStart: true)
+        startPulse()
+        startHintAutoHide()
 
-        if started {
-            modeState = .cameraIdle
-        } else {
-            print("[CAMERA] initial camera start failed")
-            modeState = .cameraIdle
-        }
-
-        endMediaOperation()
+        /*
+         第 4 步重點：
+         App 啟動時只啟動攝影機預覽，不啟動錄影。
+         */
+        startCameraPreview()
     }
 
-    // MARK: - Media Operation Gate
+    func stop() {
+        activeEvent = nil
+        loadingText = ""
 
-    @discardableResult
-    private func beginMediaOperation(name: String) -> UUID? {
-        if isMediaOperationRunning {
-            print("[MEDIA] operation ignored:", name, "current state:", modeState)
-            return nil
-        }
+        hasRequestedInitialCameraPreview = false
+        isStartingCameraPreview = false
 
-        isMediaOperationRunning = true
-        let id = makeNewOperationID()
-        print("[MEDIA] begin:", name, id)
-        return id
-    }
+        hintTask?.cancel()
+        hintTask = nil
 
-    private func endMediaOperation() {
-        print("[MEDIA] end:", operationID)
-        isMediaOperationRunning = false
-    }
-
-    private func forceEndMediaOperation() {
-        print("[MEDIA] force end")
-        isMediaOperationRunning = false
-    }
-
-    // MARK: - Camera
-
-    private func configureCameraInputAsync(releaseVideoBeforeStart: Bool) async -> Bool {
-        if releaseVideoBeforeStart {
-            videoFrameSource.stop()
-        }
-
-        cameraManager.onFrame = { [weak self] buffer in
-            guard let self else { return }
-
-            guard self.modeState == .cameraIdle || self.modeState == .recording else {
-                return
-            }
-
-            self.inferenceEngine.processFrame(buffer)
-        }
-
-        let started = await cameraManager.requestPermissionAndStartAsync()
-
-        if !started {
-            print("[CAMERA] requestPermissionAndStartAsync failed")
-            return false
-        }
-
-        return true
-    }
-
-    private func stopCameraAndVideoAsync() async {
         cameraManager.onFrame = nil
+        cameraManager.stop()
+
+        videoFrameSource.onFrame = nil
         videoFrameSource.stop()
 
-        await cameraManager.stopForPickerAsync()
+        if recordingManager.isRecording {
+            recordingManager.stopRecording()
+        }
 
-        await Task.yield()
-        try? await Task.sleep(for: .milliseconds(180))
+        recordingManager.forceReset()
+
+        appMode = .stopped
     }
 
-    // MARK: - Video Picker
+    // MARK: - Video Picker Event
 
     func prepareForVideoPickerAsync() async -> Bool {
-        switch modeState {
-        case .cameraIdle, .videoReady, .videoEnded:
+        switch appMode {
+        case .cameraPreview, .videoReady, .videoEnded:
             break
 
         default:
-            print("[PICKER] prepare ignored, state:", modeState)
+            print("[EVENT] open video library ignored, state:", appMode)
             return false
         }
 
-        guard beginMediaOperation(name: "prepareForVideoPicker") != nil else {
+        guard beginEvent(
+            .openVideoLibrary,
+            loadingText: "準備開啟影片庫..."
+        ) else {
             return false
         }
 
-        modeState = .preparingVideoPicker
+        modeBeforePicker = appMode
 
-        cancelVideoLoadingTimeout()
-        cancelRecordingStartTimeout()
-        cancelRecordingStopTimeout()
+        await waitForEventInterval()
 
-        await stopCameraAndVideoAsync()
+        appMode = .preparingVideoLibrary
 
-        modeState = .videoPickerPresented
+        switch modeBeforePicker {
+        case .cameraPreview:
+            await stopCameraForExternalPicker()
+
+        case .videoReady, .videoEnded:
+            videoFrameSource.pause()
+
+        default:
+            break
+        }
+
         hintVisible = false
+        appMode = .videoPickerPresented
 
-        endMediaOperation()
+        finishEvent()
         return true
     }
 
     func beginResolvingPickedVideo() {
-        if modeState == .preparingVideoPicker {
-            modeState = .videoPickerPresented
+        if appMode == .preparingVideoLibrary {
+            appMode = .videoPickerPresented
         }
     }
 
     func cancelVideoPickerAndRecover() {
-        switch modeState {
-        case .preparingVideoPicker, .videoPickerPresented:
-            break
-
-        default:
-            print("[PICKER] cancel ignored, current state:", modeState)
+        guard appMode == .preparingVideoLibrary ||
+              appMode == .videoPickerPresented else {
             syncPublishedState()
             return
         }
 
-        guard beginMediaOperation(name: "cancelVideoPickerAndRecover") != nil else {
+        restoreAfterPickerDismiss()
+    }
+
+    private func restoreAfterPickerDismiss() {
+        guard beginEvent(
+            .returnToCamera,
+            loadingText: "恢復畫面中..."
+        ) else {
             return
         }
 
         Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            print("[PICKER] cancel and recover to camera")
-
-            self.cancelVideoLoadingTimeout()
-            self.videoFrameSource.stop()
-
-            self.modeState = .switchingToCamera
-
-            let started = await self.configureCameraInputAsync(releaseVideoBeforeStart: true)
-
-            if !started {
-                print("[PICKER] recover camera start failed")
+            guard let self else {
+                return
             }
 
-            self.modeState = .cameraIdle
-            self.endMediaOperation()
+            await self.waitForEventInterval()
+
+            switch self.modeBeforePicker {
+            case .videoReady, .videoEnded:
+                if self.videoFrameSource.hasActiveItem {
+                    self.appMode = self.modeBeforePicker
+                } else {
+                    self.appMode = .recovering
+                    await self.startCameraPreviewAsync()
+                    self.appMode = .cameraPreview
+                }
+
+            default:
+                self.appMode = .recovering
+                await self.startCameraPreviewAsync()
+                self.appMode = .cameraPreview
+            }
+
+            self.finishEvent()
         }
     }
 
@@ -433,289 +417,153 @@ final class MainViewModel: ObservableObject {
     }
 
     func videoSelectionFailed() {
-        guard beginMediaOperation(name: "videoSelectionFailed") != nil else {
-            return
-        }
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            self.cancelVideoLoadingTimeout()
-            self.videoFrameSource.forceResetAfterFailedLoad()
-
-            self.modeState = .switchingToCamera
-
-            let started = await self.configureCameraInputAsync(releaseVideoBeforeStart: true)
-
-            if !started {
-                print("[PICKER] selection failed recover camera failed")
-            }
-
-            self.modeState = .cameraIdle
-            self.endMediaOperation()
-        }
+        recoverToCameraPreview(reason: "video selection failed")
     }
 
-    // MARK: - Video Loading
-
     func loadVideo(url: URL) {
-        guard modeState == .videoPickerPresented ||
-              modeState == .cameraIdle ||
-              modeState == .videoReady ||
-              modeState == .videoEnded else {
-            print("[VIDEO] load ignored, state:", modeState)
+        guard appMode == .videoPickerPresented else {
+            print("[EVENT] load picked video ignored, state:", appMode)
             return
         }
 
-        guard let operation = beginMediaOperation(name: "loadVideo") else {
+        guard beginEvent(
+            .loadPickedVideo,
+            loadingText: "載入影片中..."
+        ) else {
             return
         }
 
-        modeState = .loadingVideo
-
-        cancelVideoLoadingTimeout()
-        cancelRecordingStartTimeout()
-        cancelRecordingStopTimeout()
-
-        hintVisible = false
-        inferenceEngine.start()
-
-        startVideoLoadingTimeout(for: operation)
-
-        Task { @MainActor [weak self, url, operation] in
-            guard let self else { return }
-            guard self.isCurrentOperation(operation) else { return }
-
-            await self.stopCameraAndVideoAsync()
-
-            guard self.isCurrentOperation(operation) else { return }
-            guard self.modeState == .loadingVideo else {
-                self.recoverToCameraIdleIfNeeded()
+        Task { @MainActor [weak self, url] in
+            guard let self else {
                 return
+            }
+
+            await self.waitForEventInterval()
+
+            self.appMode = .loadingVideo
+
+            await self.clearImageResources(
+                policy: .beforeOpenVideoLibrary
+            )
+
+            self.videoFrameSource.onFrame = { [weak self] buffer in
+                guard let self else {
+                    return
+                }
+
+                self.handleVideoFrame(buffer)
             }
 
             self.videoFrameSource.load(
                 url: url,
-                autoPlay: false,
+                autoPlay: true,
                 onReady: { [weak self] in
-                    Task { @MainActor [weak self, operation] in
-                        guard let self else { return }
-                        self.handleVideoReady(operation: operation)
+                    guard let self else {
+                        return
                     }
+
+                    self.handleVideoReady()
                 },
                 onFailed: { [weak self] message in
-                    Task { @MainActor [weak self, operation, message] in
-                        guard let self else { return }
-                        await self.handleVideoLoadFailed(
-                            operation: operation,
-                            message: message
-                        )
+                    guard let self else {
+                        return
                     }
+
+                    self.handleVideoLoadFailed(message: message)
                 }
             )
         }
     }
 
-    private func handleVideoReady(operation: UUID) {
-        guard isCurrentOperation(operation) else {
+    private func handleVideoReady() {
+        guard appMode == .loadingVideo else {
+            print("[VIDEO] ready ignored, state:", appMode)
+            finishEvent()
             return
         }
 
-        cancelVideoLoadingTimeout()
-
-        modeState = .videoReady
-
-        endMediaOperation()
-
-        Task { @MainActor [weak self, operation] in
-            guard let self else { return }
-
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(180))
-
-            guard self.isCurrentOperation(operation) else { return }
-            guard self.modeState == .videoReady else { return }
-
-            self.videoFrameSource.play()
-        }
+        appMode = .videoReady
+        finishEvent()
     }
 
-    private func handleVideoLoadFailed(
-        operation: UUID,
-        message: String
-    ) async {
-        guard isCurrentOperation(operation) else {
-            return
-        }
-
+    private func handleVideoLoadFailed(message: String) {
         print("[VIDEO] load failed:", message)
 
-        cancelVideoLoadingTimeout()
         videoFrameSource.forceResetAfterFailedLoad()
 
-        modeState = .switchingToCamera
+        appMode = .recovering
 
-        let started = await configureCameraInputAsync(releaseVideoBeforeStart: true)
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
 
-        if !started {
-            print("[VIDEO] recover camera start failed")
+            await self.startCameraPreviewAsync()
+
+            self.appMode = .cameraPreview
+            self.finishEvent()
         }
-
-        modeState = .cameraIdle
-        endMediaOperation()
     }
 
     private func handleVideoEnded() {
-        print("[VIDEO] ended callback")
-
-        cancelVideoLoadingTimeout()
-
-        switch modeState {
-        case .loadingVideo, .videoReady:
-            modeState = .videoEnded
-
-        case .videoEnded:
+        guard appMode == .videoReady ||
+              appMode == .loadingVideo ||
+              appMode == .videoEnded else {
+            print("[VIDEO] ended ignored, state:", appMode)
             syncPublishedState()
-
-        case .preparingRecording,
-             .recording,
-             .stoppingRecording,
-             .switchingToCamera:
-            print("[VIDEO] ended ignored during active transition:", modeState)
-
-        case .cameraIdle,
-             .preparingVideoPicker,
-             .videoPickerPresented,
-             .stopped:
-            print("[VIDEO] ended ignored, current state:", modeState)
-            syncPublishedState()
-        }
-    }
-
-    // MARK: - Switching
-
-    func useLiveCameraInput() {
-        guard modeState == .videoReady || modeState == .videoEnded else {
             return
         }
 
-        guard beginMediaOperation(name: "useLiveCameraInput") != nil else {
-            return
-        }
-
-        modeState = .switchingToCamera
-
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            self.videoFrameSource.stop()
-            await self.cameraManager.stopForPickerAsync()
-
-            let started = await self.configureCameraInputAsync(releaseVideoBeforeStart: false)
-
-            if !started {
-                print("[CAMERA] switch to live failed")
-            }
-
-            self.modeState = .cameraIdle
-            self.endMediaOperation()
-        }
+        appMode = .videoEnded
     }
 
-    func backToCamera() {
-        useLiveCameraInput()
+    private func handleVideoFrame(_ buffer: CMSampleBuffer) {
+        /*
+         預留模型偵測接口。
+         第 4 步不處理模型推論。
+         */
     }
 
-    // MARK: - Recording
+    // MARK: - Recording Event
 
     func toggleRecording() {
-        let now = CACurrentMediaTime()
-
-        guard now - lastRecordingToggleAt > 0.45 else {
-            print("[RECORD] toggle ignored: debounce")
-            return
-        }
-
-        lastRecordingToggleAt = now
-
-        switch modeState {
-        case .cameraIdle, .videoReady, .videoEnded:
-            startRecordingAfterResourceCheck()
+        switch appMode {
+        case .cameraPreview, .videoReady, .videoEnded:
+            startRecordingEvent()
 
         case .recording:
-            stopRecordingFromButton()
+            stopRecordingEvent()
 
-        case .preparingRecording,
-             .stoppingRecording,
-             .switchingToCamera,
-             .loadingVideo,
-             .preparingVideoPicker,
-             .videoPickerPresented:
-            print("[RECORD] toggle ignored, current state:", modeState)
-
-        case .stopped:
-            return
+        default:
+            print("[EVENT] recording ignored, state:", appMode)
         }
     }
 
-    private func startRecordingAfterResourceCheck() {
-        guard modeState == .cameraIdle ||
-              modeState == .videoReady ||
-              modeState == .videoEnded else {
+    private func startRecordingEvent() {
+        guard beginEvent(
+            .startRecording,
+            loadingText: "準備錄影..."
+        ) else {
             return
         }
 
-        guard let operation = beginMediaOperation(name: "startRecording") else {
-            return
-        }
-
-        let cameFromVideo =
-            modeState == .videoReady ||
-            modeState == .videoEnded ||
-            isUsingVideoFile ||
-            videoFrameSource.hasActiveItem
-
-        modeState = .preparingRecording
-
-        cancelVideoLoadingTimeout()
-        cancelRecordingStartTimeout()
-        cancelRecordingStopTimeout()
-
-        startRecordingPreparationTimeout(for: operation)
-
-        Task { @MainActor [weak self, operation, cameFromVideo] in
-            guard let self else { return }
-            guard self.isCurrentOperation(operation) else { return }
-
-            if cameFromVideo {
-                self.videoFrameSource.stop()
-                await self.cameraManager.stopForPickerAsync()
-                try? await Task.sleep(for: .milliseconds(250))
-            }
-
-            guard self.isCurrentOperation(operation) else { return }
-            guard self.modeState == .preparingRecording else {
-                self.recoverToCameraIdleIfNeeded()
+        Task { @MainActor [weak self] in
+            guard let self else {
                 return
             }
 
-            let started = await self.configureCameraInputAsync(
-                releaseVideoBeforeStart: cameFromVideo
+            await self.waitForEventInterval()
+
+            self.appMode = .preparingRecording
+
+            await self.clearImageResources(
+                policy: .beforeStartRecording
             )
 
-            guard self.isCurrentOperation(operation) else { return }
+            await self.startCameraPreviewAsync()
 
-            guard started else {
-                print("[RECORD] camera start failed")
-                self.cancelRecordingStartTimeout()
-                self.isRecording = false
-                self.modeState = .cameraIdle
-                self.endMediaOperation()
-                return
-            }
-
-            guard self.modeState == .preparingRecording else {
-                self.recoverToCameraIdleIfNeeded()
+            guard self.appMode == .preparingRecording else {
+                self.finishEvent()
                 return
             }
 
@@ -725,54 +573,54 @@ final class MainViewModel: ObservableObject {
     }
 
     private func handleRecordingStarted(success: Bool) {
-        cancelRecordingStartTimeout()
+        guard appMode == .preparingRecording else {
+            print("[RECORD] onStarted ignored, state:", appMode)
+            return
+        }
 
-        guard modeState == .preparingRecording else {
-            print("[RECORD] onStarted ignored, current state:", modeState)
+        guard activeEvent == .startRecording else {
+            print("[RECORD] onStarted ignored, activeEvent:", String(describing: activeEvent))
             return
         }
 
         guard success else {
-            print("[RECORD] start failed, recover to cameraIdle")
-            isRecording = false
-            modeState = .cameraIdle
-            endMediaOperation()
+            print("[RECORD] start failed")
+
+            recordingManager.forceReset()
+            appMode = .cameraPreview
+            finishEvent()
             return
         }
 
         print("[RECORD] recording started")
 
-        isRecording = true
-        pulseScale = 1.0
-        modeState = .recording
-
-        endMediaOperation()
+        appMode = .recording
+        finishEvent()
     }
 
-    private func stopRecordingFromButton() {
-        guard modeState == .recording || isRecording || recordingManager.isRecording else {
-            isRecording = false
-            modeState = .cameraIdle
+    private func stopRecordingEvent() {
+        guard appMode == .recording ||
+              recordingManager.isRecording else {
+            appMode = .cameraPreview
+            syncPublishedState()
             return
         }
 
-        guard beginMediaOperation(name: "stopRecording") != nil else {
+        guard beginEvent(
+            .stopRecording,
+            loadingText: "停止錄影中..."
+        ) else {
             return
         }
-
-        print("[RECORD] stop button tapped")
-
-        isRecording = false
-        modeState = .stoppingRecording
-
-        cancelRecordingStartTimeout()
-        startRecordingStopTimeout()
 
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self else {
+                return
+            }
 
-            await Task.yield()
-            try? await Task.sleep(for: .milliseconds(80))
+            self.appMode = .stoppingRecording
+
+            await self.waitForEventInterval()
 
             print("[RECORD] call stopRecording")
             self.recordingManager.stopRecording()
@@ -780,152 +628,222 @@ final class MainViewModel: ObservableObject {
     }
 
     private func handleRecordingStopped(url: URL?) {
-        print("[RECORD] onStopped callback, url:", url?.path ?? "nil")
-
-        cancelRecordingStartTimeout()
-        cancelRecordingStopTimeout()
-
-        isRecording = false
-
-        if modeState == .recording ||
-            modeState == .preparingRecording ||
-            modeState == .stoppingRecording {
-            modeState = .cameraIdle
+        if appMode == .stopped {
+            return
         }
 
-        endMediaOperation()
+        print("[RECORD] stopped:", url?.path ?? "nil")
+
+        recordingManager.forceReset()
+
+        if appMode == .recording ||
+           appMode == .preparingRecording ||
+           appMode == .stoppingRecording {
+            appMode = .cameraPreview
+        }
+
+        finishEvent()
 
         guard let url else {
             return
         }
 
         recordingManager.saveToPhotoLibrary(url: url) { (success: Bool) in
-            print("[RECORD] saveToPhotoLibrary finished:", success)
+            print("[RECORD] saveToPhotoLibrary:", success)
         }
     }
 
-    // MARK: - Timeouts
+    // MARK: - Effect Event
 
-    private func startRecordingPreparationTimeout(for operationID: UUID) {
-        recordingStartTimeoutTask?.cancel()
+    func onEffectMenuButtonTapped() {
+        guard activeEvent == nil else {
+            return
+        }
 
-        recordingStartTimeoutTask = Task { @MainActor [weak self, operationID] in
-            try? await Task.sleep(for: .seconds(8))
+        effectMenuVisible.toggle()
+    }
 
-            guard let self else { return }
-            guard self.isCurrentOperation(operationID) else { return }
+    func onEffectSelected(_ effect: EffectType) {
+        guard activeEvent == nil else {
+            return
+        }
 
-            if self.modeState == .preparingRecording {
-                print("[RECOVER] preparingRecording timeout, recover to cameraIdle")
+        guard !effect.isLocked else {
+            return
+        }
 
-                self.recordingManager.forceReset()
-                self.isRecording = false
-                self.modeState = .cameraIdle
-                self.forceEndMediaOperation()
+        selectedEffect = effect
+        effectMenuVisible = false
+    }
+
+    // MARK: - Return To Camera
+
+    func useLiveCameraInput() {
+        guard appMode == .videoReady ||
+              appMode == .videoEnded else {
+            return
+        }
+
+        recoverToCameraPreview(reason: "return to camera")
+    }
+
+    func backToCamera() {
+        recoverToCameraPreview(reason: "back to camera")
+    }
+
+    private func recoverToCameraPreview(reason: String) {
+        guard beginEvent(
+            .returnToCamera,
+            loadingText: "恢復攝影機畫面..."
+        ) else {
+            return
+        }
+
+        Task { @MainActor [weak self, reason] in
+            guard let self else {
+                return
             }
-        }
-    }
 
-    private func startRecordingStopTimeout() {
-        recordingStopTimeoutTask?.cancel()
+            print("[EVENT] recover:", reason)
 
-        recordingStopTimeoutTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(5))
+            self.appMode = .recovering
 
-            guard let self else { return }
+            await self.waitForEventInterval()
 
-            if self.modeState == .stoppingRecording {
-                print("[RECOVER] stopRecording timeout, force cameraIdle")
-
-                self.recordingManager.forceReset()
-                self.isRecording = false
-                self.modeState = .cameraIdle
-                self.startPulse()
-                self.forceEndMediaOperation()
+            if self.recordingManager.isRecording {
+                self.recordingManager.stopRecording()
             }
+
+            self.recordingManager.forceReset()
+
+            await self.clearImageResources(
+                policy: .beforeOpenVideoLibrary
+            )
+
+            await self.startCameraPreviewAsync()
+
+            self.appMode = .cameraPreview
+            self.finishEvent()
         }
     }
 
-    private func cancelRecordingStartTimeout() {
-        recordingStartTimeoutTask?.cancel()
-        recordingStartTimeoutTask = nil
+    // MARK: - Event Gate
+
+    private func beginEvent(
+        _ event: UIEvent,
+        loadingText: String
+    ) -> Bool {
+        guard activeEvent == nil else {
+            print(
+                "[EVENT] ignored:",
+                event,
+                "active:",
+                String(describing: activeEvent)
+            )
+            return false
+        }
+
+        activeEvent = event
+        self.loadingText = loadingText
+        return true
     }
 
-    private func cancelRecordingStopTimeout() {
-        recordingStopTimeoutTask?.cancel()
-        recordingStopTimeoutTask = nil
+    private func finishEvent() {
+        activeEvent = nil
+        loadingText = ""
+        lastEventFinishedAt = Date()
+        syncPublishedState()
     }
 
-    private func cancelVideoLoadingTimeout() {
-        videoLoadingTimeoutTask?.cancel()
-        videoLoadingTimeoutTask = nil
+    private func waitForEventInterval() async {
+        let elapsed = Date().timeIntervalSince(lastEventFinishedAt)
+
+        guard elapsed < minEventInterval else {
+            return
+        }
+
+        let delay = minEventInterval - elapsed
+
+        try? await Task.sleep(
+            nanoseconds: UInt64(delay * 1_000_000_000)
+        )
     }
 
-    private func startVideoLoadingTimeout(for operationID: UUID) {
-        cancelVideoLoadingTimeout()
+    // MARK: - Resource Cleanup
 
-        videoLoadingTimeoutTask = Task { @MainActor [weak self, operationID] in
-            try? await Task.sleep(for: .seconds(8))
+    private func clearImageResources(
+        policy: ResourceClearPolicy
+    ) async {
+        if policy.clearLoadedVideo {
+            videoFrameSource.onFrame = nil
+            videoFrameSource.stop()
+        }
 
-            guard let self else { return }
-            guard self.isCurrentOperation(operationID) else { return }
-
-            if self.modeState == .loadingVideo {
-                print("[RECOVER] video loading timeout")
-
-                self.videoFrameSource.forceResetAfterFailedLoad()
-                self.modeState = .switchingToCamera
-
-                let started = await self.configureCameraInputAsync(
-                    releaseVideoBeforeStart: true
-                )
-
-                if !started {
-                    print("[RECOVER] camera start failed after video timeout")
-                }
-
-                self.modeState = .cameraIdle
-                self.forceEndMediaOperation()
+        if policy.clearRecordedPreview {
+            if recordingManager.isRecording {
+                recordingManager.stopRecording()
             }
+
+            recordingManager.forceReset()
+        }
+
+        effectMenuVisible = false
+
+        await Task.yield()
+    }
+
+    // MARK: - Camera Preview
+
+    private func startCameraPreview() {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            await self.startCameraPreviewAsync()
         }
     }
 
-    // MARK: - Recovery
-
-    private func recoverToCameraIdleIfNeeded() {
-        if modeState == .preparingRecording ||
-            modeState == .stoppingRecording ||
-            modeState == .switchingToCamera ||
-            modeState == .loadingVideo ||
-            modeState == .preparingVideoPicker ||
-            modeState == .videoPickerPresented {
-
-            print("[RECOVER] force recover from:", modeState)
-
-            cancelRecordingStartTimeout()
-            cancelRecordingStopTimeout()
-            cancelVideoLoadingTimeout()
-
-            isRecording = false
-            modeState = .cameraIdle
-            forceEndMediaOperation()
+    private func startCameraPreviewAsync() async {
+        guard !isStartingCameraPreview else {
+            print("[CAMERA] preview start ignored: already starting")
+            return
         }
+
+        guard appMode != .recording &&
+              appMode != .stoppingRecording else {
+            print("[CAMERA] preview start ignored during recording state:", appMode)
+            return
+        }
+
+        isStartingCameraPreview = true
+        syncPublishedState()
+
+        cameraManager.onFrame = nil
+
+        /*
+         第 4 步重點：
+         只啟動 camera session 作為預覽來源。
+         不呼叫 recordingManager.startRecording()。
+         */
+        let started = await cameraManager.requestPermissionAndStartAsync()
+
+        if !started {
+            print("[CAMERA] preview start failed")
+        }
+
+        isStartingCameraPreview = false
+        syncPublishedState()
     }
 
-    // MARK: - Operation ID
+    private func stopCameraForExternalPicker() async {
+        cameraManager.onFrame = nil
+        videoFrameSource.stop()
 
-    private func makeNewOperationID() -> UUID {
-        let id = UUID()
-        operationID = id
-        return id
-    }
+        await cameraManager.stopForPickerAsync()
 
-    private func invalidateCurrentOperation() {
-        operationID = UUID()
-    }
-
-    private func isCurrentOperation(_ id: UUID) -> Bool {
-        operationID == id
+        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(180))
     }
 
     // MARK: - UI Helpers
@@ -936,45 +854,13 @@ final class MainViewModel: ObservableObject {
         hintTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(3.5))
 
-            guard let self else { return }
+            guard let self else {
+                return
+            }
 
             withAnimation(.easeOut(duration: 0.8)) {
                 self.hintVisible = false
             }
-        }
-    }
-
-    private func applyTrackedResults(_ tracked: [DetectionResult]) {
-        for det in tracked {
-            trailEffectEngine.addPoint(
-                trackId: det.trackId,
-                center: det.center,
-                color: det.dominantColor
-            )
-        }
-
-        if let first = tracked.first {
-            fps = Int(first.fps)
-            hardwareLabel = first.hardware.rawValue
-            hardwareColor = hardwareColor(for: first.hardware)
-        }
-
-        trailOverlayView.setNeedsDisplay()
-    }
-
-    private func hardwareColor(for hw: InferenceHardware) -> Color {
-        switch hw {
-        case .npu:
-            return Color(hex: 0x00FF88)
-
-        case .gpu:
-            return Color(hex: 0x88AAFF)
-
-        case .cpu:
-            return Color(hex: 0xFFAA00)
-
-        case .mock:
-            return Color(white: 0.6)
         }
     }
 
@@ -984,7 +870,10 @@ final class MainViewModel: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(100))
 
-            guard let self else { return }
+            guard let self else {
+                return
+            }
+
             self.pulseScale = 1.18
         }
     }

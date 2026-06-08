@@ -121,7 +121,7 @@ struct ContentView: View {
                 }
             )
             .ignoresSafeArea()
-            .interactiveDismissDisabled(true)
+            .interactiveDismissDisabled(false)
         }
         .onAppear {
             vm.start()
@@ -488,6 +488,10 @@ struct ContentView: View {
     }
 
     private var busyOverlayText: String {
+        if !vm.loadingText.isEmpty {
+            return vm.loadingText
+        }
+
         if vm.isVideoLoading {
             return "載入影片中..."
         }
