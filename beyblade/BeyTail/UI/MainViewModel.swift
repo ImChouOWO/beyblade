@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVFoundation
+import ImageIO
 
 private struct UncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
@@ -120,11 +121,18 @@ final class MainViewModel: ObservableObject {
     private var hasRequestedInitialCameraPreview = false
 
     private var latestSourceFrameSize = CGSize(width: 1, height: 1)
-
     private var latestOverlaySize = CGSize(width: 1, height: 1)
     private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
 
-    private let enableAspectFillBBoxMapping = true
+    private let enableBBoxDisplayMapping = true
+
+    /*
+     建議先不要在映射後強制 clamp。
+     因為 resizeAspectFill 會裁切畫面，bbox 超出 overlay 邊界是正常現象。
+     若直接 clamp，會讓 bbox 偏移問題更難 debug。
+     確認座標正確後，如果你想避免畫出畫面外，可以改成 true。
+     */
+    private let clampMappedBBoxToVisibleArea = false
 
     // MARK: - Init
 
@@ -452,52 +460,65 @@ final class MainViewModel: ObservableObject {
     private func mapNormalizedRectToOverlay(
         _ normalizedRect: CGRect
     ) -> CGRect {
-        guard enableAspectFillBBoxMapping else {
-            return clampNormalizedRect(normalizedRect)
+        let inputRect = clampNormalizedRect(normalizedRect)
+
+        guard enableBBoxDisplayMapping else {
+            return inputRect
         }
 
-        let overlaySize: CGSize
-
-        if latestOverlaySize.width > 1,
-           latestOverlaySize.height > 1 {
-            overlaySize = latestOverlaySize
-        } else {
-            overlaySize = trailOverlayView.bounds.size
-        }
+        let overlaySize = currentOverlaySize()
 
         guard overlaySize.width > 1,
               overlaySize.height > 1,
               latestSourceFrameSize.width > 1,
               latestSourceFrameSize.height > 1 else {
-            return clampNormalizedRect(normalizedRect)
+            return inputRect
         }
 
-        let sourceSize = effectiveSourceSizeForCurrentOverlay(
-            rawSourceSize: latestSourceFrameSize,
-            overlaySize: overlaySize
-        )
-
-        let scale: CGFloat
+        let sourceSize = latestSourceFrameSize
 
         switch previewVideoGravity {
+        case .resize:
+            return inputRect
+
         case .resizeAspect:
-            scale = min(
-                overlaySize.width / sourceSize.width,
-                overlaySize.height / sourceSize.height
+            return mapRectByAspectMode(
+                inputRect,
+                sourceSize: sourceSize,
+                overlaySize: overlaySize,
+                useAspectFill: false
             )
 
         case .resizeAspectFill:
-            scale = max(
-                overlaySize.width / sourceSize.width,
-                overlaySize.height / sourceSize.height
+            return mapRectByAspectMode(
+                inputRect,
+                sourceSize: sourceSize,
+                overlaySize: overlaySize,
+                useAspectFill: true
             )
 
         default:
-            scale = max(
-                overlaySize.width / sourceSize.width,
-                overlaySize.height / sourceSize.height
+            return mapRectByAspectMode(
+                inputRect,
+                sourceSize: sourceSize,
+                overlaySize: overlaySize,
+                useAspectFill: true
             )
         }
+    }
+
+    private func mapRectByAspectMode(
+        _ normalizedRect: CGRect,
+        sourceSize: CGSize,
+        overlaySize: CGSize,
+        useAspectFill: Bool
+    ) -> CGRect {
+        let widthScale = overlaySize.width / sourceSize.width
+        let heightScale = overlaySize.height / sourceSize.height
+
+        let scale = useAspectFill
+            ? max(widthScale, heightScale)
+            : min(widthScale, heightScale)
 
         let scaledWidth = sourceSize.width * scale
         let scaledHeight = sourceSize.height * scale
@@ -526,24 +547,69 @@ final class MainViewModel: ObservableObject {
             height: displayRect.height / overlaySize.height
         )
 
-        return clampNormalizedRect(normalizedDisplayRect)
-    }
-
-    private func effectiveSourceSizeForCurrentOverlay(
-        rawSourceSize: CGSize,
-        overlaySize: CGSize
-    ) -> CGSize {
-        let overlayIsPortrait = overlaySize.height >= overlaySize.width
-        let sourceIsPortrait = rawSourceSize.height >= rawSourceSize.width
-
-        if overlayIsPortrait != sourceIsPortrait {
-            return CGSize(
-                width: rawSourceSize.height,
-                height: rawSourceSize.width
-            )
+        guard isValidRect(normalizedDisplayRect) else {
+            return clampNormalizedRect(normalizedRect)
         }
 
-        return rawSourceSize
+        if clampMappedBBoxToVisibleArea {
+            return clampNormalizedRect(normalizedDisplayRect)
+        }
+
+        return normalizedDisplayRect
+    }
+
+    private func currentOverlaySize() -> CGSize {
+        let boundsSize = trailOverlayView.bounds.size
+
+        if boundsSize.width > 1,
+           boundsSize.height > 1 {
+            return boundsSize
+        }
+
+        return latestOverlaySize
+    }
+
+    private func updateLatestSourceFrameSize(
+        from buffer: CMSampleBuffer,
+        orientation: CGImagePropertyOrientation = .up
+    ) {
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else {
+            return
+        }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        guard width > 0,
+              height > 0 else {
+            return
+        }
+
+        let rawSize = CGSize(
+            width: CGFloat(width),
+            height: CGFloat(height)
+        )
+
+        latestSourceFrameSize = orientedSourceSize(
+            rawSize: rawSize,
+            orientation: orientation
+        )
+    }
+
+    private func orientedSourceSize(
+        rawSize: CGSize,
+        orientation: CGImagePropertyOrientation
+    ) -> CGSize {
+        switch orientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            return CGSize(
+                width: rawSize.height,
+                height: rawSize.width
+            )
+
+        default:
+            return rawSize
+        }
     }
 
     private func clampNormalizedRect(
@@ -589,25 +655,15 @@ final class MainViewModel: ObservableObject {
         min(max(value, lower), upper)
     }
 
-    private func updateLatestSourceFrameSize(
-        from buffer: CMSampleBuffer
-    ) {
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else {
-            return
-        }
-
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-
-        guard width > 0,
-              height > 0 else {
-            return
-        }
-
-        latestSourceFrameSize = CGSize(
-            width: width,
-            height: height
-        )
+    private func isValidRect(
+        _ rect: CGRect
+    ) -> Bool {
+        rect.minX.isFinite &&
+        rect.minY.isFinite &&
+        rect.width.isFinite &&
+        rect.height.isFinite &&
+        rect.width >= 0.0 &&
+        rect.height >= 0.0
     }
 
     // MARK: - Video Picker Event
@@ -823,8 +879,15 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        updateLatestSourceFrameSize(from: buffer)
-        inferenceEngine.processFrame(buffer)
+        updateLatestSourceFrameSize(
+            from: buffer,
+            orientation: .up
+        )
+
+        inferenceEngine.processFrame(
+            buffer,
+            orientation: .up
+        )
     }
 
     // MARK: - Recording Event
@@ -1168,11 +1231,16 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        updateLatestSourceFrameSize(from: buffer)
+        let orientation = cameraManager.currentVisionImageOrientation
+
+        updateLatestSourceFrameSize(
+            from: buffer,
+            orientation: orientation
+        )
 
         inferenceEngine.processFrame(
             buffer,
-            orientation: cameraManager.currentVisionImageOrientation
+            orientation: orientation
         )
     }
 

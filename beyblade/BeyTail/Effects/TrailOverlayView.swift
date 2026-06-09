@@ -37,25 +37,30 @@ class TrailOverlayView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext(),
-              let engine = effectEngine else { return }
+            let engine = effectEngine else {
+            return
+        }
+
+        let canvas = bounds
 
         let now = CACurrentMediaTime()
         let trackData = engine.getPointsByTrack(now: now)
 
         for (_, pointsWithAlpha) in trackData {
-            drawTrail(ctx: ctx, points: pointsWithAlpha, rect: rect)
+            drawTrail(ctx: ctx, points: pointsWithAlpha, rect: canvas)
         }
 
-        // Debug bounding boxes
         ctx.setStrokeColor(UIColor.green.cgColor)
         ctx.setLineWidth(2)
+
         for (normRect, _) in debugBoundingBoxes {
             let screenRect = CGRect(
-                x: normRect.minX * rect.width,
-                y: normRect.minY * rect.height,
-                width: normRect.width * rect.width,
-                height: normRect.height * rect.height
+                x: normRect.minX * canvas.width,
+                y: normRect.minY * canvas.height,
+                width: normRect.width * canvas.width,
+                height: normRect.height * canvas.height
             )
+
             ctx.stroke(screenRect)
         }
     }
