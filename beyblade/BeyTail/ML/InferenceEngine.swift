@@ -31,7 +31,7 @@ final class InferenceEngine: @unchecked Sendable {
 
     private let confidenceThreshold: Float = 0.30
     private let nmsIoUThreshold: CGFloat = 0.35
-    private let maxOutputDetections = 2
+    private let maxOutputDetections = 20
 
     /*
      這個值代表 YOLO raw output bbox 座標的基準尺寸。

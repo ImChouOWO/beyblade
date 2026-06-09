@@ -38,14 +38,18 @@ struct ContentView: View {
                     } else {
                         CameraPreviewView(
                             session: vm.cameraManager.session,
-                            videoGravity: videoGravity
+                            videoGravity: videoGravity,
+                            isLandscape: isLandscape
                         )
                     }
                 }
                 .ignoresSafeArea()
 
-                TrailOverlayRepresentable(view: vm.trailOverlayView)
-                    .ignoresSafeArea()
+                TrailOverlayRepresentable(
+                    view: vm.trailOverlayView
+                )
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
 
                 VStack {
                     LinearGradient(
@@ -137,6 +141,13 @@ struct ContentView: View {
                 .interactiveDismissDisabled(false)
             }
             .onAppear {
+                print(
+                    "[CONTENT_LAYOUT_APPEAR]",
+                    "size:", size,
+                    "isLandscape:", isLandscape,
+                    "videoGravity:", videoGravity.rawValue
+                )
+
                 vm.updatePreviewLayout(
                     overlaySize: size,
                     videoGravity: videoGravity
@@ -153,6 +164,13 @@ struct ContentView: View {
                 let newVideoGravity: AVLayerVideoGravity = newIsLandscape
                     ? .resizeAspect
                     : .resizeAspectFill
+
+                print(
+                    "[CONTENT_LAYOUT_CHANGE]",
+                    "size:", newSize,
+                    "isLandscape:", newIsLandscape,
+                    "videoGravity:", newVideoGravity.rawValue
+                )
 
                 vm.updatePreviewLayout(
                     overlaySize: newSize,
@@ -662,7 +680,6 @@ struct VideoPickerController: UIViewControllerRepresentable {
                 } catch {
                     DispatchQueue.main.async {
                         self.parent.onFailed(self.parent.sessionID)
-                        self.parent.isPresented = false
                     }
                 }
             }
@@ -676,12 +693,14 @@ struct CameraPreviewView: UIViewRepresentable {
 
     let session: AVCaptureSession
     let videoGravity: AVLayerVideoGravity
+    let isLandscape: Bool
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
         let view = CameraPreviewUIView()
         view.backgroundColor = .black
         view.attachSession(session)
         view.setVideoGravity(videoGravity)
+        view.setIsLandscape(isLandscape)
         return view
     }
 
@@ -691,6 +710,7 @@ struct CameraPreviewView: UIViewRepresentable {
     ) {
         uiView.attachSession(session)
         uiView.setVideoGravity(videoGravity)
+        uiView.setIsLandscape(isLandscape)
         uiView.setNeedsLayout()
     }
 
@@ -703,6 +723,9 @@ struct CameraPreviewView: UIViewRepresentable {
 }
 
 final class CameraPreviewUIView: UIView {
+
+    private var isLandscape = false
+    private var lastAppliedPreviewAngle: CGFloat = -1
 
     override static var layerClass: AnyClass {
         AVCaptureVideoPreviewLayer.self
@@ -727,12 +750,106 @@ final class CameraPreviewUIView: UIView {
     }
 
     func setVideoGravity(_ videoGravity: AVLayerVideoGravity) {
-        previewLayer.videoGravity = videoGravity
+        if previewLayer.videoGravity != videoGravity {
+            previewLayer.videoGravity = videoGravity
+        }
+    }
+
+    func setIsLandscape(_ isLandscape: Bool) {
+        self.isLandscape = isLandscape
+        applyPreviewRotationIfNeeded(force: true)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyPreviewRotationIfNeeded(force: true)
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
+
         previewLayer.frame = bounds
+        applyPreviewRotationIfNeeded(force: false)
+
+        print(
+            "[PREVIEW_LAYOUT]",
+            "bounds:", bounds.size,
+            "isLandscape:", isLandscape,
+            "interfaceOrientation:", currentInterfaceOrientationRawValue(),
+            "videoGravity:", previewLayer.videoGravity.rawValue
+        )
+    }
+
+    private func applyPreviewRotationIfNeeded(force: Bool) {
+        guard let connection = previewLayer.connection else {
+            return
+        }
+
+        let previewAngle = previewRotationAngleForCurrentInterface()
+
+        guard force || previewAngle != lastAppliedPreviewAngle else {
+            return
+        }
+
+        guard connection.isVideoRotationAngleSupported(previewAngle) else {
+            print(
+                "[WARN] previewLayer videoRotationAngle not supported:",
+                previewAngle
+            )
+            return
+        }
+
+        connection.videoRotationAngle = previewAngle
+        lastAppliedPreviewAngle = previewAngle
+
+        print(
+            "[PREVIEW_ROTATION]",
+            "previewAngle:", previewAngle,
+            "bounds:", bounds.size,
+            "isLandscape:", isLandscape,
+            "interfaceOrientation:", currentInterfaceOrientationRawValue(),
+            "automaticallyAdjustsVideoMirroring:", connection.automaticallyAdjustsVideoMirroring,
+            "isVideoMirrored:", connection.isVideoMirrored
+        )
+    }
+
+    private func previewRotationAngleForCurrentInterface() -> CGFloat {
+        guard let orientation = currentInterfaceOrientation() else {
+            return isLandscape ? 180 : 90
+        }
+
+        switch orientation {
+        case .portrait:
+            return 90
+
+        case .landscapeLeft:
+            return 180
+
+        case .landscapeRight:
+            return 0
+
+//        case .portraitUpsideDown:
+//            return 270
+
+        default:
+            return isLandscape ? 180 : 90
+        }
+    }
+
+    private func currentInterfaceOrientation() -> UIInterfaceOrientation? {
+        guard let windowScene = window?.windowScene else {
+            return nil
+        }
+
+        if #available(iOS 26.0, *) {
+            return windowScene.effectiveGeometry.interfaceOrientation
+        } else {
+            return windowScene.interfaceOrientation
+        }
+    }
+
+    private func currentInterfaceOrientationRawValue() -> Int {
+        currentInterfaceOrientation()?.rawValue ?? -1
     }
 }
 
@@ -742,8 +859,19 @@ struct TrailOverlayRepresentable: UIViewRepresentable {
     let view: TrailOverlayView
 
     func makeUIView(context: Context) -> TrailOverlayView {
-        view
+        view.backgroundColor = .clear
+        view.isOpaque = false
+        view.contentMode = .redraw
+        return view
     }
 
-    func updateUIView(_ uiView: TrailOverlayView, context: Context) {}
+    func updateUIView(
+        _ uiView: TrailOverlayView,
+        context: Context
+    ) {
+        uiView.backgroundColor = .clear
+        uiView.isOpaque = false
+        uiView.contentMode = .redraw
+        uiView.setNeedsDisplay()
+    }
 }

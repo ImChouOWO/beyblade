@@ -2,6 +2,7 @@ import SwiftUI
 import Combine
 import AVFoundation
 import ImageIO
+import UIKit
 
 private struct UncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
@@ -25,6 +26,7 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var fps: Int = 0
     @Published private(set) var hardwareLabel = "MOCK"
     @Published private(set) var hardwareColor = Color(white: 0.6)
+    @Published private(set) var cameraVideoRotationAngle: CGFloat = 90
 
     @Published var hintVisible = true
     @Published var pulseScale: CGFloat = 1.0
@@ -124,6 +126,15 @@ final class MainViewModel: ObservableObject {
     private var latestOverlaySize = CGSize(width: 1, height: 1)
     private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
 
+    /*
+     bbox 座標修正以目前 UI interface orientation 為準。
+     你的實測狀況：
+     - 順時針 90 度：bbox 正常
+     - 逆時針 90 度：bbox 上下顛倒、左右相反
+     - 直立 / 上下顛倒：bbox 相對位置旋轉 90 度
+    */
+    private var currentInterfaceOrientation: UIInterfaceOrientation = .portrait
+
     private let enableBBoxDisplayMapping = true
 
     /*
@@ -198,6 +209,20 @@ final class MainViewModel: ObservableObject {
 
         latestOverlaySize = overlaySize
         previewVideoGravity = videoGravity
+        cameraVideoRotationAngle = cameraManager.currentVideoRotationAngle
+        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
+            fallbackSize: overlaySize
+        )
+
+        print(
+            "[LAYOUT]",
+            "overlaySize:", overlaySize,
+            "trailBounds:", trailOverlayView.bounds.size,
+            "videoGravity:", videoGravity.rawValue,
+            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
+            "cameraVideoRotationAngle:", cameraVideoRotationAngle
+        )
+
         trailOverlayView.setNeedsDisplay()
     }
 
@@ -387,6 +412,10 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
+            fallbackSize: currentCanvasSize()
+        )
+
         if let first = tracked.first {
             fps = Int(first.fps)
             hardwareLabel = first.hardware.label
@@ -401,6 +430,11 @@ final class MainViewModel: ObservableObject {
             ($0.displayRect, $0.trackId)
         }
 
+        logDetectedObjects(
+            rawDetections: tracked,
+            mappedDetections: mappedResults
+        )
+
         for result in mappedResults {
             guard result.trackId > 0 else {
                 continue
@@ -410,6 +444,44 @@ final class MainViewModel: ObservableObject {
                 trackId: result.trackId,
                 center: result.displayCenter,
                 color: result.color
+            )
+        }
+    }
+
+    private func logDetectedObjects(
+        rawDetections: [DetectionResult],
+        mappedDetections: [DisplayDetection]
+    ) {
+        let canvasSize = currentCanvasSize()
+
+        print(
+            "[DETECTION]",
+            "count:", rawDetections.count,
+            "fps:", fps,
+            "hardware:", hardwareLabel,
+            "sourceSize:", latestSourceFrameSize,
+            "canvasSize:", canvasSize,
+            "overlaySize:", latestOverlaySize,
+            "trailBounds:", trailOverlayView.bounds.size,
+            "videoGravity:", previewVideoGravity.rawValue,
+            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
+            "cameraVideoRotationAngle:", cameraVideoRotationAngle,
+            "visionOrientation:", cameraManager.currentVisionImageOrientation.rawValue
+        )
+
+        for index in rawDetections.indices {
+            let raw = rawDetections[index]
+            let mapped = mappedDetections[index]
+
+            print(
+                "[DETECTION_ITEM]",
+                "index:", index,
+                "trackId:", raw.trackId,
+                "confidence:", raw.confidence,
+                "rawBBox:", raw.boundingBox,
+                "correctedBBox:", mapped.correctedRect,
+                "mappedBBox:", mapped.displayRect,
+                "mappedCenter:", mapped.displayCenter
             )
         }
     }
@@ -432,19 +504,23 @@ final class MainViewModel: ObservableObject {
 
     // MARK: - BBox Mapping
 
-
     private struct DisplayDetection {
         let displayRect: CGRect
         let displayCenter: CGPoint
         let trackId: Int
         let color: UIColor
+        let correctedRect: CGRect
     }
 
     private func mapDetectionToOverlaySpace(
         _ detection: DetectionResult
     ) -> DisplayDetection {
-        let mappedRect = mapNormalizedRectToCanvas(
+        let correctedRect = correctDetectionBBoxOrientation(
             detection.boundingBox
+        )
+
+        let mappedRect = mapNormalizedRectToCanvas(
+            correctedRect
         )
 
         return DisplayDetection(
@@ -454,7 +530,94 @@ final class MainViewModel: ObservableObject {
                 y: mappedRect.midY
             ),
             trackId: detection.trackId,
-            color: detection.dominantColor
+            color: detection.dominantColor,
+            correctedRect: correctedRect
+        )
+    }
+
+    private func correctDetectionBBoxOrientation(
+        _ rect: CGRect
+    ) -> CGRect {
+        let input = clampNormalizedRect(rect)
+
+        let corrected: CGRect
+
+        /*
+         目前依照你的實測結果建立方向修正：
+
+         1. 順時針旋轉 90 度：bbox 正常
+            -> 對應 .landscapeRight，直接使用原 bbox
+
+         2. 逆時針旋轉 90 度：bbox 上下顛倒、左右相反
+            -> 對應 .landscapeLeft，旋轉 180 度
+
+         3. 直立：bbox 相對位置旋轉 90 度
+            -> 對應 .portrait，做 90 度順時針修正
+
+         4. 上下顛倒：
+            如果 App 沒有支援 portraitUpsideDown，通常仍會被視為 portrait。
+            如果系統真的回傳 .portraitUpsideDown，這裡做 90 度逆時針修正。
+        */
+
+        switch currentInterfaceOrientation {
+        case .landscapeLeft:
+            corrected = input
+
+        case .landscapeRight:
+            corrected = rotateBBox180(input)
+
+        case .portraitUpsideDown:
+            corrected = rotateBBox90Clockwise(input)
+
+        case .portrait:
+            corrected = rotateBBox90CounterClockwise(input)
+
+        default:
+            corrected = input
+        }
+
+        let output = clampNormalizedRect(corrected)
+
+        print(
+            "[BBOX_ORIENTATION_FIX]",
+            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
+            "raw:", input,
+            "corrected:", output
+        )
+
+        return output
+    }
+
+    private func rotateBBox180(
+        _ rect: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: 1.0 - rect.maxX,
+            y: 1.0 - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    private func rotateBBox90Clockwise(
+        _ rect: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: 1.0 - rect.maxY,
+            y: rect.minX,
+            width: rect.height,
+            height: rect.width
+        )
+    }
+
+    private func rotateBBox90CounterClockwise(
+        _ rect: CGRect
+    ) -> CGRect {
+        CGRect(
+            x: rect.minY,
+            y: 1.0 - rect.maxX,
+            width: rect.height,
+            height: rect.width
         )
     }
 
@@ -462,12 +625,17 @@ final class MainViewModel: ObservableObject {
         _ normalizedRect: CGRect
     ) -> CGRect {
         let inputRect = clampNormalizedRect(normalizedRect)
+
+        guard enableBBoxDisplayMapping else {
+            return inputRect
+        }
+
         let canvasSize = currentCanvasSize()
 
         guard canvasSize.width > 1,
-            canvasSize.height > 1,
-            latestSourceFrameSize.width > 1,
-            latestSourceFrameSize.height > 1 else {
+              canvasSize.height > 1,
+              latestSourceFrameSize.width > 1,
+              latestSourceFrameSize.height > 1 else {
             return inputRect
         }
 
@@ -523,6 +691,14 @@ final class MainViewModel: ObservableObject {
             height: canvasRect.height / canvasSize.height
         )
 
+        guard isValidRect(normalizedCanvasRect) else {
+            return inputRect
+        }
+
+        if clampMappedBBoxToVisibleArea {
+            return clampNormalizedRect(normalizedCanvasRect)
+        }
+
         return normalizedCanvasRect
     }
 
@@ -530,7 +706,7 @@ final class MainViewModel: ObservableObject {
         let boundsSize = trailOverlayView.bounds.size
 
         if boundsSize.width > 1,
-        boundsSize.height > 1 {
+           boundsSize.height > 1 {
             return boundsSize
         }
 
@@ -549,7 +725,7 @@ final class MainViewModel: ObservableObject {
         let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
 
         guard rawWidth > 0,
-            rawHeight > 0 else {
+              rawHeight > 0 else {
             return
         }
 
@@ -622,6 +798,7 @@ final class MainViewModel: ObservableObject {
     ) -> CGFloat {
         min(max(value, lower), upper)
     }
+
     private func isValidRect(
         _ rect: CGRect
     ) -> Bool {
@@ -631,6 +808,43 @@ final class MainViewModel: ObservableObject {
         rect.height.isFinite &&
         rect.width >= 0.0 &&
         rect.height >= 0.0
+    }
+
+    // MARK: - Interface Orientation
+
+    private func resolveCurrentInterfaceOrientation(
+        fallbackSize: CGSize
+    ) -> UIInterfaceOrientation {
+        if let orientation = currentForegroundInterfaceOrientation() {
+            switch orientation {
+            case .portrait,
+                 .landscapeLeft,
+                 .landscapeRight,
+                 .portraitUpsideDown:
+                return orientation
+
+            default:
+                break
+            }
+        }
+
+        return fallbackSize.width > fallbackSize.height
+            ? .landscapeRight
+            : .portrait
+    }
+
+    private func currentForegroundInterfaceOrientation() -> UIInterfaceOrientation? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }) else {
+            return nil
+        }
+
+        if #available(iOS 26.0, *) {
+            return scene.effectiveGeometry.interfaceOrientation
+        } else {
+            return scene.interfaceOrientation
+        }
     }
 
     // MARK: - Video Picker Event
@@ -1193,12 +1407,16 @@ final class MainViewModel: ObservableObject {
 
     private func handleCameraFrame(_ buffer: CMSampleBuffer) {
         guard appMode == .cameraPreview ||
-            appMode == .recording ||
-            appMode == .preparingRecording else {
+              appMode == .recording ||
+              appMode == .preparingRecording else {
             return
         }
 
         let orientation = cameraManager.currentVisionImageOrientation
+        cameraVideoRotationAngle = cameraManager.currentVideoRotationAngle
+        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
+            fallbackSize: currentCanvasSize()
+        )
 
         updateLatestSourceFrameSize(
             from: buffer,

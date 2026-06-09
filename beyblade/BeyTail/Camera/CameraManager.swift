@@ -19,6 +19,15 @@ final class CameraManager: NSObject {
         return _currentVisionImageOrientation
     }
 
+    var currentVideoRotationAngle: CGFloat {
+        orientationLock.lock()
+        defer {
+            orientationLock.unlock()
+        }
+
+        return _currentVideoRotationAngle
+    }
+
     // MARK: - Private
 
     private let sessionQueue = DispatchQueue(
@@ -38,6 +47,7 @@ final class CameraManager: NSObject {
 
     private let orientationLock = NSLock()
     private var _currentVisionImageOrientation: CGImagePropertyOrientation = .right
+    private var _currentVideoRotationAngle: CGFloat = 90
 
     private var lastAppliedVideoAngle: CGFloat = -1
     private var lastValidDeviceOrientation: UIDeviceOrientation = .portrait
@@ -318,6 +328,10 @@ final class CameraManager: NSObject {
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
         if connection.isVideoMirroringSupported {
+            if connection.automaticallyAdjustsVideoMirroring {
+                connection.automaticallyAdjustsVideoMirroring = false
+            }
+
             connection.isVideoMirrored = false
         }
 
@@ -363,7 +377,10 @@ final class CameraManager: NSObject {
             for: lastValidDeviceOrientation
         )
 
-        setCurrentVisionImageOrientation(visionOrientation)
+        orientationLock.lock()
+        _currentVideoRotationAngle = angle
+        _currentVisionImageOrientation = visionOrientation
+        orientationLock.unlock()
 
         guard force || angle != lastAppliedVideoAngle else {
             return
@@ -382,12 +399,10 @@ final class CameraManager: NSObject {
         }
 
         print(
-            "[CAMERA] deviceOrientation:",
-            lastValidDeviceOrientation.rawValue,
-            "videoRotationAngle:",
-            angle,
-            "visionOrientation:",
-            visionOrientation.rawValue
+            "[CAMERA]",
+            "deviceOrientation:", lastValidDeviceOrientation.rawValue,
+            "videoRotationAngle:", angle,
+            "visionOrientation:", visionOrientation.rawValue
         )
     }
 
@@ -405,31 +420,23 @@ final class CameraManager: NSObject {
             break
         }
 
+        let angle = videoRotationAngle(
+            for: lastValidDeviceOrientation
+        )
+
         let visionOrientation = visionImageOrientation(
             for: lastValidDeviceOrientation
         )
 
-        setCurrentVisionImageOrientation(visionOrientation)
-    }
-
-    private func setCurrentVisionImageOrientation(
-        _ orientation: CGImagePropertyOrientation
-    ) {
         orientationLock.lock()
-        _currentVisionImageOrientation = orientation
+        _currentVideoRotationAngle = angle
+        _currentVisionImageOrientation = visionOrientation
         orientationLock.unlock()
     }
 
     private func videoRotationAngle(
         for deviceOrientation: UIDeviceOrientation
     ) -> CGFloat {
-        /*
-         後鏡頭常用對應：
-         portrait          -> 90
-         landscapeRight    -> 0
-         landscapeLeft     -> 180
-         portraitUpsideDown -> 270
-         */
         switch deviceOrientation {
         case .portrait:
             return 90
@@ -451,13 +458,6 @@ final class CameraManager: NSObject {
     private func visionImageOrientation(
         for deviceOrientation: UIDeviceOrientation
     ) -> CGImagePropertyOrientation {
-        /*
-         後鏡頭 raw pixelBuffer 給 Vision 的常用對應：
-         portrait          -> .right
-         landscapeLeft     -> .up
-         landscapeRight    -> .down
-         portraitUpsideDown -> .left
-         */
         switch deviceOrientation {
         case .portrait:
             return .right
@@ -509,21 +509,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        updateDeviceOrientationState()
-
-        applyCurrentVideoRotation(
-            to: connection,
-            force: false
-        )
-
         onFrame?(sampleBuffer)
-    }
-
-    func captureOutput(
-        _ output: AVCaptureOutput,
-        didDrop sampleBuffer: CMSampleBuffer,
-        from connection: AVCaptureConnection
-    ) {
-        // intentionally empty
     }
 }
