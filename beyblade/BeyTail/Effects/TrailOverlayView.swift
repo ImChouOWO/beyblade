@@ -34,7 +34,6 @@ class TrailOverlayView: UIView {
     }
 
     @objc private func tick() { setNeedsDisplay() }
-
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext(),
             let engine = effectEngine else {
@@ -47,7 +46,11 @@ class TrailOverlayView: UIView {
         let trackData = engine.getPointsByTrack(now: now)
 
         for (_, pointsWithAlpha) in trackData {
-            drawTrail(ctx: ctx, points: pointsWithAlpha, rect: canvas)
+            drawTrail(
+                ctx: ctx,
+                points: pointsWithAlpha,
+                rect: canvas
+            )
         }
 
         ctx.setStrokeColor(UIColor.green.cgColor)

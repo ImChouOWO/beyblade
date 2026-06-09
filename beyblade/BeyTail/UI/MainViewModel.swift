@@ -432,6 +432,7 @@ final class MainViewModel: ObservableObject {
 
     // MARK: - BBox Mapping
 
+
     private struct DisplayDetection {
         let displayRect: CGRect
         let displayCenter: CGPoint
@@ -442,7 +443,7 @@ final class MainViewModel: ObservableObject {
     private func mapDetectionToOverlaySpace(
         _ detection: DetectionResult
     ) -> DisplayDetection {
-        let mappedRect = mapNormalizedRectToOverlay(
+        let mappedRect = mapNormalizedRectToCanvas(
             detection.boundingBox
         )
 
@@ -457,112 +458,79 @@ final class MainViewModel: ObservableObject {
         )
     }
 
-    private func mapNormalizedRectToOverlay(
+    private func mapNormalizedRectToCanvas(
         _ normalizedRect: CGRect
     ) -> CGRect {
         let inputRect = clampNormalizedRect(normalizedRect)
+        let canvasSize = currentCanvasSize()
 
-        guard enableBBoxDisplayMapping else {
-            return inputRect
-        }
-
-        let overlaySize = currentOverlaySize()
-
-        guard overlaySize.width > 1,
-              overlaySize.height > 1,
-              latestSourceFrameSize.width > 1,
-              latestSourceFrameSize.height > 1 else {
+        guard canvasSize.width > 1,
+            canvasSize.height > 1,
+            latestSourceFrameSize.width > 1,
+            latestSourceFrameSize.height > 1 else {
             return inputRect
         }
 
         let sourceSize = latestSourceFrameSize
 
+        let useAspectFill: Bool
+
         switch previewVideoGravity {
+        case .resizeAspect:
+            useAspectFill = false
+
+        case .resizeAspectFill:
+            useAspectFill = true
+
         case .resize:
             return inputRect
 
-        case .resizeAspect:
-            return mapRectByAspectMode(
-                inputRect,
-                sourceSize: sourceSize,
-                overlaySize: overlaySize,
-                useAspectFill: false
-            )
-
-        case .resizeAspectFill:
-            return mapRectByAspectMode(
-                inputRect,
-                sourceSize: sourceSize,
-                overlaySize: overlaySize,
-                useAspectFill: true
-            )
-
         default:
-            return mapRectByAspectMode(
-                inputRect,
-                sourceSize: sourceSize,
-                overlaySize: overlaySize,
-                useAspectFill: true
-            )
+            useAspectFill = true
         }
-    }
 
-    private func mapRectByAspectMode(
-        _ normalizedRect: CGRect,
-        sourceSize: CGSize,
-        overlaySize: CGSize,
-        useAspectFill: Bool
-    ) -> CGRect {
-        let widthScale = overlaySize.width / sourceSize.width
-        let heightScale = overlaySize.height / sourceSize.height
+        let widthScale = canvasSize.width / sourceSize.width
+        let heightScale = canvasSize.height / sourceSize.height
 
         let scale = useAspectFill
             ? max(widthScale, heightScale)
             : min(widthScale, heightScale)
 
-        let scaledWidth = sourceSize.width * scale
-        let scaledHeight = sourceSize.height * scale
+        let displayedVideoWidth = sourceSize.width * scale
+        let displayedVideoHeight = sourceSize.height * scale
 
-        let offsetX = (overlaySize.width - scaledWidth) / 2.0
-        let offsetY = (overlaySize.height - scaledHeight) / 2.0
+        let offsetX = (canvasSize.width - displayedVideoWidth) / 2.0
+        let offsetY = (canvasSize.height - displayedVideoHeight) / 2.0
 
         let sourceRect = CGRect(
-            x: normalizedRect.minX * sourceSize.width,
-            y: normalizedRect.minY * sourceSize.height,
-            width: normalizedRect.width * sourceSize.width,
-            height: normalizedRect.height * sourceSize.height
+            x: inputRect.minX * sourceSize.width,
+            y: inputRect.minY * sourceSize.height,
+            width: inputRect.width * sourceSize.width,
+            height: inputRect.height * sourceSize.height
         )
 
-        let displayRect = CGRect(
+        let canvasRect = CGRect(
             x: sourceRect.minX * scale + offsetX,
             y: sourceRect.minY * scale + offsetY,
             width: sourceRect.width * scale,
             height: sourceRect.height * scale
         )
 
-        let normalizedDisplayRect = CGRect(
-            x: displayRect.minX / overlaySize.width,
-            y: displayRect.minY / overlaySize.height,
-            width: displayRect.width / overlaySize.width,
-            height: displayRect.height / overlaySize.height
+        let normalizedCanvasRect = CGRect(
+            x: canvasRect.minX / canvasSize.width,
+            y: canvasRect.minY / canvasSize.height,
+            width: canvasRect.width / canvasSize.width,
+            height: canvasRect.height / canvasSize.height
         )
 
-        guard isValidRect(normalizedDisplayRect) else {
-            return clampNormalizedRect(normalizedRect)
-        }
-
-        if clampMappedBBoxToVisibleArea {
-            return clampNormalizedRect(normalizedDisplayRect)
-        }
-
-        return normalizedDisplayRect
+        return normalizedCanvasRect
     }
 
-    private func currentOverlaySize() -> CGSize {
+    private func currentCanvasSize() -> CGSize {
         let boundsSize = trailOverlayView.bounds.size
 
         if boundsSize.width > 1,
-           boundsSize.height > 1 {
+        boundsSize.height > 1 {
             return boundsSize
         }
 
@@ -571,23 +539,23 @@ final class MainViewModel: ObservableObject {
 
     private func updateLatestSourceFrameSize(
         from buffer: CMSampleBuffer,
-        orientation: CGImagePropertyOrientation = .up
+        orientation: CGImagePropertyOrientation
     ) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(buffer) else {
             return
         }
 
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let rawWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let rawHeight = CVPixelBufferGetHeight(pixelBuffer)
 
-        guard width > 0,
-              height > 0 else {
+        guard rawWidth > 0,
+            rawHeight > 0 else {
             return
         }
 
         let rawSize = CGSize(
-            width: CGFloat(width),
-            height: CGFloat(height)
+            width: CGFloat(rawWidth),
+            height: CGFloat(rawHeight)
         )
 
         latestSourceFrameSize = orientedSourceSize(
@@ -654,7 +622,6 @@ final class MainViewModel: ObservableObject {
     ) -> CGFloat {
         min(max(value, lower), upper)
     }
-
     private func isValidRect(
         _ rect: CGRect
     ) -> Bool {
@@ -1226,8 +1193,8 @@ final class MainViewModel: ObservableObject {
 
     private func handleCameraFrame(_ buffer: CMSampleBuffer) {
         guard appMode == .cameraPreview ||
-              appMode == .recording ||
-              appMode == .preparingRecording else {
+            appMode == .recording ||
+            appMode == .preparingRecording else {
             return
         }
 
