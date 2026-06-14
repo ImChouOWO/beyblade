@@ -5,6 +5,8 @@ import UIKit
 
 struct ContentView: View {
 
+    @Environment(\.scenePhase) private var scenePhase
+
     @StateObject private var vm = MainViewModel()
 
     @State private var showVideoPicker = false
@@ -223,8 +225,22 @@ struct ContentView: View {
                 vm.cameraManager.updateVideoRotation()
                 vm.start()
             }
-            .onDisappear {
-                vm.stop()
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .active:
+                    print("[SCENE_PHASE] active")
+                    vm.start()
+
+                case .inactive:
+                    print("[SCENE_PHASE] inactive")
+
+                case .background:
+                    print("[SCENE_PHASE] background")
+                    vm.stop()
+
+                @unknown default:
+                    break
+                }
             }
             .onChange(of: size) { _, newSize in
                 print(

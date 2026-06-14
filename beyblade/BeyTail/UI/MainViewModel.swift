@@ -75,6 +75,11 @@ final class MainViewModel: ObservableObject {
         case stopped
     }
 
+    private enum FrameInputSource: Equatable {
+        case camera
+        case video
+    }
+
     private struct ResourceClearPolicy {
         let clearLoadedVideo: Bool
         let clearRecordedPreview: Bool
@@ -126,7 +131,19 @@ final class MainViewModel: ObservableObject {
     private var latestOverlaySize = CGSize(width: 1, height: 1)
     private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
 
+    private var activeFrameInputSource: FrameInputSource = .camera
+    private var activeVisionOrientation: CGImagePropertyOrientation = .up
 
+    /*
+     相機與影片的 bbox 修正分離：
+     - 相機維持原本 180 度 bbox 修正，避免破壞既有相機偵測顯示。
+     - 影片先不做 180 度修正，避免影片 bbox 被反轉到錯誤位置。
+     如果測試後發現影片 bbox 也上下左右相反，再把 rotateVideoBBox180 改成 true。
+    */
+    private let rotateCameraBBox180 = true
+    private let rotateVideoBBox180 = false
+
+    private var videoFrameCount = 0
 
     private let enableBBoxDisplayMapping = true
 
@@ -389,6 +406,11 @@ final class MainViewModel: ObservableObject {
 
         recordingManager.forceReset()
 
+        activeFrameInputSource = .camera
+        activeVisionOrientation = .up
+        videoFrameCount = 0
+        latestSourceFrameSize = CGSize(width: 1, height: 1)
+
         appMode = .stopped
     }
 
@@ -450,7 +472,8 @@ final class MainViewModel: ObservableObject {
             "trailBounds:", trailOverlayView.bounds.size,
             "videoGravity:", previewVideoGravity.rawValue,
             "cameraVideoRotationAngle:", cameraVideoRotationAngle,
-            "visionOrientation:", cameraManager.currentVisionImageOrientation.rawValue
+            "inputSource:", activeFrameInputSource,
+            "visionOrientation:", activeVisionOrientation.rawValue
         )
 
         for index in rawDetections.indices {
@@ -497,18 +520,23 @@ final class MainViewModel: ObservableObject {
     private func mapDetectionToOverlaySpace(
         _ detection: DetectionResult
     ) -> DisplayDetection {
-        /*
-         固定畫布模式：
-         不做 90 度旋轉，只修正 bbox 180 度反向。
-
-         適用情況：
-         - 相機畫面方向正確
-         - bbox 左右相反
-         - bbox 上下顛倒
-        */
-        let correctedRect = rotateBBox180(
+        let inputRect = clampNormalizedRect(
             detection.boundingBox
         )
+
+        let correctedRect: CGRect
+
+        switch activeFrameInputSource {
+        case .camera:
+            correctedRect = rotateCameraBBox180
+                ? rotateBBox180(inputRect)
+                : inputRect
+
+        case .video:
+            correctedRect = rotateVideoBBox180
+                ? rotateBBox180(inputRect)
+                : inputRect
+        }
 
         let mappedRect = mapNormalizedRectToCanvas(
             correctedRect
@@ -729,9 +757,6 @@ final class MainViewModel: ObservableObject {
         rect.height >= 0.0
     }
 
-
-    
-
     // MARK: - Video Picker Event
 
     func prepareForVideoPickerAsync() async -> Bool {
@@ -856,6 +881,11 @@ final class MainViewModel: ObservableObject {
 
             self.appMode = .loadingVideo
 
+            self.activeFrameInputSource = .video
+            self.activeVisionOrientation = .up
+            self.cameraVideoRotationAngle = 0
+            self.videoFrameCount = 0
+
             await self.clearImageResources(
                 policy: .beforeOpenVideoLibrary
             )
@@ -904,6 +934,9 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        activeFrameInputSource = .video
+        activeVisionOrientation = .up
+
         appMode = .videoReady
         finishEvent()
     }
@@ -912,6 +945,10 @@ final class MainViewModel: ObservableObject {
         print("[VIDEO] load failed:", message)
 
         videoFrameSource.forceResetAfterFailedLoad()
+
+        activeFrameInputSource = .camera
+        activeVisionOrientation = .up
+        videoFrameCount = 0
 
         appMode = .recovering
 
@@ -936,6 +973,9 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        activeFrameInputSource = .video
+        activeVisionOrientation = .up
+
         appMode = .videoEnded
     }
 
@@ -945,14 +985,32 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        let orientation: CGImagePropertyOrientation = .up
+
+        activeFrameInputSource = .video
+        activeVisionOrientation = orientation
+        cameraVideoRotationAngle = 0
+
         updateLatestSourceFrameSize(
             from: buffer,
-            orientation: .up
+            orientation: orientation
         )
+
+        videoFrameCount += 1
+
+        if videoFrameCount % 30 == 0 {
+            print(
+                "[VIDEO_FRAME]",
+                "count:", videoFrameCount,
+                "sourceSize:", latestSourceFrameSize,
+                "orientation:", orientation.rawValue,
+                "appMode:", appMode
+            )
+        }
 
         inferenceEngine.processFrame(
             buffer,
-            orientation: .up
+            orientation: orientation
         )
     }
 
@@ -991,6 +1049,10 @@ final class MainViewModel: ObservableObject {
             await self.clearImageResources(
                 policy: .beforeStartRecording
             )
+
+            self.activeFrameInputSource = .camera
+            self.activeVisionOrientation = .up
+            self.videoFrameCount = 0
 
             await self.startCameraPreviewAsync()
 
@@ -1077,6 +1139,10 @@ final class MainViewModel: ObservableObject {
             appMode = .cameraPreview
         }
 
+        activeFrameInputSource = .camera
+        activeVisionOrientation = .up
+        videoFrameCount = 0
+
         finishEvent()
 
         guard let url else {
@@ -1154,6 +1220,10 @@ final class MainViewModel: ObservableObject {
             await self.clearImageResources(
                 policy: .returnToCamera
             )
+
+            self.activeFrameInputSource = .camera
+            self.activeVisionOrientation = .up
+            self.videoFrameCount = 0
 
             await self.startCameraPreviewAsync()
 
@@ -1265,6 +1335,10 @@ final class MainViewModel: ObservableObject {
             return
         }
 
+        activeFrameInputSource = .camera
+        activeVisionOrientation = .up
+        videoFrameCount = 0
+
         isStartingCameraPreview = true
         syncPublishedState()
 
@@ -1298,6 +1372,9 @@ final class MainViewModel: ObservableObject {
         }
 
         let orientation = cameraManager.currentVisionImageOrientation
+
+        activeFrameInputSource = .camera
+        activeVisionOrientation = orientation
         cameraVideoRotationAngle = cameraManager.currentVideoRotationAngle
 
         updateLatestSourceFrameSize(
