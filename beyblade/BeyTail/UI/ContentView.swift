@@ -24,15 +24,38 @@ struct ContentView: View {
      - 不修改原本選單列的旋轉邏輯與參數
      - icon / 文字內容根據手機方向旋轉
      - hintBar 跟隨選單列方向與 icon 方向
+     - VideoPickerController 旋轉時會先交換寬高，避免縮放不貼合螢幕
     */
     @State private var iconRotation: Angle = .degrees(0)
+    @State private var iconRotationDeg: Double = 0
 
     private let fixedIsLandscape = true
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspect
     private let controlBarHeight: CGFloat = 110
 
+    private let videoPickerExtraRotationDeg: Double = 90
+    private let busyDeg: Double = 90
+
+    private var videoPickerRotationDeg: Double {
+        iconRotationDeg + videoPickerExtraRotationDeg
+    }
+
+    private var videoPickerRotation: Angle {
+        .degrees(videoPickerRotationDeg)
+    }
+
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
+    }
+
+    private func normalizedDegrees(_ degrees: Double) -> Double {
+        let value = degrees.truncatingRemainder(dividingBy: 360)
+        return value >= 0 ? value : value + 360
+    }
+
+    private func isQuarterTurn(_ degrees: Double) -> Bool {
+        let value = normalizedDegrees(degrees)
+        return value == 90 || value == 270
     }
 
     private var controlBarLayer: some View {
@@ -160,6 +183,7 @@ struct ContentView: View {
                 VideoPickerController(
                     isPresented: $showVideoPicker,
                     sessionID: pickerSessionID,
+                    rotationDegrees: videoPickerRotationDeg,
                     onSelectionPrepared: { sessionID in
                         handleSelectionPrepared(sessionID: sessionID)
                     },
@@ -202,7 +226,9 @@ struct ContentView: View {
                     "fixedCanvas:", true,
                     "isLandscape:", isLandscape,
                     "videoGravity:", videoGravity.rawValue,
-                    "iconRotation:", iconRotation
+                    "iconRotation:", iconRotation,
+                    "iconRotationDeg:", iconRotationDeg,
+                    "videoPickerRotationDeg:", videoPickerRotationDeg
                 )
 
                 vm.updatePreviewLayout(
@@ -233,7 +259,9 @@ struct ContentView: View {
                     "fixedCanvas:", true,
                     "isLandscape:", fixedIsLandscape,
                     "videoGravity:", fixedVideoGravity.rawValue,
-                    "iconRotation:", iconRotation
+                    "iconRotation:", iconRotation,
+                    "iconRotationDeg:", iconRotationDeg,
+                    "videoPickerRotationDeg:", videoPickerRotationDeg
                 )
 
                 vm.updatePreviewLayout(
@@ -269,28 +297,35 @@ struct ContentView: View {
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
         let addDeg: Double = 90
+        let deg: Double
 
         switch orientation {
         case .landscapeRight:
-            iconRotation = .degrees(0 + addDeg)
+            deg = 0 + addDeg
 
         case .portrait:
-            iconRotation = .degrees(90 + addDeg)
+            deg = 90 + addDeg
 
         case .landscapeLeft:
-            iconRotation = .degrees(180 + addDeg)
+            deg = 180 + addDeg
 
         case .portraitUpsideDown:
-            iconRotation = .degrees(270 + addDeg)
+            deg = 270 + addDeg
 
         default:
-            break
+            return
         }
+
+        iconRotationDeg = deg
+        iconRotation = .degrees(deg)
 
         print(
             "[ICON_ROTATION]",
             "deviceOrientation:", orientation.rawValue,
-            "iconRotation:", iconRotation
+            "iconRotation:", iconRotation,
+            "iconRotationDeg:", iconRotationDeg,
+            "videoPickerRotationDeg:", videoPickerRotationDeg,
+            "videoPickerQuarterTurn:", isQuarterTurn(videoPickerRotationDeg)
         )
     }
 
@@ -648,6 +683,8 @@ struct ContentView: View {
                 RoundedRectangle(cornerRadius: 14)
                     .fill(Color.black.opacity(0.75))
             )
+            .rotationEffect(iconRotation)
+            .rotationEffect(.degrees(busyDeg))
         }
         .allowsHitTesting(true)
     }
@@ -676,12 +713,13 @@ struct VideoPickerController: UIViewControllerRepresentable {
     @Binding var isPresented: Bool
 
     let sessionID: UUID
+    let rotationDegrees: Double
     let onSelectionPrepared: (UUID) -> Void
     let onPicked: (UUID, URL) -> Void
     let onCancel: (UUID) -> Void
     let onFailed: (UUID) -> Void
 
-    func makeUIViewController(context: Context) -> PHPickerViewController {
+    func makeUIViewController(context: Context) -> RotatedPHPickerContainerViewController {
         var configuration = PHPickerConfiguration(photoLibrary: .shared())
         configuration.filter = .videos
         configuration.selectionLimit = 1
@@ -690,13 +728,21 @@ struct VideoPickerController: UIViewControllerRepresentable {
         let picker = PHPickerViewController(configuration: configuration)
         picker.delegate = context.coordinator
 
-        return picker
+        let container = RotatedPHPickerContainerViewController(
+            contentViewController: picker
+        )
+
+        container.rotationDegrees = rotationDegrees
+
+        return container
     }
 
     func updateUIViewController(
-        _ uiViewController: PHPickerViewController,
+        _ uiViewController: RotatedPHPickerContainerViewController,
         context: Context
-    ) {}
+    ) {
+        uiViewController.rotationDegrees = rotationDegrees
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -798,6 +844,68 @@ struct VideoPickerController: UIViewControllerRepresentable {
                 }
             }
         }
+    }
+}
+final class RotatedPHPickerContainerViewController: UIViewController {
+
+    private let contentViewController: UIViewController
+
+    var rotationDegrees: Double = 0 {
+        didSet {
+            view.setNeedsLayout()
+        }
+    }
+
+    init(contentViewController: UIViewController) {
+        self.contentViewController = contentViewController
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        view.backgroundColor = .black
+        view.clipsToBounds = true
+
+        addChild(contentViewController)
+        view.addSubview(contentViewController.view)
+        contentViewController.didMove(toParent: self)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+
+        let size = view.bounds.size
+        let normalized = normalizedDegrees(rotationDegrees)
+        let quarterTurn = normalized == 90 || normalized == 270
+
+        let contentSize = CGSize(
+            width: quarterTurn ? size.height : size.width,
+            height: quarterTurn ? size.width : size.height
+        )
+
+        contentViewController.view.bounds = CGRect(
+            origin: .zero,
+            size: contentSize
+        )
+
+        contentViewController.view.center = CGPoint(
+            x: size.width / 2,
+            y: size.height / 2
+        )
+
+        contentViewController.view.transform = CGAffineTransform(
+            rotationAngle: CGFloat(rotationDegrees * .pi / 180)
+        )
+    }
+
+    private func normalizedDegrees(_ degrees: Double) -> Double {
+        let value = degrees.truncatingRemainder(dividingBy: 360)
+        return value >= 0 ? value : value + 360
     }
 }
 
