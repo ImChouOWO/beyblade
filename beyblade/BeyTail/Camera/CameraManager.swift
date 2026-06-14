@@ -28,6 +28,24 @@ final class CameraManager: NSObject {
         return _currentVideoRotationAngle
     }
 
+    // MARK: - Fixed Orientation
+
+    /*
+     固定順時針 90 度畫面基準。
+
+     依照你前面的實測：
+     - 順時針旋轉 90 度時 bbox 正常
+     - 該方向對應原本的 landscapeRight
+     - 原本 landscapeRight 對應：
+       videoRotationAngle = 0
+       visionImageOrientation = .down
+
+     所以這裡完全固定相機輸出與 Vision 方向。
+     手機實體旋轉時，不再改變 camera output / Vision / bbox 座標系。
+    */
+    private let fixedVideoRotationAngle: CGFloat = 0
+    private let fixedVisionImageOrientation: CGImagePropertyOrientation = .down
+
     // MARK: - Private
 
     private let sessionQueue = DispatchQueue(
@@ -46,35 +64,25 @@ final class CameraManager: NSObject {
     private var isSessionRunning = false
 
     private let orientationLock = NSLock()
-    private var _currentVisionImageOrientation: CGImagePropertyOrientation = .right
-    private var _currentVideoRotationAngle: CGFloat = 90
+    private var _currentVisionImageOrientation: CGImagePropertyOrientation = .down
+    private var _currentVideoRotationAngle: CGFloat = 0
 
     private var lastAppliedVideoAngle: CGFloat = -1
-    private var lastValidDeviceOrientation: UIDeviceOrientation = .portrait
 
     // MARK: - Init
 
     override init() {
         super.init()
 
-        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(deviceOrientationDidChange),
-            name: UIDevice.orientationDidChangeNotification,
-            object: nil
-        )
+        /*
+         不再監聽 UIDevice.orientationDidChangeNotification。
+         目標是固定相機畫布方向，而不是跟著手機旋轉改變影像座標系。
+        */
+        setFixedOrientationState()
     }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        UIDevice.current.endGeneratingDeviceOrientationNotifications()
-    }
-
-    @objc private func deviceOrientationDidChange() {
-        updateDeviceOrientationState()
-        updateVideoRotation()
     }
 
     // MARK: - Permission / Start
@@ -207,8 +215,8 @@ final class CameraManager: NSObject {
             return
         }
 
-        updateDeviceOrientationState()
-        applyCurrentVideoRotation(force: true)
+        setFixedOrientationState()
+        applyFixedVideoRotation(force: true)
 
         guard !session.isRunning else {
             isSessionRunning = true
@@ -218,7 +226,7 @@ final class CameraManager: NSObject {
         session.startRunning()
         isSessionRunning = session.isRunning
 
-        applyCurrentVideoRotation(force: true)
+        applyFixedVideoRotation(force: true)
     }
 
     private func stopSessionIfNeeded() {
@@ -327,21 +335,32 @@ final class CameraManager: NSObject {
     }
 
     private func configureVideoConnection(_ connection: AVCaptureConnection) {
-        if connection.isVideoMirroringSupported {
-            if connection.automaticallyAdjustsVideoMirroring {
-                connection.automaticallyAdjustsVideoMirroring = false
-            }
+        configureMirroringIfNeeded(connection)
 
-            connection.isVideoMirrored = false
-        }
-
-        applyCurrentVideoRotation(
+        applyFixedVideoRotation(
             to: connection,
             force: true
         )
     }
 
-    // MARK: - Dynamic Rotation
+    private func configureMirroringIfNeeded(_ connection: AVCaptureConnection) {
+        /*
+         videoOutput connection 可以安全關閉 mirroring。
+         PreviewLayer connection 不要這樣做，否則可能因
+         automaticallyAdjustsVideoMirroring == true 而 crash。
+        */
+        guard connection.isVideoMirroringSupported else {
+            return
+        }
+
+        if connection.automaticallyAdjustsVideoMirroring {
+            connection.automaticallyAdjustsVideoMirroring = false
+        }
+
+        connection.isVideoMirrored = false
+    }
+
+    // MARK: - Fixed Rotation
 
     func updateVideoRotation() {
         sessionQueue.async { [weak self] in
@@ -349,38 +368,37 @@ final class CameraManager: NSObject {
                 return
             }
 
-            self.updateDeviceOrientationState()
-            self.applyCurrentVideoRotation(force: false)
+            self.setFixedOrientationState()
+            self.applyFixedVideoRotation(force: false)
         }
     }
 
-    private func applyCurrentVideoRotation(force: Bool) {
+    private func setFixedOrientationState() {
+        orientationLock.lock()
+        _currentVideoRotationAngle = fixedVideoRotationAngle
+        _currentVisionImageOrientation = fixedVisionImageOrientation
+        orientationLock.unlock()
+    }
+
+    private func applyFixedVideoRotation(force: Bool) {
         guard let connection = videoOutput.connection(with: .video) else {
             return
         }
 
-        applyCurrentVideoRotation(
+        applyFixedVideoRotation(
             to: connection,
             force: force
         )
     }
 
-    private func applyCurrentVideoRotation(
+    private func applyFixedVideoRotation(
         to connection: AVCaptureConnection,
         force: Bool
     ) {
-        let angle = videoRotationAngle(
-            for: lastValidDeviceOrientation
-        )
+        setFixedOrientationState()
 
-        let visionOrientation = visionImageOrientation(
-            for: lastValidDeviceOrientation
-        )
-
-        orientationLock.lock()
-        _currentVideoRotationAngle = angle
-        _currentVisionImageOrientation = visionOrientation
-        orientationLock.unlock()
+        let angle = fixedVideoRotationAngle
+        let visionOrientation = fixedVisionImageOrientation
 
         guard force || angle != lastAppliedVideoAngle else {
             return
@@ -394,86 +412,11 @@ final class CameraManager: NSObject {
         connection.videoRotationAngle = angle
         lastAppliedVideoAngle = angle
 
-        if connection.isVideoMirroringSupported {
-            connection.isVideoMirrored = false
-        }
-
         print(
-            "[CAMERA]",
-            "deviceOrientation:", lastValidDeviceOrientation.rawValue,
+            "[CAMERA_FIXED]",
             "videoRotationAngle:", angle,
             "visionOrientation:", visionOrientation.rawValue
         )
-    }
-
-    private func updateDeviceOrientationState() {
-        let orientation = UIDevice.current.orientation
-
-        switch orientation {
-        case .portrait,
-             .portraitUpsideDown,
-             .landscapeLeft,
-             .landscapeRight:
-            lastValidDeviceOrientation = orientation
-
-        default:
-            break
-        }
-
-        let angle = videoRotationAngle(
-            for: lastValidDeviceOrientation
-        )
-
-        let visionOrientation = visionImageOrientation(
-            for: lastValidDeviceOrientation
-        )
-
-        orientationLock.lock()
-        _currentVideoRotationAngle = angle
-        _currentVisionImageOrientation = visionOrientation
-        orientationLock.unlock()
-    }
-
-    private func videoRotationAngle(
-        for deviceOrientation: UIDeviceOrientation
-    ) -> CGFloat {
-        switch deviceOrientation {
-        case .portrait:
-            return 90
-
-        case .landscapeRight:
-            return 0
-
-        case .landscapeLeft:
-            return 180
-
-        case .portraitUpsideDown:
-            return 270
-
-        default:
-            return 90
-        }
-    }
-
-    private func visionImageOrientation(
-        for deviceOrientation: UIDeviceOrientation
-    ) -> CGImagePropertyOrientation {
-        switch deviceOrientation {
-        case .portrait:
-            return .right
-
-        case .landscapeLeft:
-            return .up
-
-        case .landscapeRight:
-            return .down
-
-        case .portraitUpsideDown:
-            return .left
-
-        default:
-            return .right
-        }
     }
 
     // MARK: - Frame Rate

@@ -26,7 +26,7 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var fps: Int = 0
     @Published private(set) var hardwareLabel = "MOCK"
     @Published private(set) var hardwareColor = Color(white: 0.6)
-    @Published private(set) var cameraVideoRotationAngle: CGFloat = 90
+    @Published private(set) var cameraVideoRotationAngle: CGFloat = 0
 
     @Published var hintVisible = true
     @Published var pulseScale: CGFloat = 1.0
@@ -126,14 +126,7 @@ final class MainViewModel: ObservableObject {
     private var latestOverlaySize = CGSize(width: 1, height: 1)
     private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
 
-    /*
-     bbox 座標修正以目前 UI interface orientation 為準。
-     你的實測狀況：
-     - 順時針 90 度：bbox 正常
-     - 逆時針 90 度：bbox 上下顛倒、左右相反
-     - 直立 / 上下顛倒：bbox 相對位置旋轉 90 度
-    */
-    private var currentInterfaceOrientation: UIInterfaceOrientation = .portrait
+
 
     private let enableBBoxDisplayMapping = true
 
@@ -210,16 +203,12 @@ final class MainViewModel: ObservableObject {
         latestOverlaySize = overlaySize
         previewVideoGravity = videoGravity
         cameraVideoRotationAngle = cameraManager.currentVideoRotationAngle
-        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
-            fallbackSize: overlaySize
-        )
 
         print(
             "[LAYOUT]",
             "overlaySize:", overlaySize,
             "trailBounds:", trailOverlayView.bounds.size,
             "videoGravity:", videoGravity.rawValue,
-            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
             "cameraVideoRotationAngle:", cameraVideoRotationAngle
         )
 
@@ -412,10 +401,6 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
-            fallbackSize: currentCanvasSize()
-        )
-
         if let first = tracked.first {
             fps = Int(first.fps)
             hardwareLabel = first.hardware.label
@@ -464,7 +449,6 @@ final class MainViewModel: ObservableObject {
             "overlaySize:", latestOverlaySize,
             "trailBounds:", trailOverlayView.bounds.size,
             "videoGravity:", previewVideoGravity.rawValue,
-            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
             "cameraVideoRotationAngle:", cameraVideoRotationAngle,
             "visionOrientation:", cameraManager.currentVisionImageOrientation.rawValue
         )
@@ -479,7 +463,6 @@ final class MainViewModel: ObservableObject {
                 "trackId:", raw.trackId,
                 "confidence:", raw.confidence,
                 "rawBBox:", raw.boundingBox,
-                "correctedBBox:", mapped.correctedRect,
                 "mappedBBox:", mapped.displayRect,
                 "mappedCenter:", mapped.displayCenter
             )
@@ -509,13 +492,21 @@ final class MainViewModel: ObservableObject {
         let displayCenter: CGPoint
         let trackId: Int
         let color: UIColor
-        let correctedRect: CGRect
     }
 
     private func mapDetectionToOverlaySpace(
         _ detection: DetectionResult
     ) -> DisplayDetection {
-        let correctedRect = correctDetectionBBoxOrientation(
+        /*
+         固定畫布模式：
+         不做 90 度旋轉，只修正 bbox 180 度反向。
+
+         適用情況：
+         - 相機畫面方向正確
+         - bbox 左右相反
+         - bbox 上下顛倒
+        */
+        let correctedRect = rotateBBox180(
             detection.boundingBox
         )
 
@@ -530,95 +521,23 @@ final class MainViewModel: ObservableObject {
                 y: mappedRect.midY
             ),
             trackId: detection.trackId,
-            color: detection.dominantColor,
-            correctedRect: correctedRect
+            color: detection.dominantColor
         )
-    }
-
-    private func correctDetectionBBoxOrientation(
-        _ rect: CGRect
-    ) -> CGRect {
-        let input = clampNormalizedRect(rect)
-
-        let corrected: CGRect
-
-        /*
-         目前依照你的實測結果建立方向修正：
-
-         1. 順時針旋轉 90 度：bbox 正常
-            -> 對應 .landscapeRight，直接使用原 bbox
-
-         2. 逆時針旋轉 90 度：bbox 上下顛倒、左右相反
-            -> 對應 .landscapeLeft，旋轉 180 度
-
-         3. 直立：bbox 相對位置旋轉 90 度
-            -> 對應 .portrait，做 90 度順時針修正
-
-         4. 上下顛倒：
-            如果 App 沒有支援 portraitUpsideDown，通常仍會被視為 portrait。
-            如果系統真的回傳 .portraitUpsideDown，這裡做 90 度逆時針修正。
-        */
-
-        switch currentInterfaceOrientation {
-        case .landscapeLeft:
-            corrected = input
-
-        case .landscapeRight:
-            corrected = rotateBBox180(input)
-
-        case .portraitUpsideDown:
-            corrected = rotateBBox90Clockwise(input)
-
-        case .portrait:
-            corrected = rotateBBox90CounterClockwise(input)
-
-        default:
-            corrected = input
-        }
-
-        let output = clampNormalizedRect(corrected)
-
-        print(
-            "[BBOX_ORIENTATION_FIX]",
-            "interfaceOrientation:", currentInterfaceOrientation.rawValue,
-            "raw:", input,
-            "corrected:", output
-        )
-
-        return output
     }
 
     private func rotateBBox180(
         _ rect: CGRect
     ) -> CGRect {
-        CGRect(
-            x: 1.0 - rect.maxX,
-            y: 1.0 - rect.maxY,
-            width: rect.width,
-            height: rect.height
-        )
-    }
+        let input = clampNormalizedRect(rect)
 
-    private func rotateBBox90Clockwise(
-        _ rect: CGRect
-    ) -> CGRect {
-        CGRect(
-            x: 1.0 - rect.maxY,
-            y: rect.minX,
-            width: rect.height,
-            height: rect.width
+        let rotated = CGRect(
+            x: 1.0 - input.maxX,
+            y: 1.0 - input.maxY,
+            width: input.width,
+            height: input.height
         )
-    }
 
-    private func rotateBBox90CounterClockwise(
-        _ rect: CGRect
-    ) -> CGRect {
-        CGRect(
-            x: rect.minY,
-            y: 1.0 - rect.maxX,
-            width: rect.height,
-            height: rect.width
-        )
+        return clampNormalizedRect(rotated)
     }
 
     private func mapNormalizedRectToCanvas(
@@ -810,42 +729,8 @@ final class MainViewModel: ObservableObject {
         rect.height >= 0.0
     }
 
-    // MARK: - Interface Orientation
 
-    private func resolveCurrentInterfaceOrientation(
-        fallbackSize: CGSize
-    ) -> UIInterfaceOrientation {
-        if let orientation = currentForegroundInterfaceOrientation() {
-            switch orientation {
-            case .portrait,
-                 .landscapeLeft,
-                 .landscapeRight,
-                 .portraitUpsideDown:
-                return orientation
-
-            default:
-                break
-            }
-        }
-
-        return fallbackSize.width > fallbackSize.height
-            ? .landscapeRight
-            : .portrait
-    }
-
-    private func currentForegroundInterfaceOrientation() -> UIInterfaceOrientation? {
-        guard let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first(where: { $0.activationState == .foregroundActive }) else {
-            return nil
-        }
-
-        if #available(iOS 26.0, *) {
-            return scene.effectiveGeometry.interfaceOrientation
-        } else {
-            return scene.interfaceOrientation
-        }
-    }
+    
 
     // MARK: - Video Picker Event
 
@@ -1414,9 +1299,6 @@ final class MainViewModel: ObservableObject {
 
         let orientation = cameraManager.currentVisionImageOrientation
         cameraVideoRotationAngle = cameraManager.currentVideoRotationAngle
-        currentInterfaceOrientation = resolveCurrentInterfaceOrientation(
-            fallbackSize: currentCanvasSize()
-        )
 
         updateLatestSourceFrameSize(
             from: buffer,

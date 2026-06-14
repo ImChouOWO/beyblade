@@ -16,17 +16,86 @@ struct ContentView: View {
     @State private var selectionPreparedPickerSessionID: UUID?
     @State private var handledPickerSessionID: UUID?
 
+    /*
+     固定畫布模式：
+     - AppDelegate 可維持 .landscapeRight
+     - 影像畫布固定不旋轉
+     - 選單列固定在畫面右側
+     - 不修改原本選單列的旋轉邏輯與參數
+     - icon / 文字內容根據手機方向旋轉
+     - hintBar 跟隨選單列方向與 icon 方向
+    */
+    @State private var iconRotation: Angle = .degrees(0)
+
+    private let fixedIsLandscape = true
+    private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspect
+    private let controlBarHeight: CGFloat = 110
+
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
+    }
+
+    private var controlBarLayer: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+
+            bottomBar
+                .frame(
+                    width: size.height,
+                    height: controlBarHeight
+                )
+                .rotationEffect(.degrees(90))
+                .position(
+                    x: size.width - controlBarHeight / 2,
+                    y: size.height / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(true)
+    }
+
+    private var hintLayer: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+
+            hintBar
+                .rotationEffect(.degrees(90))
+                .position(
+                    x: size.width - controlBarHeight - 34,
+                    y: size.height / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    private var effectMenuLayer: some View {
+        GeometryReader { geometry in
+            let size = geometry.size
+
+            if vm.effectMenuVisible {
+                EffectMenuView(
+                    selectedEffect: $vm.selectedEffect,
+                    isVisible: $vm.effectMenuVisible
+                )
+                .rotationEffect(iconRotation)
+                .rotationEffect(.degrees(90))
+                .position(
+                    x: size.width - controlBarHeight - 92,
+                    y: size.height - 78
+                )
+                .transition(.opacity)
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(vm.effectMenuVisible)
     }
 
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let isLandscape = size.width > size.height
-            let videoGravity: AVLayerVideoGravity = isLandscape
-                ? .resizeAspect
-                : .resizeAspectFill
+            let isLandscape = fixedIsLandscape
+            let videoGravity = fixedVideoGravity
 
             ZStack {
                 Group {
@@ -69,29 +138,12 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     topBar
                     Spacer()
-                    hintBar
-                    bottomBar
                 }
                 .ignoresSafeArea(edges: .bottom)
 
-                if vm.effectMenuVisible {
-                    VStack {
-                        Spacer()
-
-                        HStack {
-                            Spacer()
-
-                            EffectMenuView(
-                                selectedEffect: $vm.selectedEffect,
-                                isVisible: $vm.effectMenuVisible
-                            )
-                            .padding(.trailing, 8)
-                            .padding(.bottom, 130)
-                        }
-                    }
-                    .ignoresSafeArea()
-                    .transition(.opacity)
-                }
+                hintLayer
+                controlBarLayer
+                effectMenuLayer
 
                 if isBusy {
                     busyOverlay
@@ -141,11 +193,16 @@ struct ContentView: View {
                 .interactiveDismissDisabled(false)
             }
             .onAppear {
+                UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+                updateIconRotation()
+
                 print(
                     "[CONTENT_LAYOUT_APPEAR]",
                     "size:", size,
+                    "fixedCanvas:", true,
                     "isLandscape:", isLandscape,
-                    "videoGravity:", videoGravity.rawValue
+                    "videoGravity:", videoGravity.rawValue,
+                    "iconRotation:", iconRotation
                 )
 
                 vm.updatePreviewLayout(
@@ -153,6 +210,10 @@ struct ContentView: View {
                     videoGravity: videoGravity
                 )
 
+                /*
+                 CameraManager 應已固定 videoRotationAngle = 0。
+                 這裡保留呼叫，讓 CameraManager 重新套用固定方向。
+                */
                 vm.cameraManager.updateVideoRotation()
                 vm.start()
             }
@@ -160,24 +221,34 @@ struct ContentView: View {
                 vm.stop()
             }
             .onChange(of: size) { _, newSize in
-                let newIsLandscape = newSize.width > newSize.height
-                let newVideoGravity: AVLayerVideoGravity = newIsLandscape
-                    ? .resizeAspect
-                    : .resizeAspectFill
-
+                /*
+                 固定畫布模式：
+                 size 改變時只更新 overlaySize。
+                 不再根據 newSize.width > newSize.height 改變 videoGravity。
+                 選單列位置也不再跟著 deviceOrientation 改變。
+                */
                 print(
                     "[CONTENT_LAYOUT_CHANGE]",
                     "size:", newSize,
-                    "isLandscape:", newIsLandscape,
-                    "videoGravity:", newVideoGravity.rawValue
+                    "fixedCanvas:", true,
+                    "isLandscape:", fixedIsLandscape,
+                    "videoGravity:", fixedVideoGravity.rawValue,
+                    "iconRotation:", iconRotation
                 )
 
                 vm.updatePreviewLayout(
                     overlaySize: newSize,
-                    videoGravity: newVideoGravity
+                    videoGravity: fixedVideoGravity
                 )
 
                 vm.cameraManager.updateVideoRotation()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIDevice.orientationDidChangeNotification
+                )
+            ) { _ in
+                updateIconRotation()
             }
             .onChange(of: vm.isSwitchingInputSource) { _, newValue in
                 if !newValue {
@@ -191,6 +262,36 @@ struct ContentView: View {
             }
             .preferredColorScheme(.dark)
         }
+    }
+
+    // MARK: - Icon Rotation
+
+    private func updateIconRotation() {
+        let orientation = UIDevice.current.orientation
+        let addDeg: Double = 90
+
+        switch orientation {
+        case .landscapeRight:
+            iconRotation = .degrees(0 + addDeg)
+
+        case .portrait:
+            iconRotation = .degrees(90 + addDeg)
+
+        case .landscapeLeft:
+            iconRotation = .degrees(180 + addDeg)
+
+        case .portraitUpsideDown:
+            iconRotation = .degrees(270 + addDeg)
+
+        default:
+            break
+        }
+
+        print(
+            "[ICON_ROTATION]",
+            "deviceOrientation:", orientation.rawValue,
+            "iconRotation:", iconRotation
+        )
     }
 
     // MARK: - Video Picker Handler
@@ -302,19 +403,27 @@ struct ContentView: View {
     // MARK: - Top Bar
 
     private var topBar: some View {
-        HStack {
-            Text("BEY TAIL")
-                .font(.system(size: 20, weight: .black))
-                .foregroundStyle(
-                    LinearGradient(
-                        colors: [
-                            Color(hex: 0x00F5FF),
-                            Color(hex: 0xBF5FFF)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
+        let txtDeg: Double = 90
+
+        return HStack {
+            ZStack {
+                Text("BEY TAIL")
+                    .font(.system(size: 20, weight: .black))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: 0x00F5FF),
+                                Color(hex: 0xBF5FFF)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
                     )
-                )
+                    .fixedSize()
+                    .rotationEffect(iconRotation)
+                    .rotationEffect(.degrees(txtDeg))
+            }
+            .frame(width: 96, height: 96)
 
             Spacer()
 
@@ -329,6 +438,7 @@ struct ContentView: View {
                         Color(white: 1, opacity: 0.15)
                             .cornerRadius(8)
                     )
+                    .rotationEffect(iconRotation)
             }
             .disabled(isBusy)
             .opacity(isBusy ? 0.45 : 1.0)
@@ -357,7 +467,7 @@ struct ContentView: View {
                     Capsule()
                         .fill(Color(white: 0.04).opacity(0.88))
                 )
-                .padding(.bottom, 10)
+                .rotationEffect(iconRotation)
                 .transition(.opacity)
             }
         }
@@ -389,6 +499,7 @@ struct ContentView: View {
                                 : Color(white: 0.28)
                         )
                 }
+                .rotationEffect(iconRotation)
             }
             .frame(maxWidth: .infinity)
             .disabled(!vm.canOpenVideoLibrary || isPreparingVideoPicker || showVideoPicker || isBusy)
@@ -419,6 +530,7 @@ struct ContentView: View {
                             Circle()
                                 .fill(centerButtonGradient)
                         )
+                        .rotationEffect(iconRotation)
                 }
                 .disabled(centerButtonDisabled)
                 .opacity(centerButtonDisabled ? 0.45 : 1.0)
@@ -436,6 +548,7 @@ struct ContentView: View {
                             .font(.system(size: 11, weight: .bold, design: .monospaced))
                             .foregroundColor(vm.hardwareColor)
                     }
+                    .rotationEffect(iconRotation)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.leading, 8)
 
@@ -462,6 +575,7 @@ struct ContentView: View {
                                                 )
                                         )
                                 )
+                                .rotationEffect(iconRotation)
                         }
                         .padding(.trailing, 8)
                         .disabled(isBusy)
@@ -471,7 +585,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity)
         }
-        .frame(height: 110)
+        .frame(height: controlBarHeight)
         .background(Color(white: 0.05).opacity(0.95))
     }
 
@@ -724,7 +838,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
 final class CameraPreviewUIView: UIView {
 
-    private var isLandscape = false
+    private var isLandscape = true
     private var lastAppliedPreviewAngle: CGFloat = -1
 
     override static var layerClass: AnyClass {
@@ -756,7 +870,11 @@ final class CameraPreviewUIView: UIView {
     }
 
     func setIsLandscape(_ isLandscape: Bool) {
-        self.isLandscape = isLandscape
+        /*
+         固定畫布模式：
+         不接受外部動態方向，只維持橫向畫布。
+        */
+        self.isLandscape = true
         applyPreviewRotationIfNeeded(force: true)
     }
 
@@ -774,8 +892,8 @@ final class CameraPreviewUIView: UIView {
         print(
             "[PREVIEW_LAYOUT]",
             "bounds:", bounds.size,
+            "fixedCanvas:", true,
             "isLandscape:", isLandscape,
-            "interfaceOrientation:", currentInterfaceOrientationRawValue(),
             "videoGravity:", previewLayer.videoGravity.rawValue
         )
     }
@@ -785,7 +903,7 @@ final class CameraPreviewUIView: UIView {
             return
         }
 
-        let previewAngle = previewRotationAngleForCurrentInterface()
+        let previewAngle = fixedPreviewRotationAngle()
 
         guard force || previewAngle != lastAppliedPreviewAngle else {
             return
@@ -805,51 +923,22 @@ final class CameraPreviewUIView: UIView {
         print(
             "[PREVIEW_ROTATION]",
             "previewAngle:", previewAngle,
+            "fixedCanvas:", true,
             "bounds:", bounds.size,
             "isLandscape:", isLandscape,
-            "interfaceOrientation:", currentInterfaceOrientationRawValue(),
             "automaticallyAdjustsVideoMirroring:", connection.automaticallyAdjustsVideoMirroring,
             "isVideoMirrored:", connection.isVideoMirrored
         )
     }
 
-    private func previewRotationAngleForCurrentInterface() -> CGFloat {
-        guard let orientation = currentInterfaceOrientation() else {
-            return isLandscape ? 180 : 90
-        }
-
-        switch orientation {
-        case .portrait:
-            return 90
-
-        case .landscapeLeft:
-            return 180
-
-        case .landscapeRight:
-            return 0
-
-//        case .portraitUpsideDown:
-//            return 270
-
-        default:
-            return isLandscape ? 180 : 90
-        }
-    }
-
-    private func currentInterfaceOrientation() -> UIInterfaceOrientation? {
-        guard let windowScene = window?.windowScene else {
-            return nil
-        }
-
-        if #available(iOS 26.0, *) {
-            return windowScene.effectiveGeometry.interfaceOrientation
-        } else {
-            return windowScene.interfaceOrientation
-        }
-    }
-
-    private func currentInterfaceOrientationRawValue() -> Int {
-        currentInterfaceOrientation()?.rawValue ?? -1
+    private func fixedPreviewRotationAngle() -> CGFloat {
+        /*
+         固定順時針 90 度橫向基準。
+         對應 CameraManager:
+         videoRotationAngle = 0
+         visionImageOrientation = .down
+        */
+        return 0
     }
 }
 
