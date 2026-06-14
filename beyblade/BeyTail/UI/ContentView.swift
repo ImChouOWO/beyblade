@@ -1,8 +1,7 @@
 import SwiftUI
-import AVFoundation
+@preconcurrency import AVFoundation
 import UIKit
-import PhotosUI
-import UniformTypeIdentifiers
+@preconcurrency import Photos
 
 struct ContentView: View {
 
@@ -18,44 +17,31 @@ struct ContentView: View {
 
     /*
      固定畫布模式：
-     - AppDelegate 可維持 .landscapeRight
-     - 影像畫布固定不旋轉
+     - AppDelegate 維持 .landscapeRight
+     - CameraPreview / VideoPlayer / TrailOverlay 不跟隨裝置方向旋轉
      - 選單列固定在畫面右側
-     - 不修改原本選單列的旋轉邏輯與參數
-     - icon / 文字內容根據手機方向旋轉
-     - hintBar 跟隨選單列方向與 icon 方向
-     - VideoPickerController 旋轉時會先交換寬高，避免縮放不貼合螢幕
+     - 不修改 controlBarLayer 的外層旋轉與位置邏輯
+     - icon / 文字 / FPS / 效果按鈕跟隨 iconRotation
+     - hintBar 外層跟選單列方向一致，內部跟 iconRotation 一致
+     - BEY TAIL 額外補償 90 度
+     - busyOverlay 只旋轉中間卡片，不旋轉遮罩
+     - 影片庫改為自製 SwiftUI Grid
+     - 影片庫實際角度 = iconRotation + videoLibraryExtraRotationDeg
+     - layout 寬高交換也使用同一個實際角度，避免跑版
+     - 影片縮圖固定直拍比例 9:16
+     - 影片縮圖使用固定 cardWidth，避免寬度重疊
     */
     @State private var iconRotation: Angle = .degrees(0)
-    @State private var iconRotationDeg: Double = 0
 
     private let fixedIsLandscape = true
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspect
     private let controlBarHeight: CGFloat = 110
 
-    private let videoPickerExtraRotationDeg: Double = 90
     private let busyDeg: Double = 90
-
-    private var videoPickerRotationDeg: Double {
-        iconRotationDeg + videoPickerExtraRotationDeg
-    }
-
-    private var videoPickerRotation: Angle {
-        .degrees(videoPickerRotationDeg)
-    }
+    private let videoLibraryExtraRotationDeg: Double = 90
 
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
-    }
-
-    private func normalizedDegrees(_ degrees: Double) -> Double {
-        let value = degrees.truncatingRemainder(dividingBy: 360)
-        return value >= 0 ? value : value + 360
-    }
-
-    private func isQuarterTurn(_ degrees: Double) -> Bool {
-        let value = normalizedDegrees(degrees)
-        return value == 90 || value == 270
     }
 
     private var controlBarLayer: some View {
@@ -173,17 +159,18 @@ struct ContentView: View {
                         .transition(.opacity)
                 }
             }
-            .sheet(
+            .fullScreenCover(
                 isPresented: $showVideoPicker,
                 onDismiss: {
                     let sessionID = presentedPickerSessionID ?? pickerSessionID
                     handleVideoPickerDismiss(sessionID: sessionID)
                 }
             ) {
-                VideoPickerController(
+                RotatedVideoLibraryPickerView(
                     isPresented: $showVideoPicker,
                     sessionID: pickerSessionID,
-                    rotationDegrees: videoPickerRotationDeg,
+                    rotation: $iconRotation,
+                    extraRotationDegrees: videoLibraryExtraRotationDeg,
                     onSelectionPrepared: { sessionID in
                         handleSelectionPrepared(sessionID: sessionID)
                     },
@@ -214,7 +201,6 @@ struct ContentView: View {
                     }
                 )
                 .ignoresSafeArea()
-                .interactiveDismissDisabled(false)
             }
             .onAppear {
                 UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -226,9 +212,7 @@ struct ContentView: View {
                     "fixedCanvas:", true,
                     "isLandscape:", isLandscape,
                     "videoGravity:", videoGravity.rawValue,
-                    "iconRotation:", iconRotation,
-                    "iconRotationDeg:", iconRotationDeg,
-                    "videoPickerRotationDeg:", videoPickerRotationDeg
+                    "iconRotation:", iconRotation
                 )
 
                 vm.updatePreviewLayout(
@@ -236,10 +220,6 @@ struct ContentView: View {
                     videoGravity: videoGravity
                 )
 
-                /*
-                 CameraManager 應已固定 videoRotationAngle = 0。
-                 這裡保留呼叫，讓 CameraManager 重新套用固定方向。
-                */
                 vm.cameraManager.updateVideoRotation()
                 vm.start()
             }
@@ -247,21 +227,13 @@ struct ContentView: View {
                 vm.stop()
             }
             .onChange(of: size) { _, newSize in
-                /*
-                 固定畫布模式：
-                 size 改變時只更新 overlaySize。
-                 不再根據 newSize.width > newSize.height 改變 videoGravity。
-                 選單列位置也不再跟著 deviceOrientation 改變。
-                */
                 print(
                     "[CONTENT_LAYOUT_CHANGE]",
                     "size:", newSize,
                     "fixedCanvas:", true,
                     "isLandscape:", fixedIsLandscape,
                     "videoGravity:", fixedVideoGravity.rawValue,
-                    "iconRotation:", iconRotation,
-                    "iconRotationDeg:", iconRotationDeg,
-                    "videoPickerRotationDeg:", videoPickerRotationDeg
+                    "iconRotation:", iconRotation
                 )
 
                 vm.updatePreviewLayout(
@@ -297,35 +269,28 @@ struct ContentView: View {
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
         let addDeg: Double = 90
-        let deg: Double
 
         switch orientation {
         case .landscapeRight:
-            deg = 0 + addDeg
+            iconRotation = .degrees(0 + addDeg)
 
         case .portrait:
-            deg = 90 + addDeg
+            iconRotation = .degrees(90 + addDeg)
 
         case .landscapeLeft:
-            deg = 180 + addDeg
+            iconRotation = .degrees(180 + addDeg)
 
         case .portraitUpsideDown:
-            deg = 270 + addDeg
+            iconRotation = .degrees(270 + addDeg)
 
         default:
-            return
+            break
         }
-
-        iconRotationDeg = deg
-        iconRotation = .degrees(deg)
 
         print(
             "[ICON_ROTATION]",
             "deviceOrientation:", orientation.rawValue,
-            "iconRotation:", iconRotation,
-            "iconRotationDeg:", iconRotationDeg,
-            "videoPickerRotationDeg:", videoPickerRotationDeg,
-            "videoPickerQuarterTurn:", isQuarterTurn(videoPickerRotationDeg)
+            "iconRotation:", iconRotation
         )
     }
 
@@ -706,206 +671,780 @@ struct ContentView: View {
     }
 }
 
-// MARK: - UIKit PHPicker Wrapper
+// MARK: - Custom SwiftUI Video Library Picker
 
-struct VideoPickerController: UIViewControllerRepresentable {
+struct RotatedVideoLibraryPickerView: View {
 
     @Binding var isPresented: Bool
 
     let sessionID: UUID
-    let rotationDegrees: Double
+
+    @Binding var rotation: Angle
+    let extraRotationDegrees: Double
+
     let onSelectionPrepared: (UUID) -> Void
     let onPicked: (UUID, URL) -> Void
     let onCancel: (UUID) -> Void
     let onFailed: (UUID) -> Void
 
-    func makeUIViewController(context: Context) -> RotatedPHPickerContainerViewController {
-        var configuration = PHPickerConfiguration(photoLibrary: .shared())
-        configuration.filter = .videos
-        configuration.selectionLimit = 1
-        configuration.preferredAssetRepresentationMode = .current
+    @Environment(\.displayScale) private var displayScale
 
-        let picker = PHPickerViewController(configuration: configuration)
-        picker.delegate = context.coordinator
+    @State private var imageManager = PHCachingImageManager()
 
-        let container = RotatedPHPickerContainerViewController(
-            contentViewController: picker
-        )
+    @State private var authorizationStatus: PHAuthorizationStatus =
+        PHPhotoLibrary.authorizationStatus(for: .readWrite)
 
-        container.rotationDegrees = rotationDegrees
+    @State private var assets: [PHAsset] = []
+    @State private var isLoadingAssets = true
+    @State private var isPreparingVideo = false
+    @State private var errorText: String?
 
-        return container
+    private let gridSpacing: CGFloat = 12
+    private let headerDropY: CGFloat = 10
+
+    private var effectiveRotation: Angle {
+        .degrees(rotation.degrees + extraRotationDegrees)
     }
 
-    func updateUIViewController(
-        _ uiViewController: RotatedPHPickerContainerViewController,
-        context: Context
-    ) {
-        uiViewController.rotationDegrees = rotationDegrees
+    var body: some View {
+        GeometryReader { geometry in
+            let screenSize = geometry.size
+            let angle = effectiveRotation
+            let contentSize = Self.contentSize(
+                screenSize: screenSize,
+                rotation: angle
+            )
+
+            ZStack {
+                Color.black
+                    .ignoresSafeArea()
+
+                pickerContent
+                    .frame(
+                        width: contentSize.width,
+                        height: contentSize.height
+                    )
+                    .clipped()
+                    .contentShape(Rectangle())
+                    .rotationEffect(angle)
+                    .position(
+                        x: screenSize.width / 2,
+                        y: screenSize.height / 2
+                    )
+            }
+        }
+        .interactiveDismissDisabled(isPreparingVideo)
+        .onAppear {
+            requestPhotoLibraryAccessIfNeeded()
+        }
+        .onDisappear {
+            imageManager.stopCachingImagesForAllAssets()
+        }
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
+    private var pickerContent: some View {
+        ZStack {
+            Color.black
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                headerBar
+
+                Divider()
+                    .background(Color.white.opacity(0.12))
+
+                contentArea
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+
+            if isPreparingVideo {
+                preparingOverlay
+            }
+        }
     }
 
-    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+    private var headerBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                guard !isPreparingVideo else {
+                    return
+                }
 
-        private let parent: VideoPickerController
-        private var didFinish = false
+                onCancel(sessionID)
+                isPresented = false
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .bold))
 
-        init(parent: VideoPickerController) {
-            self.parent = parent
+                    Text("取消")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule()
+                        .fill(Color.white.opacity(0.14))
+                )
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(spacing: 2) {
+                Text("影片庫")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+
+                Text("\(assets.count) 支影片")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white.opacity(0.55))
+                    .lineLimit(1)
+            }
+            .frame(minWidth: 96)
+
+            Spacer(minLength: 8)
+
+            Button {
+                guard !isPreparingVideo else {
+                    return
+                }
+
+                loadVideoAssets()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(0.14))
+                    )
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 12 + headerDropY)
+        .padding(.bottom, 12)
+        .frame(height: 66 + headerDropY)
+    }
+
+    @ViewBuilder
+    private var contentArea: some View {
+        switch authorizationStatus {
+        case .authorized, .limited:
+            if isLoadingAssets {
+                loadingView
+            } else if assets.isEmpty {
+                emptyView
+            } else {
+                assetGrid
+            }
+
+        case .notDetermined:
+            loadingView
+
+        case .denied, .restricted:
+            permissionDeniedView
+
+        @unknown default:
+            permissionDeniedView
+        }
+    }
+
+    private var assetGrid: some View {
+        GeometryReader { proxy in
+            let horizontalPadding: CGFloat = 12
+            let availableWidth = max(
+                1,
+                proxy.size.width - horizontalPadding * 2
+            )
+
+            let minCardWidth: CGFloat = 82
+            let maxCardWidth: CGFloat = 112
+
+            let rawColumnCount = Int(
+                (availableWidth + gridSpacing) / (minCardWidth + gridSpacing)
+            )
+
+            let columnCount = max(
+                2,
+                min(rawColumnCount, 4)
+            )
+
+            let computedCardWidth = (
+                availableWidth - CGFloat(columnCount - 1) * gridSpacing
+            ) / CGFloat(columnCount)
+
+            let cardWidth = min(
+                maxCardWidth,
+                max(minCardWidth, computedCardWidth)
+            )
+
+            let columns = Array(
+                repeating: GridItem(
+                    .fixed(cardWidth),
+                    spacing: gridSpacing,
+                    alignment: .top
+                ),
+                count: columnCount
+            )
+
+            ScrollView {
+                LazyVGrid(
+                    columns: columns,
+                    alignment: .center,
+                    spacing: gridSpacing
+                ) {
+                    ForEach(assets, id: \.localIdentifier) { asset in
+                        VideoLibraryAssetCell(
+                            asset: asset,
+                            imageManager: imageManager,
+                            displayScale: displayScale,
+                            cardWidth: cardWidth
+                        ) {
+                            selectVideoAsset(asset)
+                        }
+                        .disabled(isPreparingVideo)
+                        .opacity(isPreparingVideo ? 0.55 : 1.0)
+                    }
+                }
+                .padding(.horizontal, horizontalPadding)
+                .padding(.top, 12)
+                .padding(.bottom, 28)
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .scrollIndicators(.visible)
+        }
+    }
+
+    private var loadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .progressViewStyle(.circular)
+                .tint(.white)
+
+            Text("讀取影片庫中...")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "video.slash.fill")
+                .font(.system(size: 36))
+                .foregroundColor(.white.opacity(0.45))
+
+            Text("找不到影片")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundColor(.white)
+
+            Text("請確認相簿中是否有可讀取的影片。")
+                .font(.system(size: 13))
+                .foregroundColor(.white.opacity(0.55))
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var permissionDeniedView: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 34))
+                .foregroundColor(.white.opacity(0.45))
+
+            Text("無法讀取影片庫")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundColor(.white)
+
+            Text("請到設定中允許 BeyTail 讀取照片與影片。")
+                .font(.system(size: 13))
+                .foregroundColor(.white.opacity(0.6))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            Button {
+                openAppSettings()
+            } label: {
+                Text("開啟設定")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(
+                        Capsule()
+                            .fill(Color.white)
+                    )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var preparingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.42)
+                .ignoresSafeArea()
+
+            VStack(spacing: 12) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+
+                Text(errorText ?? "準備影片中...")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            .padding(20)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.black.opacity(0.82))
+            )
+        }
+        .allowsHitTesting(true)
+    }
+
+    private func requestPhotoLibraryAccessIfNeeded() {
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        authorizationStatus = currentStatus
+
+        switch currentStatus {
+        case .authorized, .limited:
+            loadVideoAssets()
+
+        case .notDetermined:
+            isLoadingAssets = true
+
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
+                Task { @MainActor in
+                    authorizationStatus = newStatus
+
+                    switch newStatus {
+                    case .authorized, .limited:
+                        loadVideoAssets()
+
+                    default:
+                        isLoadingAssets = false
+                    }
+                }
+            }
+
+        case .denied, .restricted:
+            isLoadingAssets = false
+
+        @unknown default:
+            isLoadingAssets = false
+        }
+    }
+
+    private func loadVideoAssets() {
+        guard authorizationStatus == .authorized ||
+              authorizationStatus == .limited else {
+            isLoadingAssets = false
+            return
         }
 
-        func picker(
-            _ picker: PHPickerViewController,
-            didFinishPicking results: [PHPickerResult]
-        ) {
-            guard !didFinish else {
-                return
-            }
+        isLoadingAssets = true
+        errorText = nil
 
-            didFinish = true
+        let options = PHFetchOptions()
+        options.sortDescriptors = [
+            NSSortDescriptor(
+                key: "creationDate",
+                ascending: false
+            )
+        ]
 
-            guard let result = results.first else {
-                DispatchQueue.main.async {
-                    self.parent.onCancel(self.parent.sessionID)
-                    self.parent.isPresented = false
+        let result = PHAsset.fetchAssets(
+            with: .video,
+            options: options
+        )
+
+        var fetchedAssets: [PHAsset] = []
+        fetchedAssets.reserveCapacity(result.count)
+
+        result.enumerateObjects { asset, _, _ in
+            fetchedAssets.append(asset)
+        }
+
+        assets = fetchedAssets
+        isLoadingAssets = false
+
+        imageManager.stopCachingImagesForAllAssets()
+        imageManager.startCachingImages(
+            for: fetchedAssets,
+            targetSize: CGSize(width: 180, height: 320),
+            contentMode: .aspectFill,
+            options: nil
+        )
+    }
+
+    private func selectVideoAsset(_ asset: PHAsset) {
+        guard !isPreparingVideo else {
+            return
+        }
+
+        isPreparingVideo = true
+        errorText = nil
+
+        let options = PHVideoRequestOptions()
+        options.version = .current
+        options.deliveryMode = .automatic
+        options.isNetworkAccessAllowed = true
+
+        PHImageManager.default().requestAVAsset(
+            forVideo: asset,
+            options: options
+        ) { avAsset, _, _ in
+            guard let avAsset else {
+                Task { @MainActor in
+                    isPreparingVideo = false
+                    errorText = "無法取得影片資源"
+                    onFailed(sessionID)
+                    isPresented = false
                 }
                 return
             }
 
-            let provider = result.itemProvider
-
-            guard let typeIdentifier = provider.registeredTypeIdentifiers.first(where: { identifier in
-                guard let type = UTType(identifier) else {
-                    return false
-                }
-
-                return type.conforms(to: .movie)
-                    || type.conforms(to: .video)
-                    || type.conforms(to: .audiovisualContent)
-            }) else {
-                DispatchQueue.main.async {
-                    self.parent.onFailed(self.parent.sessionID)
-                    self.parent.isPresented = false
-                }
-                return
-            }
-
-            provider.loadFileRepresentation(
-                forTypeIdentifier: typeIdentifier
-            ) { url, error in
-                if error != nil {
-                    DispatchQueue.main.async {
-                        self.parent.onFailed(self.parent.sessionID)
-                        self.parent.isPresented = false
-                    }
-                    return
-                }
-
-                guard let url else {
-                    DispatchQueue.main.async {
-                        self.parent.onFailed(self.parent.sessionID)
-                        self.parent.isPresented = false
-                    }
-                    return
-                }
-
+            Task {
                 do {
-                    let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
-
-                    let copyURL = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString)
-                        .appendingPathExtension(ext)
-
-                    if FileManager.default.fileExists(atPath: copyURL.path) {
-                        try FileManager.default.removeItem(at: copyURL)
-                    }
-
-                    try FileManager.default.copyItem(
-                        at: url,
-                        to: copyURL
+                    let url = try await Self.prepareTemporaryVideoURL(
+                        from: avAsset
                     )
 
-                    DispatchQueue.main.async {
-                        self.parent.onSelectionPrepared(self.parent.sessionID)
-                        self.parent.isPresented = false
+                    await MainActor.run {
+                        onSelectionPrepared(sessionID)
+                        isPresented = false
 
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            self.parent.onPicked(self.parent.sessionID, copyURL)
+                            onPicked(sessionID, url)
                         }
                     }
 
                 } catch {
-                    DispatchQueue.main.async {
-                        self.parent.onFailed(self.parent.sessionID)
+                    await MainActor.run {
+                        isPreparingVideo = false
+                        errorText = "影片準備失敗"
+                        onFailed(sessionID)
+                        isPresented = false
                     }
                 }
             }
         }
     }
+
+    private func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else {
+            return
+        }
+
+        UIApplication.shared.open(url)
+    }
+
+    private static func prepareTemporaryVideoURL(
+        from avAsset: AVAsset
+    ) async throws -> URL {
+        if let urlAsset = avAsset as? AVURLAsset {
+            do {
+                let ext = urlAsset.url.pathExtension.isEmpty
+                    ? "mov"
+                    : urlAsset.url.pathExtension
+
+                let copyURL = makeTemporaryVideoURL(fileExtension: ext)
+
+                if FileManager.default.fileExists(atPath: copyURL.path) {
+                    try FileManager.default.removeItem(at: copyURL)
+                }
+
+                try FileManager.default.copyItem(
+                    at: urlAsset.url,
+                    to: copyURL
+                )
+
+                return copyURL
+
+            } catch {
+                return try await exportTemporaryVideoURL(from: avAsset)
+            }
+        }
+
+        return try await exportTemporaryVideoURL(from: avAsset)
+    }
+
+    private static func exportTemporaryVideoURL(
+        from avAsset: AVAsset
+    ) async throws -> URL {
+        guard let exportSession = AVAssetExportSession(
+            asset: avAsset,
+            presetName: AVAssetExportPresetHighestQuality
+        ) else {
+            throw VideoLibraryPickerError.exportSessionUnavailable
+        }
+
+        let outputFileType: AVFileType
+
+        if exportSession.supportedFileTypes.contains(.mov) {
+            outputFileType = .mov
+        } else if exportSession.supportedFileTypes.contains(.mp4) {
+            outputFileType = .mp4
+        } else if let first = exportSession.supportedFileTypes.first {
+            outputFileType = first
+        } else {
+            throw VideoLibraryPickerError.unsupportedOutputType
+        }
+
+        let fileExtension = outputFileType == .mp4 ? "mp4" : "mov"
+        let outputURL = makeTemporaryVideoURL(fileExtension: fileExtension)
+
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        exportSession.shouldOptimizeForNetworkUse = true
+
+        try await exportSession.export(
+            to: outputURL,
+            as: outputFileType
+        )
+
+        return outputURL
+    }
+
+    private static func makeTemporaryVideoURL(
+        fileExtension: String
+    ) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(fileExtension)
+    }
+
+    private static func contentSize(
+        screenSize: CGSize,
+        rotation: Angle
+    ) -> CGSize {
+        if isQuarterTurn(rotation) {
+            return CGSize(
+                width: screenSize.height,
+                height: screenSize.width
+            )
+        }
+
+        return screenSize
+    }
+
+    private static func isQuarterTurn(_ angle: Angle) -> Bool {
+        let deg = normalizedDegrees(angle.degrees)
+
+        return abs(deg - 90) < 0.5 ||
+               abs(deg - 270) < 0.5
+    }
+
+    private static func normalizedDegrees(_ degrees: Double) -> Double {
+        var value = degrees.truncatingRemainder(dividingBy: 360)
+
+        if value < 0 {
+            value += 360
+        }
+
+        return value
+    }
 }
-final class RotatedPHPickerContainerViewController: UIViewController {
 
-    private let contentViewController: UIViewController
+private enum VideoLibraryPickerError: LocalizedError {
+    case exportSessionUnavailable
+    case unsupportedOutputType
+    case exportFailed
+    case exportCancelled
 
-    var rotationDegrees: Double = 0 {
-        didSet {
-            view.setNeedsLayout()
+    var errorDescription: String? {
+        switch self {
+        case .exportSessionUnavailable:
+            return "無法建立影片匯出工作"
+
+        case .unsupportedOutputType:
+            return "不支援的影片輸出格式"
+
+        case .exportFailed:
+            return "影片匯出失敗"
+
+        case .exportCancelled:
+            return "影片匯出已取消"
+        }
+    }
+}
+
+private struct VideoLibraryAssetCell: View {
+
+    let asset: PHAsset
+    let imageManager: PHCachingImageManager
+    let displayScale: CGFloat
+    let cardWidth: CGFloat
+    let onTap: () -> Void
+
+    private let portraitAspectRatio: CGFloat = 9.0 / 16.0
+
+    private var cardHeight: CGFloat {
+        cardWidth / portraitAspectRatio
+    }
+
+    var body: some View {
+        Button {
+            onTap()
+        } label: {
+            ZStack(alignment: .bottomLeading) {
+                VideoLibraryThumbnailView(
+                    asset: asset,
+                    imageManager: imageManager,
+                    displayScale: displayScale
+                )
+                .frame(
+                    width: cardWidth,
+                    height: cardHeight
+                )
+                .clipped()
+
+                LinearGradient(
+                    colors: [
+                        .clear,
+                        .black.opacity(0.72)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(
+                    width: cardWidth,
+                    height: cardHeight
+                )
+
+                HStack(spacing: 4) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 9, weight: .bold))
+
+                    Text(durationText(asset.duration))
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .lineLimit(1)
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(Color.black.opacity(0.65))
+                )
+                .padding(6)
+            }
+            .frame(
+                width: cardWidth,
+                height: cardHeight
+            )
+            .clipShape(
+                RoundedRectangle(cornerRadius: 12)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(
+            width: cardWidth,
+            height: cardHeight
+        )
+    }
+
+    private func durationText(_ duration: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(duration.rounded()))
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+private struct VideoLibraryThumbnailView: View {
+
+    let asset: PHAsset
+    let imageManager: PHCachingImageManager
+    let displayScale: CGFloat
+
+    @State private var image: UIImage?
+    @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+            }
+        }
+        .clipped()
+        .onAppear {
+            requestThumbnail()
+        }
+        .onDisappear {
+            cancelThumbnailRequest()
         }
     }
 
-    init(contentViewController: UIViewController) {
-        self.contentViewController = contentViewController
-        super.init(nibName: nil, bundle: nil)
-    }
+    private func requestThumbnail() {
+        guard image == nil else {
+            return
+        }
 
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
+        cancelThumbnailRequest()
 
-    override func viewDidLoad() {
-        super.viewDidLoad()
+        let scale = displayScale
 
-        view.backgroundColor = .black
-        view.clipsToBounds = true
-
-        addChild(contentViewController)
-        view.addSubview(contentViewController.view)
-        contentViewController.didMove(toParent: self)
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-
-        let size = view.bounds.size
-        let normalized = normalizedDegrees(rotationDegrees)
-        let quarterTurn = normalized == 90 || normalized == 270
-
-        let contentSize = CGSize(
-            width: quarterTurn ? size.height : size.width,
-            height: quarterTurn ? size.width : size.height
+        let targetSize = CGSize(
+            width: 180 * scale,
+            height: 320 * scale
         )
 
-        contentViewController.view.bounds = CGRect(
-            origin: .zero,
-            size: contentSize
-        )
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
 
-        contentViewController.view.center = CGPoint(
-            x: size.width / 2,
-            y: size.height / 2
-        )
+        requestID = imageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { requestedImage, _ in
+            guard let requestedImage else {
+                return
+            }
 
-        contentViewController.view.transform = CGAffineTransform(
-            rotationAngle: CGFloat(rotationDegrees * .pi / 180)
-        )
+            Task { @MainActor in
+                image = requestedImage
+            }
+        }
     }
 
-    private func normalizedDegrees(_ degrees: Double) -> Double {
-        let value = degrees.truncatingRemainder(dividingBy: 360)
-        return value >= 0 ? value : value + 360
+    private func cancelThumbnailRequest() {
+        guard requestID != PHInvalidImageRequestID else {
+            return
+        }
+
+        imageManager.cancelImageRequest(requestID)
+        requestID = PHInvalidImageRequestID
     }
 }
 
