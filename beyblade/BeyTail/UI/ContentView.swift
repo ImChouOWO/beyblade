@@ -45,6 +45,11 @@ struct ContentView: View {
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspectFill
     private let controlBarHeight: CGFloat = 110
 
+    // Top bar uses absolute full-screen coordinates.
+    // Increase topBarTopPadding to move it down; decrease it to move it up.
+    private let topBarHeight: CGFloat = 40
+    private let topBarTopPadding: CGFloat = 10
+
     private let busyDeg: Double = 0
     private let videoLibraryExtraRotationDeg: Double = 0
 
@@ -62,6 +67,22 @@ struct ContentView: View {
                 .position(
                     x: geometry.size.width / 2,
                     y: geometry.size.height - controlBarHeight / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(true)
+    }
+
+    private var topBarLayer: some View {
+        GeometryReader { geometry in
+            topBar
+                .frame(
+                    width: geometry.size.width,
+                    height: topBarHeight
+                )
+                .position(
+                    x: geometry.size.width / 2,
+                    y: topBarTopPadding + topBarHeight / 2
                 )
         }
         .ignoresSafeArea()
@@ -172,19 +193,6 @@ struct ContentView: View {
                 TrailOverlayRepresentable(
                     view: vm.trailOverlayView
                 )
-                .frame(
-                    width: vm.isRecording ? size.height : size.width,
-                    height: vm.isRecording ? size.width : size.height
-                )
-                .rotationEffect(
-                    vm.isRecording
-                        ? .degrees(-90)
-                        : .zero
-                )
-                .position(
-                    x: size.width / 2,
-                    y: size.height / 2
-                )
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
@@ -203,17 +211,7 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
 
-                topBar
-                    .frame(
-                        width: size.width,
-                        height: 64
-                    )
-                    .position(
-                        x: size.width / 2,
-                        y: 32
-                    )
-                    .ignoresSafeArea()
-                    .allowsHitTesting(true)
+                topBarLayer
 
                 hintLayer
                 controlBarLayer
@@ -348,6 +346,7 @@ struct ContentView: View {
             }
             .preferredColorScheme(ColorScheme.dark)
         }
+        .statusBarHidden(true)
     }
 
     // MARK: - Icon Rotation
