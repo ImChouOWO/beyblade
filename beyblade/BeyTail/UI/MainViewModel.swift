@@ -135,13 +135,20 @@ final class MainViewModel: ObservableObject {
     private var activeVisionOrientation: CGImagePropertyOrientation = .up
 
     /*
-     相機與影片的 bbox 修正分離：
-     - 相機維持原本 180 度 bbox 修正，避免破壞既有相機偵測顯示。
-     - 影片先不做 180 度修正，避免影片 bbox 被反轉到錯誤位置。
-     如果測試後發現影片 bbox 也上下左右相反，再把 rotateVideoBBox180 改成 true。
+     bbox 修正分離：
+     - 相機 / 錄影模式維持原本 180 度修正。
+     - 影片模式不在 MainViewModel 做 bbox 旋轉。
+     - HDR videoComposition 會影響影片 frame 顯示管線，所以影片模式不要再額外轉 90 度。
     */
+    private enum BBoxRotation {
+        case none
+        case clockwise90
+        case counterClockwise90
+        case rotate180
+    }
+
     private let rotateCameraBBox180 = true
-    private let rotateVideoBBox180 = false
+    private let videoBBoxRotation: BBoxRotation = .none
 
     private var videoFrameCount = 0
 
@@ -467,6 +474,7 @@ final class MainViewModel: ObservableObject {
             "fps:", fps,
             "hardware:", hardwareLabel,
             "sourceSize:", latestSourceFrameSize,
+            "mappingSourceSize:", currentMappingSourceSize(),
             "canvasSize:", canvasSize,
             "overlaySize:", latestOverlaySize,
             "trailBounds:", trailOverlayView.bounds.size,
@@ -529,13 +537,16 @@ final class MainViewModel: ObservableObject {
         switch activeFrameInputSource {
         case .camera:
             correctedRect = rotateCameraBBox180
-                ? rotateBBox180(inputRect)
+                ? rotateBBox(inputRect, rotation: .rotate180)
                 : inputRect
 
         case .video:
-            correctedRect = rotateVideoBBox180
-                ? rotateBBox180(inputRect)
-                : inputRect
+            /*
+             影片模式不在 MainViewModel 做 bbox 旋轉。
+             HDR videoComposition 已經讓影片 frame 走過系統顯示管線。
+             若這裡再旋轉，就會多轉 90 度。
+            */
+            correctedRect = inputRect
         }
 
         let mappedRect = mapNormalizedRectToCanvas(
@@ -553,17 +564,42 @@ final class MainViewModel: ObservableObject {
         )
     }
 
-    private func rotateBBox180(
-        _ rect: CGRect
+    private func rotateBBox(
+        _ rect: CGRect,
+        rotation: BBoxRotation
     ) -> CGRect {
         let input = clampNormalizedRect(rect)
 
-        let rotated = CGRect(
-            x: 1.0 - input.maxX,
-            y: 1.0 - input.maxY,
-            width: input.width,
-            height: input.height
-        )
+        let rotated: CGRect
+
+        switch rotation {
+        case .none:
+            rotated = input
+
+        case .clockwise90:
+            rotated = CGRect(
+                x: 1.0 - input.maxY,
+                y: input.minX,
+                width: input.height,
+                height: input.width
+            )
+
+        case .counterClockwise90:
+            rotated = CGRect(
+                x: input.minY,
+                y: 1.0 - input.maxX,
+                width: input.height,
+                height: input.width
+            )
+
+        case .rotate180:
+            rotated = CGRect(
+                x: 1.0 - input.maxX,
+                y: 1.0 - input.maxY,
+                width: input.width,
+                height: input.height
+            )
+        }
 
         return clampNormalizedRect(rotated)
     }
@@ -586,7 +622,7 @@ final class MainViewModel: ObservableObject {
             return inputRect
         }
 
-        let sourceSize = latestSourceFrameSize
+        let sourceSize = currentMappingSourceSize()
 
         let useAspectFill: Bool
 
@@ -658,6 +694,27 @@ final class MainViewModel: ObservableObject {
         }
 
         return latestOverlaySize
+    }
+
+    private func currentMappingSourceSize() -> CGSize {
+        let sourceSize = latestSourceFrameSize
+
+        guard sourceSize.width > 1,
+              sourceSize.height > 1 else {
+            return sourceSize
+        }
+
+        switch activeFrameInputSource {
+        case .camera:
+            return sourceSize
+
+        case .video:
+            /*
+             影片模式不交換寬高。
+             避免 bbox 在 HDR videoComposition 後又被額外當成旋轉後座標處理。
+            */
+            return sourceSize
+        }
     }
 
     private func updateLatestSourceFrameSize(

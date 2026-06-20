@@ -34,6 +34,12 @@ struct ContentView: View {
      - 影片縮圖使用固定 cardWidth，避免寬度重疊
     */
     @State private var iconRotation: Angle = .degrees(0)
+    @State private var effectDragLocation: CGPoint?
+
+    @State private var showEffectLibraryPage = false
+    @State private var effectPressStartDate: Date?
+    @State private var effectLongPressTask: Task<Void, Never>?
+    @State private var isEffectDragSelecting = false
 
     private let fixedIsLandscape = true
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspect
@@ -70,33 +76,73 @@ struct ContentView: View {
             let size = geometry.size
 
             hintBar
-                .rotationEffect(.degrees(90))
                 .position(
-                    x: size.width - controlBarHeight - 34,
+                    x: size.width / 2,
                     y: size.height / 2
                 )
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
     }
+    private func isEffectMenuQuarterTurn(_ degrees: Double) -> Bool {
+        let value = normalizedEffectMenuDegrees(degrees)
+
+        return abs(value - 90) < 0.5 ||
+            abs(value - 270) < 0.5
+    }
+
+    private func normalizedEffectMenuDegrees(_ degrees: Double) -> Double {
+        var value = degrees.truncatingRemainder(dividingBy: 360)
+
+        if value < 0 {
+            value += 360
+        }
+
+        return value
+    }
+    private let effectMenuWidth: CGFloat = 220
+    private let effectMenuHeight: CGFloat = 360
+
+    private let effectMenuGapToControlBar: CGFloat = 10
+    private let effectMenuBottomPadding: CGFloat = 24
 
     private var effectMenuLayer: some View {
         GeometryReader { geometry in
-            let size = geometry.size
+            let rotationDegrees = iconRotation.degrees + 90
+            let isQuarterTurn = isEffectMenuQuarterTurn(rotationDegrees)
 
-            if vm.effectMenuVisible {
-                EffectMenuView(
-                    selectedEffect: $vm.selectedEffect,
-                    isVisible: $vm.effectMenuVisible
-                )
-                .rotationEffect(iconRotation)
-                .rotationEffect(.degrees(90))
-                .position(
-                    x: size.width - controlBarHeight - 92,
-                    y: size.height - 78
-                )
-                .transition(.opacity)
+            let visualWidth = isQuarterTurn ? effectMenuHeight : effectMenuWidth
+            let visualHeight = isQuarterTurn ? effectMenuWidth : effectMenuHeight
+
+            ZStack(alignment: .bottomTrailing) {
+                Color.clear
+
+                if vm.effectMenuVisible {
+                    ZStack {
+                        EffectMenuView(
+                            selectedEffect: $vm.selectedEffect,
+                            isVisible: $vm.effectMenuVisible,
+                            dragLocation: effectDragLocation
+                        )
+                        .frame(
+                            width: effectMenuWidth,
+                            height: effectMenuHeight
+                        )
+                        .rotationEffect(.degrees(rotationDegrees))
+                    }
+                    .frame(
+                        width: visualWidth,
+                        height: visualHeight
+                    )
+                    .padding(.trailing, controlBarHeight + effectMenuGapToControlBar)
+                    .padding(.bottom, effectMenuBottomPadding)
+                    .transition(.opacity)
+                }
             }
+            .frame(
+                width: geometry.size.width,
+                height: geometry.size.height
+            )
         }
         .ignoresSafeArea()
         .allowsHitTesting(vm.effectMenuVisible)
@@ -146,11 +192,17 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    topBar
-                    Spacer()
-                }
-                .ignoresSafeArea(edges: .bottom)
+                topBar
+                    .frame(
+                        width: 96,
+                        height: size.height
+                    )
+                    .position(
+                        x: 48,
+                        y: size.height / 2
+                    )
+                    .ignoresSafeArea()
+                    .allowsHitTesting(true)
 
                 hintLayer
                 controlBarLayer
@@ -203,6 +255,13 @@ struct ContentView: View {
                     }
                 )
                 .ignoresSafeArea()
+            }
+            .fullScreenCover(isPresented: $showEffectLibraryPage) {
+                EffectLibraryPage(
+                    selectedEffect: $vm.selectedEffect,
+                    isPresented: $showEffectLibraryPage
+                )
+                .preferredColorScheme(.dark)
             }
             .onAppear {
                 UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -421,28 +480,7 @@ struct ContentView: View {
     private var topBar: some View {
         let txtDeg: Double = 90
 
-        return HStack {
-            ZStack {
-                Text("BEY TAIL")
-                    .font(.system(size: 20, weight: .black))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [
-                                Color(hex: 0x00F5FF),
-                                Color(hex: 0xBF5FFF)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .fixedSize()
-                    .rotationEffect(iconRotation)
-                    .rotationEffect(.degrees(txtDeg))
-            }
-            .frame(width: 96, height: 96)
-
-            Spacer()
-
+        return VStack {
             Button {
                 // settings
             } label: {
@@ -458,9 +496,34 @@ struct ContentView: View {
             }
             .disabled(isBusy)
             .opacity(isBusy ? 0.45 : 1.0)
+            .padding(.top, 8)
+
+            Spacer()
+
+            ZStack {
+                Text("BEY TAIL")
+                    .font(.system(size: 20, weight: .black))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: 0x00F5FF),
+                                Color(hex: 0xBF5FFF)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .fixedSize()
+//                    .rotationEffect(iconRotation)
+                    .rotationEffect(.degrees(txtDeg))
+                    .rotationEffect(.degrees(180))
+            }
+            .frame(width: 96, height: 96)
+            .padding(.bottom, 8)
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
+        .frame(maxHeight: .infinity)
+        .frame(width: 96)
+        .padding(.leading, 0)
     }
 
     // MARK: - Hint Bar
@@ -484,6 +547,7 @@ struct ContentView: View {
                         .fill(Color(white: 0.04).opacity(0.88))
                 )
                 .rotationEffect(iconRotation)
+                .rotationEffect(.degrees(90))
                 .transition(.opacity)
             }
         }
@@ -536,8 +600,12 @@ struct ContentView: View {
                     )
 
                 Button {
-                    vm.toggleRecording()
-                } label: {
+                    if vm.isUsingVideoFile {
+                        vm.backToCamera()
+                    } else {
+                        vm.toggleRecording()
+                    }
+                }  label: {
                     Image(systemName: centerButtonIconName)
                         .font(.system(size: 22))
                         .foregroundColor(.white)
@@ -571,31 +639,8 @@ struct ContentView: View {
                     HStack {
                         Spacer()
 
-                        Button {
-                            withAnimation(.easeOut(duration: 0.22)) {
-                                vm.effectMenuVisible.toggle()
-                            }
-                        } label: {
-                            Text(vm.selectedEffect.emoji)
-                                .font(.system(size: 24))
-                                .frame(width: 52, height: 52)
-                                .background(
-                                    Circle()
-                                        .fill(Color(white: 0.08))
-                                        .overlay(
-                                            Circle()
-                                                .stroke(
-                                                    Color(hex: 0x00F5FF)
-                                                        .opacity(0.5),
-                                                    lineWidth: 1.5
-                                                )
-                                        )
-                                )
-                                .rotationEffect(iconRotation)
-                        }
-                        .padding(.trailing, 8)
-                        .disabled(isBusy)
-                        .opacity(isBusy ? 0.45 : 1.0)
+                        effectButton
+                            .padding(.trailing, 8)
                     }
                 }
             }
@@ -604,7 +649,7 @@ struct ContentView: View {
         .frame(height: controlBarHeight)
         .background(Color(white: 0.05).opacity(0.95))
     }
-
+    
     private var centerButtonDisabled: Bool {
         if isBusy {
             return true
@@ -618,10 +663,131 @@ struct ContentView: View {
     }
 
     private var centerButtonIconName: String {
-        vm.isRecording ? "stop.fill" : "video.fill"
+        if vm.isUsingVideoFile {
+            return "arrow.uturn.backward"
+        }
+
+        return vm.isRecording ? "stop.fill" : "video.fill"
     }
 
+    private var effectButton: some View {
+        Text(vm.selectedEffect.emoji)
+            .font(.system(size: 24))
+            .frame(width: 52, height: 52)
+            .background(
+                Circle()
+                    .fill(Color(white: 0.08))
+                    .overlay(
+                        Circle()
+                            .stroke(
+                                Color(hex: 0x00F5FF)
+                                    .opacity(0.5),
+                                lineWidth: 1.5
+                            )
+                    )
+            )
+            .rotationEffect(iconRotation)
+            .contentShape(Circle())
+            .gesture(effectButtonPressGesture)
+            .opacity(isBusy ? 0.45 : 1.0)
+    }
+
+    private var effectButtonPressGesture: some Gesture {
+        DragGesture(
+            minimumDistance: 0,
+            coordinateSpace: .global
+        )
+        .onChanged { value in
+            guard !isBusy else {
+                return
+            }
+
+            if effectPressStartDate == nil {
+                beginEffectPress(at: value.location)
+            }
+
+            if isEffectDragSelecting {
+                effectDragLocation = value.location
+            }
+        }
+        .onEnded { _ in
+            guard !isBusy else {
+                resetEffectPressState()
+                return
+            }
+
+            let elapsed = Date().timeIntervalSince(
+                effectPressStartDate ?? Date()
+            )
+
+            let shouldOpenPage = elapsed < 1.0 && !isEffectDragSelecting
+
+            if shouldOpenPage {
+                resetEffectPressState()
+
+                withAnimation(.easeOut(duration: 0.18)) {
+                    vm.effectMenuVisible = false
+                }
+
+                showEffectLibraryPage = true
+                return
+            }
+
+            resetEffectPressState()
+
+            withAnimation(.easeOut(duration: 0.18)) {
+                vm.effectMenuVisible = false
+            }
+        }
+    }
+
+    private func beginEffectPress(at location: CGPoint) {
+        effectPressStartDate = Date()
+        effectDragLocation = nil
+        isEffectDragSelecting = false
+
+        effectLongPressTask?.cancel()
+
+        effectLongPressTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            guard effectPressStartDate != nil else {
+                return
+            }
+
+            isEffectDragSelecting = true
+            effectDragLocation = location
+
+            withAnimation(.easeOut(duration: 0.18)) {
+                vm.effectMenuVisible = true
+            }
+        }
+    }
+
+    private func resetEffectPressState() {
+        effectLongPressTask?.cancel()
+        effectLongPressTask = nil
+
+        effectPressStartDate = nil
+        effectDragLocation = nil
+        isEffectDragSelecting = false
+    }
     private var centerButtonGradient: LinearGradient {
+        if vm.isUsingVideoFile {
+            return LinearGradient(
+                colors: [
+                    Color(hex: 0x8E8E93),
+                    Color(hex: 0x3A3A3C)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+
         if vm.isRecording {
             return LinearGradient(
                 colors: [
@@ -684,6 +850,150 @@ struct ContentView: View {
         }
 
         return "處理中..."
+    }
+}
+// MARK: - Effect Library Page
+
+private struct EffectLibraryPage: View {
+
+    @Binding var selectedEffect: EffectType
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                headerBar
+
+                Divider()
+                    .background(Color.white.opacity(0.12))
+
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(EffectType.allCases, id: \.self) { effect in
+                            EffectLibraryPageRow(
+                                effect: effect,
+                                isSelected: effect == selectedEffect,
+                                onTap: {
+                                    guard !effect.isLocked else {
+                                        return
+                                    }
+
+                                    selectedEffect = effect
+                                }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, 32)
+                }
+            }
+        }
+    }
+
+    private var headerBar: some View {
+        HStack(spacing: 12) {
+            Button {
+                isPresented = false
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .bold))
+
+                    Text("返回主頁面")
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    Capsule()
+                        .fill(Color.white.opacity(0.14))
+                )
+            }
+
+            Spacer()
+
+            Text("特效庫")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundColor(.white)
+
+            Spacer()
+
+            Color.clear
+                .frame(width: 104, height: 1)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 18)
+        .padding(.bottom, 14)
+    }
+}
+
+private struct EffectLibraryPageRow: View {
+
+    let effect: EffectType
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 14) {
+                Text(effect.emoji)
+                    .font(.system(size: 28))
+                    .frame(width: 44, height: 44)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(0.08))
+                    )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(effect.displayName)
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text(effect.description)
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.55))
+                }
+
+                Spacer()
+
+                if effect.isLocked {
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white.opacity(0.45))
+                } else if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(Color(hex: 0x00F5FF))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(
+                        isSelected
+                            ? Color(hex: 0x00F5FF).opacity(0.12)
+                            : Color.white.opacity(0.07)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(
+                                isSelected
+                                    ? Color(hex: 0x00F5FF).opacity(0.45)
+                                    : Color.white.opacity(0.08),
+                                lineWidth: 1
+                            )
+                    )
+            )
+            .opacity(effect.isLocked ? 0.5 : 1.0)
+        }
+        .buttonStyle(.plain)
+        .disabled(effect.isLocked)
     }
 }
 
