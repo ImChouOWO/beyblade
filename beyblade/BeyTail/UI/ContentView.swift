@@ -33,7 +33,7 @@ struct ContentView: View {
      - 影片縮圖固定直拍比例 9:16
      - 影片縮圖使用固定 cardWidth，避免寬度重疊
     */
-    @State private var iconRotation: Angle = .degrees(0)
+    @State private var iconRotation: Angle = .zero
     @State private var effectDragLocation: CGPoint?
 
     @State private var showEffectLibraryPage = false
@@ -41,12 +41,12 @@ struct ContentView: View {
     @State private var effectLongPressTask: Task<Void, Never>?
     @State private var isEffectDragSelecting = false
 
-    private let fixedIsLandscape = true
-    private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspect
+    private let fixedIsLandscape = false
+    private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspectFill
     private let controlBarHeight: CGFloat = 110
 
-    private let busyDeg: Double = 90
-    private let videoLibraryExtraRotationDeg: Double = 90
+    private let busyDeg: Double = 0
+    private let videoLibraryExtraRotationDeg: Double = 0
 
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
@@ -54,17 +54,14 @@ struct ContentView: View {
 
     private var controlBarLayer: some View {
         GeometryReader { geometry in
-            let size = geometry.size
-
             bottomBar
                 .frame(
-                    width: size.height,
+                    width: geometry.size.width,
                     height: controlBarHeight
                 )
-                .rotationEffect(.degrees(90))
                 .position(
-                    x: size.width - controlBarHeight / 2,
-                    y: size.height / 2
+                    x: geometry.size.width / 2,
+                    y: geometry.size.height - controlBarHeight / 2
                 )
         }
         .ignoresSafeArea()
@@ -108,7 +105,7 @@ struct ContentView: View {
 
     private var effectMenuLayer: some View {
         GeometryReader { geometry in
-            let rotationDegrees = iconRotation.degrees + 90
+            let rotationDegrees = iconRotation.degrees
             let isQuarterTurn = isEffectMenuQuarterTurn(rotationDegrees)
 
             let visualWidth = isQuarterTurn ? effectMenuHeight : effectMenuWidth
@@ -134,7 +131,8 @@ struct ContentView: View {
                         width: visualWidth,
                         height: visualHeight
                     )
-                    .padding(.trailing, controlBarHeight + effectMenuGapToControlBar)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, controlBarHeight + effectMenuGapToControlBar)
                     .padding(.bottom, effectMenuBottomPadding)
                     .transition(.opacity)
                 }
@@ -174,6 +172,19 @@ struct ContentView: View {
                 TrailOverlayRepresentable(
                     view: vm.trailOverlayView
                 )
+                .frame(
+                    width: vm.isRecording ? size.height : size.width,
+                    height: vm.isRecording ? size.width : size.height
+                )
+                .rotationEffect(
+                    vm.isRecording
+                        ? .degrees(-90)
+                        : .zero
+                )
+                .position(
+                    x: size.width / 2,
+                    y: size.height / 2
+                )
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
@@ -194,12 +205,12 @@ struct ContentView: View {
 
                 topBar
                     .frame(
-                        width: 96,
-                        height: size.height
+                        width: size.width,
+                        height: 64
                     )
                     .position(
-                        x: 48,
-                        y: size.height / 2
+                        x: size.width / 2,
+                        y: 32
                     )
                     .ignoresSafeArea()
                     .allowsHitTesting(true)
@@ -335,28 +346,26 @@ struct ContentView: View {
                     isPreparingVideoPicker = false
                 }
             }
-            .preferredColorScheme(.dark)
+            .preferredColorScheme(ColorScheme.dark)
         }
     }
 
     // MARK: - Icon Rotation
-
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
-        let addDeg: Double = 90
 
         switch orientation {
-        case .landscapeRight:
-            iconRotation = .degrees(0 + addDeg)
-
         case .portrait:
-            iconRotation = .degrees(90 + addDeg)
+            iconRotation = .degrees(0)
 
         case .landscapeLeft:
-            iconRotation = .degrees(180 + addDeg)
+            iconRotation = .degrees(90)
 
         case .portraitUpsideDown:
-            iconRotation = .degrees(270 + addDeg)
+            iconRotation = .degrees(180)
+
+        case .landscapeRight:
+            iconRotation = .degrees(-90)
 
         default:
             break
@@ -365,10 +374,9 @@ struct ContentView: View {
         print(
             "[ICON_ROTATION]",
             "deviceOrientation:", orientation.rawValue,
-            "iconRotation:", iconRotation
+            "iconRotation:", iconRotation.degrees
         )
     }
-
     // MARK: - Video Picker Handler
 
     private func openVideoPicker() {
@@ -476,54 +484,41 @@ struct ContentView: View {
     }
 
     // MARK: - Top Bar
-
     private var topBar: some View {
-        let txtDeg: Double = 90
+        HStack(spacing: 12) {
+            Text("BEY TAIL")
+                .font(.system(size: 20, weight: .black))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [
+                            Color(hex: 0x00F5FF),
+                            Color(hex: 0xBF5FFF)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
 
-        return VStack {
+            Spacer()
+
             Button {
                 // settings
             } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16))
                     .foregroundColor(.white)
-                    .frame(width: 34, height: 34)
+                    .frame(width: 40, height: 40)
                     .background(
-                        Color(white: 1, opacity: 0.15)
-                            .cornerRadius(8)
+                        Color.white.opacity(0.15),
+                        in: RoundedRectangle(cornerRadius: 10)
                     )
                     .rotationEffect(iconRotation)
             }
             .disabled(isBusy)
             .opacity(isBusy ? 0.45 : 1.0)
-            .padding(.top, 8)
-
-            Spacer()
-
-            ZStack {
-                Text("BEY TAIL")
-                    .font(.system(size: 20, weight: .black))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [
-                                Color(hex: 0x00F5FF),
-                                Color(hex: 0xBF5FFF)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-                    .fixedSize()
-//                    .rotationEffect(iconRotation)
-                    .rotationEffect(.degrees(txtDeg))
-                    .rotationEffect(.degrees(180))
-            }
-            .frame(width: 96, height: 96)
-            .padding(.bottom, 8)
         }
-        .frame(maxHeight: .infinity)
-        .frame(width: 96)
-        .padding(.leading, 0)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
     }
 
     // MARK: - Hint Bar
@@ -547,7 +542,6 @@ struct ContentView: View {
                         .fill(Color(white: 0.04).opacity(0.88))
                 )
                 .rotationEffect(iconRotation)
-                .rotationEffect(.degrees(90))
                 .transition(.opacity)
             }
         }
@@ -831,7 +825,7 @@ struct ContentView: View {
                     .fill(Color.black.opacity(0.75))
             )
             .rotationEffect(iconRotation)
-            .rotationEffect(.degrees(busyDeg))
+
         }
         .allowsHitTesting(true)
     }
@@ -1811,7 +1805,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
 final class CameraPreviewUIView: UIView {
 
-    private var isLandscape = true
+    private var isLandscape = false
     private var lastAppliedPreviewAngle: CGFloat = -1
 
     override static var layerClass: AnyClass {
@@ -1843,11 +1837,7 @@ final class CameraPreviewUIView: UIView {
     }
 
     func setIsLandscape(_ isLandscape: Bool) {
-        /*
-         固定畫布模式：
-         不接受外部動態方向，只維持橫向畫布。
-        */
-        self.isLandscape = true
+        self.isLandscape = isLandscape
         applyPreviewRotationIfNeeded(force: true)
     }
 
@@ -1911,7 +1901,7 @@ final class CameraPreviewUIView: UIView {
          videoRotationAngle = 0
          visionImageOrientation = .down
         */
-        return 0
+        return isLandscape ? 0 : 90
     }
 }
 

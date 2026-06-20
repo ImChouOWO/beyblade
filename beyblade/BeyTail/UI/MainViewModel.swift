@@ -147,7 +147,7 @@ final class MainViewModel: ObservableObject {
         case rotate180
     }
 
-    private let rotateCameraBBox180 = true
+    private let rotateCameraBBox180 = false
     private let videoBBoxRotation: BBoxRotation = .none
 
     private var videoFrameCount = 0

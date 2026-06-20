@@ -43,8 +43,8 @@ final class CameraManager: NSObject {
      所以這裡完全固定相機輸出與 Vision 方向。
      手機實體旋轉時，不再改變 camera output / Vision / bbox 座標系。
     */
-    private let fixedVideoRotationAngle: CGFloat = 0
-    private let fixedVisionImageOrientation: CGImagePropertyOrientation = .down
+    private let fixedVideoRotationAngle: CGFloat = 90
+    private let fixedVisionImageOrientation: CGImagePropertyOrientation = .up
 
     // MARK: - Private
 
