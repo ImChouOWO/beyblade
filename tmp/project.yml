@@ -1,0 +1,25 @@
+name: BeyTrail
+options:
+  bundleIdPrefix: com.beyblade
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  BeyTrail:
+    type: application
+    platform: iOS
+    sources:
+      - BeyTrail
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.beyblade.trailfilter
+        INFOPLIST_FILE: BeyTrail/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        # 在 Xcode 的 Signing & Capabilities 填入你的 Team ID
+        DEVELOPMENT_TEAM: ""
+        CODE_SIGN_STYLE: Automatic
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
