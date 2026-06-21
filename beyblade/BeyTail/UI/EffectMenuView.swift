@@ -8,20 +8,36 @@ struct EffectMenuView: View {
     // 長按拖曳時，由 ContentView 傳入目前手指位置
     var dragLocation: CGPoint? = nil
 
+    @AppStorage("effectMenuIDs") private var effectMenuIDsRaw: String = ""
+
     @State private var rowFrames: [EffectType: CGRect] = [:]
     @State private var hoveredEffect: EffectType?
+
+    private var menuEffects: [EffectType] {
+        let ids = effectMenuIDsRaw
+            .split(separator: ",")
+            .map(String.init)
+
+        if ids.isEmpty {
+            return EffectType.defaultMenuEffects
+        }
+
+        let effects = EffectType.allCases.filter {
+            ids.contains($0.rawValue)
+        }
+
+        return effects.isEmpty ? EffectType.defaultMenuEffects : effects
+    }
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
             VStack(spacing: 5) {
-                ForEach(EffectType.allCases.reversed(), id: \.self) { effect in
+                ForEach(menuEffects.reversed(), id: \.self) { effect in
                     EffectRowView(
                         effect: effect,
                         isSelected: effect == selectedEffect,
                         isHovered: effect == hoveredEffect,
                         onTap: {
-                            guard !effect.isLocked else { return }
-
                             selectedEffect = effect
 
                             withAnimation(.easeOut(duration: 0.2)) {
@@ -63,12 +79,37 @@ struct EffectMenuView: View {
         .onChange(of: dragLocation) { _, newLocation in
             updateSelectionByDragLocation(newLocation)
         }
+        .onChange(of: effectMenuIDsRaw) { _, _ in
+            removeInvalidSelectionIfNeeded()
+        }
+        .onAppear {
+            initializeDefaultMenuIfNeeded()
+            removeInvalidSelectionIfNeeded()
+        }
         .transition(
             .asymmetric(
                 insertion: .move(edge: .bottom).combined(with: .opacity),
                 removal: .move(edge: .bottom).combined(with: .opacity)
             )
         )
+    }
+
+    private func initializeDefaultMenuIfNeeded() {
+        guard effectMenuIDsRaw.isEmpty else {
+            return
+        }
+
+        effectMenuIDsRaw = EffectType.defaultMenuEffects
+            .map(\.rawValue)
+            .joined(separator: ",")
+    }
+
+    private func removeInvalidSelectionIfNeeded() {
+        guard !menuEffects.contains(selectedEffect) else {
+            return
+        }
+
+        selectedEffect = menuEffects.first ?? EffectType.defaultMenuEffects[0]
     }
 
     private func updateSelectionByDragLocation(_ location: CGPoint?) {
@@ -88,10 +129,6 @@ struct EffectMenuView: View {
         }
 
         hoveredEffect = hitEffect
-
-        guard !hitEffect.isLocked else {
-            return
-        }
 
         if selectedEffect != hitEffect {
             selectedEffect = hitEffect
@@ -137,13 +174,9 @@ private struct EffectRowView: View {
 
                 Spacer()
 
-                Text(effect.isLocked ? "🔒" : (isSelected ? "✓" : ""))
-                    .font(.system(size: 12))
-                    .foregroundColor(
-                        isSelected
-                            ? Color(hex: 0x00F5FF)
-                            : Color(white: 0.4)
-                    )
+                Text(isSelected ? "✓" : "")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(Color(hex: 0x00F5FF))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -168,7 +201,6 @@ private struct EffectRowView: View {
                             )
                     )
             )
-            .opacity(effect.isLocked ? 0.5 : 1)
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 8)

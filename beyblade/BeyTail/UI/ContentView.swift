@@ -264,13 +264,16 @@ struct ContentView: View {
                     }
                 )
                 .ignoresSafeArea()
+                .statusBarHidden(true)
             }
             .fullScreenCover(isPresented: $showEffectLibraryPage) {
                 EffectLibraryPage(
                     selectedEffect: $vm.selectedEffect,
-                    isPresented: $showEffectLibraryPage
+                    isPresented: $showEffectLibraryPage,
+                    rotation: iconRotation
                 )
                 .preferredColorScheme(.dark)
+                .statusBarHidden(true)
             }
             .onAppear {
                 UIDevice.current.beginGeneratingDeviceOrientationNotifications()
@@ -742,7 +745,7 @@ struct ContentView: View {
         effectLongPressTask?.cancel()
 
         effectLongPressTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: 250_000_000)
 
             guard !Task.isCancelled else {
                 return
@@ -852,39 +855,104 @@ private struct EffectLibraryPage: View {
     @Binding var selectedEffect: EffectType
     @Binding var isPresented: Bool
 
+    let rotation: Angle
+
+    @AppStorage("ownedEffectIDs") private var ownedEffectIDsRaw: String = ""
+    @AppStorage("effectMenuIDs") private var effectMenuIDsRaw: String = ""
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 12),
+        GridItem(.flexible(), spacing: 12)
+    ]
+
+    private var ownedEffects: [EffectType] {
+        EffectType.allCases.filter { isOwned($0) }
+    }
+
+    private var shopEffects: [EffectType] {
+        EffectType.shopEffects.filter { !isOwned($0) }
+    }
+
     var body: some View {
-        ZStack {
-            Color.black
-                .ignoresSafeArea()
+        GeometryReader { geometry in
+            let screenSize = geometry.size
+            let contentSize = Self.contentSize(
+                screenSize: screenSize,
+                rotation: rotation
+            )
 
-            VStack(spacing: 0) {
-                headerBar
+            ZStack {
+                Color.black
+                    .ignoresSafeArea()
 
-                Divider()
-                    .background(Color.white.opacity(0.12))
+                pageContent
+                    .frame(
+                        width: contentSize.width,
+                        height: contentSize.height
+                    )
+                    .clipped()
+                    .contentShape(Rectangle())
+                    .rotationEffect(rotation)
+                    .position(
+                        x: screenSize.width / 2,
+                        y: screenSize.height / 2
+                    )
+            }
+        }
+        .onAppear {
+            initializeDefaultStorageIfNeeded()
+        }
+    }
 
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(EffectType.allCases, id: \.self) { effect in
-                            EffectLibraryPageRow(
-                                effect: effect,
-                                isSelected: effect == selectedEffect,
-                                onTap: {
-                                    guard !effect.isLocked else {
-                                        return
+    private var pageContent: some View {
+        VStack(spacing: 0) {
+            headerBar
+
+            Divider()
+                .background(Color.white.opacity(0.12))
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    limitedPackCard
+
+                    if !shopEffects.isEmpty {
+                        sectionTitle("單件特效")
+
+                        LazyVGrid(columns: columns, spacing: 14) {
+                            ForEach(shopEffects, id: \.self) { effect in
+                                EffectShopCard(
+                                    effect: effect,
+                                    isOwned: false,
+                                    isInMenu: false,
+                                    onTap: {
+                                        buyEffect(effect)
                                     }
+                                )
+                            }
+                        }
+                    }
 
-                                    selectedEffect = effect
+                    sectionTitle("已擁有")
+
+                    LazyVGrid(columns: columns, spacing: 14) {
+                        ForEach(ownedEffects, id: \.self) { effect in
+                            EffectShopCard(
+                                effect: effect,
+                                isOwned: true,
+                                isInMenu: isInMenu(effect),
+                                onTap: {
+                                    toggleMenuEffect(effect)
                                 }
                             )
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
-                    .padding(.bottom, 32)
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 18)
+                .padding(.bottom, 32)
             }
         }
+        .background(Color.black)
     }
 
     private var headerBar: some View {
@@ -910,7 +978,7 @@ private struct EffectLibraryPage: View {
 
             Spacer()
 
-            Text("特效庫")
+            Text("特效商店")
                 .font(.system(size: 18, weight: .bold))
                 .foregroundColor(.white)
 
@@ -923,74 +991,277 @@ private struct EffectLibraryPage: View {
         .padding(.top, 18)
         .padding(.bottom, 14)
     }
-}
 
-private struct EffectLibraryPageRow: View {
-
-    let effect: EffectType
-    let isSelected: Bool
-    let onTap: () -> Void
-
-    var body: some View {
-        Button(action: onTap) {
+    private var limitedPackCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 14) {
-                Text(effect.emoji)
-                    .font(.system(size: 28))
-                    .frame(width: 44, height: 44)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(0.08))
-                    )
+                Text("🎁")
+                    .font(.system(size: 42))
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(effect.displayName)
-                        .font(.system(size: 16, weight: .bold))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("限定特效包")
+                        .font(.system(size: 22, weight: .black))
                         .foregroundColor(.white)
 
-                    Text(effect.description)
+                    Text("滔天浪潮 + 不滅鋼盾 + 爆刃亂舞 + 狂暴冰裂")
                         .font(.system(size: 12))
                         .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(2)
+
+                    HStack(spacing: 8) {
+                        Text("原價 NT$120")
+                            .font(.system(size: 12))
+                            .strikethrough()
+                            .foregroundColor(.white.opacity(0.38))
+
+                        Text("NT$100")
+                            .font(.system(size: 20, weight: .black))
+                            .foregroundColor(Color(hex: 0x00F5FF))
+                    }
                 }
 
                 Spacer()
-
-                if effect.isLocked {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundColor(.white.opacity(0.45))
-                } else if isSelected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 20, weight: .bold))
-                        .foregroundColor(Color(hex: 0x00F5FF))
-                }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(
-                        isSelected
-                            ? Color(hex: 0x00F5FF).opacity(0.12)
-                            : Color.white.opacity(0.07)
+
+            Button {
+                buyLimitedPack()
+            } label: {
+                Text("立即購買  省 NT$20")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: 0xBF5FFF),
+                                Color(hex: 0x00F5FF)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
                     )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(
-                                isSelected
-                                    ? Color(hex: 0x00F5FF).opacity(0.45)
-                                    : Color.white.opacity(0.08),
-                                lineWidth: 1
-                            )
-                    )
-            )
-            .opacity(effect.isLocked ? 0.5 : 1.0)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .disabled(EffectType.shopEffects.allSatisfy { isOwned($0) })
+            .opacity(EffectType.shopEffects.allSatisfy { isOwned($0) } ? 0.45 : 1.0)
         }
-        .buttonStyle(.plain)
-        .disabled(effect.isLocked)
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 18)
+                .fill(Color(hex: 0x07111F).opacity(0.95))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(Color(hex: 0x00F5FF).opacity(0.32), lineWidth: 1.4)
+                )
+        )
+    }
+
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 15, weight: .bold))
+            .foregroundColor(.white.opacity(0.55))
+    }
+
+    private func initializeDefaultStorageIfNeeded() {
+        if ownedEffectIDsRaw.isEmpty {
+            ownedEffectIDsRaw = EffectType.defaultOwnedEffects
+                .map(\.rawValue)
+                .joined(separator: ",")
+        }
+
+        if effectMenuIDsRaw.isEmpty {
+            effectMenuIDsRaw = EffectType.defaultMenuEffects
+                .map(\.rawValue)
+                .joined(separator: ",")
+        }
+    }
+
+    private func ids(from raw: String) -> Set<String> {
+        Set(
+            raw
+                .split(separator: ",")
+                .map(String.init)
+        )
+    }
+
+    private func raw(from ids: Set<String>) -> String {
+        EffectType.allCases
+            .map(\.rawValue)
+            .filter { ids.contains($0) }
+            .joined(separator: ",")
+    }
+
+    private func isOwned(_ effect: EffectType) -> Bool {
+        if effect.isDefaultOwned {
+            return true
+        }
+
+        return ids(from: ownedEffectIDsRaw).contains(effect.rawValue)
+    }
+
+    private func isInMenu(_ effect: EffectType) -> Bool {
+        ids(from: effectMenuIDsRaw).contains(effect.rawValue)
+    }
+
+    private func buyEffect(_ effect: EffectType) {
+        var ownedIDs = ids(from: ownedEffectIDsRaw)
+        ownedIDs.insert(effect.rawValue)
+        ownedEffectIDsRaw = raw(from: ownedIDs)
+    }
+
+    private func buyLimitedPack() {
+        var ownedIDs = ids(from: ownedEffectIDsRaw)
+
+        for effect in EffectType.shopEffects {
+            ownedIDs.insert(effect.rawValue)
+        }
+
+        ownedEffectIDsRaw = raw(from: ownedIDs)
+    }
+
+    private func toggleMenuEffect(_ effect: EffectType) {
+        guard isOwned(effect) else {
+            return
+        }
+
+        var menuIDs = ids(from: effectMenuIDsRaw)
+
+        if menuIDs.contains(effect.rawValue) {
+            menuIDs.remove(effect.rawValue)
+
+            if selectedEffect == effect {
+                selectedEffect = EffectType.defaultMenuEffects.first ?? .lightning
+            }
+        } else {
+            menuIDs.insert(effect.rawValue)
+            selectedEffect = effect
+        }
+
+        effectMenuIDsRaw = raw(from: menuIDs)
+    }
+
+    private static func contentSize(
+        screenSize: CGSize,
+        rotation: Angle
+    ) -> CGSize {
+        if isQuarterTurn(rotation) {
+            return CGSize(
+                width: screenSize.height,
+                height: screenSize.width
+            )
+        }
+
+        return screenSize
+    }
+
+    private static func isQuarterTurn(_ angle: Angle) -> Bool {
+        let deg = normalizedDegrees(angle.degrees)
+
+        return abs(deg - 90) < 0.5 ||
+               abs(deg - 270) < 0.5
+    }
+
+    private static func normalizedDegrees(_ degrees: Double) -> Double {
+        var value = degrees.truncatingRemainder(dividingBy: 360)
+
+        if value < 0 {
+            value += 360
+        }
+
+        return value
     }
 }
 
-// MARK: - Custom SwiftUI Video Library Picker
+private struct EffectShopCard: View {
+
+    let effect: EffectType
+    let isOwned: Bool
+    let isInMenu: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(effect.emoji)
+                .font(.system(size: 34))
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 4)
+
+            Text(effect.displayName)
+                .font(.system(size: 17, weight: .black))
+                .foregroundColor(.white)
+                .multilineTextAlignment(.center)
+
+            Text(effect.description)
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.5))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+
+            Button(action: onTap) {
+                Text(buttonTitle)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(buttonBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+            }
+        }
+        .padding(14)
+        .frame(height: 210)
+        .background(
+            RoundedRectangle(cornerRadius: 18)
+                .fill(Color.white.opacity(0.065))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        )
+    }
+
+    private var buttonTitle: String {
+        if !isOwned {
+            return "NT$\(effect.price)"
+        }
+
+        return isInMenu ? "從選單移除" : "加入選單"
+    }
+
+    private var buttonBackground: LinearGradient {
+        if !isOwned {
+            return LinearGradient(
+                colors: [
+                    Color(hex: 0xBF5FFF),
+                    Color(hex: 0x00F5FF)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+
+        if isInMenu {
+            return LinearGradient(
+                colors: [
+                    Color.red.opacity(0.55),
+                    Color.red.opacity(0.35)
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+        }
+
+        return LinearGradient(
+            colors: [
+                Color(hex: 0x00F5FF).opacity(0.55),
+                Color(hex: 0x0088FF).opacity(0.55)
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+}
 
 struct RotatedVideoLibraryPickerView: View {
 
@@ -1571,6 +1842,7 @@ struct RotatedVideoLibraryPickerView: View {
         return value
     }
 }
+
 
 private enum VideoLibraryPickerError: LocalizedError {
     case exportSessionUnavailable

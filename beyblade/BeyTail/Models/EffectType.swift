@@ -7,7 +7,7 @@ enum InferenceHardware: String {
     case mock = "MOCK"
 }
 
-enum EffectType: CaseIterable {
+enum EffectType: String, CaseIterable {
     case lightning, fire, stardust, wave, thunder, vortex, dark
 
     var emoji: String {
@@ -27,10 +27,10 @@ enum EffectType: CaseIterable {
         case .lightning: return "閃電"
         case .fire:      return "火炎"
         case .stardust:  return "星塵"
-        case .wave:      return "浪潮"
-        case .thunder:   return "雷石"
-        case .vortex:    return "漩渦"
-        case .dark:      return "暗能"
+        case .wave:      return "滔天浪潮"
+        case .thunder:   return "不滅鋼盾"
+        case .vortex:    return "爆刃亂舞"
+        case .dark:      return "狂暴冰裂"
         }
     }
 
@@ -40,13 +40,46 @@ enum EffectType: CaseIterable {
         case .fire:      return "炙熱火焰軌跡"
         case .stardust:  return "晶瑩散射軌跡"
         case .wave:      return "水波流動軌跡"
-        case .thunder:   return "碰撞特效"
-        case .vortex:    return "旋轉散落軌跡"
-        case .dark:      return "暗黑能量軌跡"
+        case .thunder:   return "防禦幾何能量盾"
+        case .vortex:    return "斬擊刀光軌跡"
+        case .dark:      return "冰封碎裂軌跡"
         }
     }
 
-    // nil = 使用相機偵測顏色
+    var price: Int {
+        switch self {
+        case .lightning, .fire, .stardust:
+            return 0
+        case .wave, .thunder, .vortex, .dark:
+            return 30
+        }
+    }
+
+    var isDefaultOwned: Bool {
+        switch self {
+        case .lightning, .fire, .stardust:
+            return true
+        case .wave, .thunder, .vortex, .dark:
+            return false
+        }
+    }
+
+    static var defaultOwnedEffects: [EffectType] {
+        [.lightning, .fire, .stardust]
+    }
+
+    static var defaultMenuEffects: [EffectType] {
+        [.lightning, .fire, .stardust]
+    }
+
+    static var shopEffects: [EffectType] {
+        [.wave, .thunder, .vortex, .dark]
+    }
+
+    static var ownedFallbackEffects: [EffectType] {
+        defaultOwnedEffects
+    }
+
     var colorOverride: UIColor? {
         switch self {
         case .lightning: return UIColor(hex: 0x00F5FF)
@@ -59,10 +92,45 @@ enum EffectType: CaseIterable {
         }
     }
 
-    var glowWidthMult: Float  { switch self { case .lightning: return 0.8; case .fire: return 1.5; case .stardust: return 0.5; case .wave: return 2.2; case .thunder: return 1.0; case .vortex: return 1.6; case .dark: return 0.7 } }
-    var coreWidthMult: Float  { switch self { case .lightning: return 0.9; case .fire: return 1.0; case .stardust: return 0.6; case .wave: return 0.8; case .thunder: return 1.4; case .vortex: return 0.8; case .dark: return 0.5 } }
-    var fadeDurationMs: Int64 { switch self { case .lightning: return 400; case .fire: return 600; case .stardust: return 280; case .wave: return 800; case .thunder: return 360; case .vortex: return 900; case .dark: return 1000 } }
-    var isLocked: Bool        { switch self { case .lightning, .fire, .stardust: return false; default: return true } }
+    var glowWidthMult: Float {
+        switch self {
+        case .lightning: return 0.8
+        case .fire:      return 1.5
+        case .stardust:  return 0.5
+        case .wave:      return 2.2
+        case .thunder:   return 1.0
+        case .vortex:    return 1.6
+        case .dark:      return 0.7
+        }
+    }
+
+    var coreWidthMult: Float {
+        switch self {
+        case .lightning: return 0.9
+        case .fire:      return 1.0
+        case .stardust:  return 0.6
+        case .wave:      return 0.8
+        case .thunder:   return 1.4
+        case .vortex:    return 0.8
+        case .dark:      return 0.5
+        }
+    }
+
+    var fadeDurationMs: Int64 {
+        switch self {
+        case .lightning: return 400
+        case .fire:      return 600
+        case .stardust:  return 280
+        case .wave:      return 800
+        case .thunder:   return 360
+        case .vortex:    return 900
+        case .dark:      return 1000
+        }
+    }
+
+    var isLocked: Bool {
+        !isDefaultOwned
+    }
 }
 
 extension UIColor {
