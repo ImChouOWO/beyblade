@@ -10,11 +10,22 @@ class TrailEffectEngine {
     private var points: [TrailPoint] = []
     private let lock = NSLock()
 
-    func addPoint(trackId: Int, center: CGPoint, color: UIColor = .white) {
+    func addPoint(
+        trackId: Int,
+        center: CGPoint,
+        color: UIColor = .white,
+        timestamp: TimeInterval = CACurrentMediaTime()
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        points.append(TrailPoint(center: center, timestamp: CACurrentMediaTime(),
-                                 trackId: trackId, color: color))
+        points.append(
+            TrailPoint(
+                center: center,
+                timestamp: timestamp,
+                trackId: trackId,
+                color: color
+            )
+        )
         if points.count > maxPoints { points.removeFirst() }
     }
 

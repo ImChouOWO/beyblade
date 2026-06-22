@@ -1,0 +1,292 @@
+diff --git a/beyblade/BeyTail/Effects/TrailEffectEngine.swift b/beyblade/BeyTail/Effects/TrailEffectEngine.swift
+index 4015380..1111111 100644
+--- a/beyblade/BeyTail/Effects/TrailEffectEngine.swift
++++ b/beyblade/BeyTail/Effects/TrailEffectEngine.swift
+@@ -12,11 +12,22 @@ class TrailEffectEngine {
+     private var points: [TrailPoint] = []
+     private let lock = NSLock()
+ 
+-    func addPoint(trackId: Int, center: CGPoint, color: UIColor = .white) {
++    func addPoint(
++        trackId: Int,
++        center: CGPoint,
++        color: UIColor = .white,
++        timestamp: TimeInterval = CACurrentMediaTime()
++    ) {
+         lock.lock()
+         defer { lock.unlock() }
+-        points.append(TrailPoint(center: center, timestamp: CACurrentMediaTime(),
+-                                 trackId: trackId, color: color))
++        points.append(
++            TrailPoint(
++                center: center,
++                timestamp: timestamp,
++                trackId: trackId,
++                color: color
++            )
++        )
+         if points.count > maxPoints { points.removeFirst() }
+     }
+ 
+diff --git a/beyblade/BeyTail/ML/InferenceEngine.swift b/beyblade/BeyTail/ML/InferenceEngine.swift
+index 4e520f2..2222222 100644
+--- a/beyblade/BeyTail/ML/InferenceEngine.swift
++++ b/beyblade/BeyTail/ML/InferenceEngine.swift
+@@ -346,6 +346,131 @@ final class InferenceEngine: @unchecked Sendable {
+             }
+         }
+     }
++
++    /// 離線影片處理使用的同步推論介面。
++    ///
++    /// 即時相機仍維持原本的 processFrame 非同步流程；只有離線影片逐幀處理
++    /// 使用此方法，避免改動現有 MainViewModel 與顯示狀態機。
++    func inferSynchronously(
++        pixelBuffer: CVPixelBuffer,
++        orientation: CGImagePropertyOrientation = .up,
++        timestamp: TimeInterval = 0
++    ) throws -> [DetectionResult] {
++        if isMockMode {
++            let t = Float(timestamp)
++            let pi2 = Float.pi * 2.0
++
++            let a1 = t * (pi2 / 3.0)
++            let cx1 = 0.5 + 0.28 * cos(a1)
++            let cy1 = 0.5 + 0.28 * sin(a1)
++            let h1: Float = 0.07
++
++            let a2 = -(t * (pi2 / 4.5)) + Float.pi
++            let cx2 = 0.5 + 0.22 * cos(a2)
++            let cy2 = 0.5 + 0.22 * sin(a2)
++            let h2: Float = 0.055
++
++            return [
++                DetectionResult(
++                    boundingBox: CGRect(
++                        x: Double(cx1 - h1),
++                        y: Double(cy1 - h1),
++                        width: Double(h1 * 2.0),
++                        height: Double(h1 * 2.0)
++                    ),
++                    confidence: 0.95,
++                    fps: 0,
++                    hardware: BeyTailInferenceHardware.mock,
++                    trackId: 0,
++                    dominantColor: UIColor(hex: 0x00DDFF)
++                ),
++                DetectionResult(
++                    boundingBox: CGRect(
++                        x: Double(cx2 - h2),
++                        y: Double(cy2 - h2),
++                        width: Double(h2 * 2.0),
++                        height: Double(h2 * 2.0)
++                    ),
++                    confidence: 0.91,
++                    fps: 0,
++                    hardware: BeyTailInferenceHardware.mock,
++                    trackId: 0,
++                    dominantColor: UIColor(hex: 0xFF00CC)
++                )
++            ]
++        }
++
++        guard let model else {
++            return []
++        }
++
++        let frameSize = CGSize(
++            width: CVPixelBufferGetWidth(pixelBuffer),
++            height: CVPixelBufferGetHeight(pixelBuffer)
++        )
++
++        activeFrameSize = frameSize
++
++        let synchronousRequest = VNCoreMLRequest(model: model)
++        synchronousRequest.imageCropAndScaleOption = .scaleFill
++
++        let handler = VNImageRequestHandler(
++            cvPixelBuffer: pixelBuffer,
++            orientation: orientation,
++            options: [:]
++        )
++
++        try handler.perform([synchronousRequest])
++
++        if let objects = synchronousRequest.results as? [VNRecognizedObjectObservation] {
++            let detections = objects
++                .prefix(100)
++                .compactMap { observation -> DetectionResult? in
++                    let confidence = observation.labels.first?.confidence
++                        ?? observation.confidence
++
++                    guard confidence >= confidenceThreshold else {
++                        return nil
++                    }
++
++                    let rect = CGRect(
++                        x: observation.boundingBox.minX,
++                        y: 1.0 - observation.boundingBox.maxY,
++                        width: observation.boundingBox.width,
++                        height: observation.boundingBox.height
++                    )
++
++                    return DetectionResult(
++                        boundingBox: clampNormalizedRect(rect),
++                        confidence: confidence,
++                        fps: 0,
++                        hardware: BeyTailInferenceHardware.npu,
++                        trackId: 0,
++                        dominantColor: UIColor(hex: 0x00DDFF)
++                    )
++                }
++
++            return nonMaximumSuppression(
++                detections,
++                iouThreshold: nmsIoUThreshold
++            )
++        }
++
++        if let features = synchronousRequest.results as? [VNCoreMLFeatureValueObservation],
++           let array = features.first?.featureValue.multiArrayValue {
++            let decoded = decodeYOLOv10Output(
++                array,
++                sourceFrameSize: frameSize
++            )
++
++            return nonMaximumSuppression(
++                decoded,
++                iouThreshold: nmsIoUThreshold
++            )
++        }
++
++        return []
++    }
+ 
+     // MARK: - Vision Result
+ 
+diff --git a/beyblade/BeyTail/UI/ContentView.swift b/beyblade/BeyTail/UI/ContentView.swift
+index 8f9d77c..4444444 100644
+--- a/beyblade/BeyTail/UI/ContentView.swift
++++ b/beyblade/BeyTail/UI/ContentView.swift
+@@ -225,46 +225,17 @@
+             .fullScreenCover(
+                 isPresented: $showVideoPicker,
+                 onDismiss: {
+-                    let sessionID = presentedPickerSessionID ?? pickerSessionID
+-                    handleVideoPickerDismiss(sessionID: sessionID)
++                    vm.start()
+                 }
+             ) {
+-                RotatedVideoLibraryPickerView(
+-                    isPresented: $showVideoPicker,
+-                    sessionID: pickerSessionID,
+-                    rotation: $iconRotation,
+-                    extraRotationDegrees: videoLibraryExtraRotationDeg,
+-                    onSelectionPrepared: { sessionID in
+-                        handleSelectionPrepared(sessionID: sessionID)
+-                    },
+-                    onPicked: { sessionID, url in
+-                        guard markPickerSessionHandled(sessionID) else {
+-                            return
+-                        }
+-
+-                        handleSelectedVideo(url)
+-                    },
+-                    onCancel: { sessionID in
+-                        guard markPickerSessionHandled(sessionID) else {
+-                            resetPickerUIState()
+-                            return
+-                        }
+-
+-                        resetPickerUIState()
+-                        vm.cancelVideoPickerAndRecover()
+-                    },
+-                    onFailed: { sessionID in
+-                        guard markPickerSessionHandled(sessionID) else {
+-                            resetPickerUIState()
+-                            return
+-                        }
+-
+-                        resetPickerUIState()
+-                        vm.videoSelectionFailed()
++                VideoRenderPage(
++                    initialEffect: vm.selectedEffect,
++                    onClose: {
++                        showVideoPicker = false
+                     }
+                 )
+                 .ignoresSafeArea()
+-                .statusBarHidden(true)
++                .preferredColorScheme(.dark)
+             }
+             .fullScreenCover(isPresented: $showEffectLibraryPage) {
+                 EffectLibraryPage(
+@@ -301,7 +272,10 @@
+                 switch newPhase {
+                 case .active:
+                     print("[SCENE_PHASE] active")
+-                    vm.start()
++
++                    if !showVideoPicker {
++                        vm.start()
++                    }
+ 
+                 case .inactive:
+                     print("[SCENE_PHASE] inactive")
+@@ -384,49 +358,16 @@
+     // MARK: - Video Picker Handler
+ 
+     private func openVideoPicker() {
+-        guard vm.canOpenVideoLibrary else {
+-            return
+-        }
+-
+-        guard !isBusy else {
+-            return
+-        }
+-
+-        guard !isPreparingVideoPicker else {
++        guard vm.canOpenVideoLibrary,
++              !isBusy,
++              !showVideoPicker else {
+             return
+         }
+ 
+-        guard !showVideoPicker else {
+-            return
+-        }
+-
+-        let newSessionID = UUID()
+-
+-        pickerSessionID = newSessionID
+-        presentedPickerSessionID = nil
+-        selectionPreparedPickerSessionID = nil
+-        handledPickerSessionID = nil
+-
+-        isPreparingVideoPicker = true
+-
+-        Task { @MainActor in
+-            let canOpen = await vm.prepareForVideoPickerAsync()
+-
+-            guard canOpen else {
+-                resetPickerUIState()
+-                return
+-            }
+-
+-            guard pickerSessionID == newSessionID else {
+-                resetPickerUIState()
+-                vm.cancelVideoPickerAndRecover()
+-                return
+-            }
+-
+-            isPreparingVideoPicker = false
+-            presentedPickerSessionID = newSessionID
+-            showVideoPicker = true
+-        }
++        // 直式影片特效頁使用系統 PhotosPicker，不再顯示自製影片 Grid。
++        // 進入頁面前停止相機與即時推論，離開後由 fullScreenCover onDismiss 恢復。
++        vm.stop()
++        showVideoPicker = true
+     }
+ 
+     private func isValidPickerSession(_ sessionID: UUID) -> Bool {

@@ -12,6 +12,10 @@ struct ContentView: View {
     @State private var showVideoPicker = false
     @State private var isPreparingVideoPicker = false
 
+    @State private var pendingVideoRenderRequest: VideoRenderRequest?
+    @State private var activeVideoRenderRequest: VideoRenderRequest?
+    @State private var reopenVideoPickerAfterRender = false
+
     @State private var pickerSessionID = UUID()
     @State private var presentedPickerSessionID: UUID?
     @State private var selectionPreparedPickerSessionID: UUID?
@@ -266,6 +270,25 @@ struct ContentView: View {
                 .ignoresSafeArea()
                 .statusBarHidden(true)
             }
+            .fullScreenCover(
+                item: $activeVideoRenderRequest,
+                onDismiss: {
+                    handleVideoRenderDismiss()
+                }
+            ) { request in
+                VideoRenderPage(
+                    request: request,
+                    onReselect: {
+                        reopenVideoPickerAfterRender = true
+                        activeVideoRenderRequest = nil
+                    },
+                    onClose: {
+                        activeVideoRenderRequest = nil
+                    }
+                )
+                .ignoresSafeArea()
+                .statusBarHidden(true)
+            }
             .fullScreenCover(isPresented: $showEffectLibraryPage) {
                 EffectLibraryPage(
                     selectedEffect: $vm.selectedEffect,
@@ -300,7 +323,11 @@ struct ContentView: View {
                 switch newPhase {
                 case .active:
                     print("[SCENE_PHASE] active")
-                    vm.start()
+
+                    if activeVideoRenderRequest == nil,
+                       pendingVideoRenderRequest == nil {
+                        vm.start()
+                    }
 
                 case .inactive:
                     print("[SCENE_PHASE] inactive")
@@ -457,13 +484,25 @@ struct ContentView: View {
     }
 
     private func handleSelectedVideo(_ url: URL) {
+        pendingVideoRenderRequest = VideoRenderRequest(
+            inputURL: url,
+            effect: vm.selectedEffect
+        )
+
         resetPickerUIState()
 
-        vm.beginResolvingPickedVideo()
-        vm.loadVideo(url: url)
+        // 不再把影片載入主 UI；停止相機與即時推論，交給獨立頁完整離線渲染。
+        vm.stop()
     }
 
     private func handleVideoPickerDismiss(sessionID: UUID) {
+        if let request = pendingVideoRenderRequest {
+            pendingVideoRenderRequest = nil
+            resetPickerUIState()
+            activeVideoRenderRequest = request
+            return
+        }
+
         if selectionPreparedPickerSessionID == sessionID,
            handledPickerSessionID == nil {
             resetPickerUIState()
@@ -483,6 +522,32 @@ struct ContentView: View {
         showVideoPicker = false
         isPreparingVideoPicker = false
         presentedPickerSessionID = nil
+    }
+
+    private func handleVideoRenderDismiss() {
+        vm.start()
+
+        guard reopenVideoPickerAfterRender else {
+            return
+        }
+
+        reopenVideoPickerAfterRender = false
+
+        Task { @MainActor in
+            // start() 會非同步啟動相機；等狀態機允許後再重新開啟影片庫。
+            for _ in 0..<50 {
+                if vm.canOpenVideoLibrary,
+                   !isBusy,
+                   activeVideoRenderRequest == nil {
+                    openVideoPicker()
+                    return
+                }
+
+                try? await Task.sleep(
+                    nanoseconds: 100_000_000
+                )
+            }
+        }
     }
 
     // MARK: - Top Bar

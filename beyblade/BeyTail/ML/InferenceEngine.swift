@@ -345,6 +345,131 @@ final class InferenceEngine: @unchecked Sendable {
         }
     }
 
+    /// 離線影片處理使用的同步推論介面。
+    ///
+    /// 即時相機仍維持原本的 processFrame 非同步流程；只有離線影片逐幀處理
+    /// 使用此方法，避免改動現有 MainViewModel 與顯示狀態機。
+    func inferSynchronously(
+        pixelBuffer: CVPixelBuffer,
+        orientation: CGImagePropertyOrientation = .up,
+        timestamp: TimeInterval = 0
+    ) throws -> [DetectionResult] {
+        if isMockMode {
+            let t = Float(timestamp)
+            let pi2 = Float.pi * 2.0
+
+            let a1 = t * (pi2 / 3.0)
+            let cx1 = 0.5 + 0.28 * cos(a1)
+            let cy1 = 0.5 + 0.28 * sin(a1)
+            let h1: Float = 0.07
+
+            let a2 = -(t * (pi2 / 4.5)) + Float.pi
+            let cx2 = 0.5 + 0.22 * cos(a2)
+            let cy2 = 0.5 + 0.22 * sin(a2)
+            let h2: Float = 0.055
+
+            return [
+                DetectionResult(
+                    boundingBox: CGRect(
+                        x: Double(cx1 - h1),
+                        y: Double(cy1 - h1),
+                        width: Double(h1 * 2.0),
+                        height: Double(h1 * 2.0)
+                    ),
+                    confidence: 0.95,
+                    fps: 0,
+                    hardware: BeyTailInferenceHardware.mock,
+                    trackId: 0,
+                    dominantColor: UIColor(hex: 0x00DDFF)
+                ),
+                DetectionResult(
+                    boundingBox: CGRect(
+                        x: Double(cx2 - h2),
+                        y: Double(cy2 - h2),
+                        width: Double(h2 * 2.0),
+                        height: Double(h2 * 2.0)
+                    ),
+                    confidence: 0.91,
+                    fps: 0,
+                    hardware: BeyTailInferenceHardware.mock,
+                    trackId: 0,
+                    dominantColor: UIColor(hex: 0xFF00CC)
+                )
+            ]
+        }
+
+        guard let model else {
+            return []
+        }
+
+        let frameSize = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
+
+        activeFrameSize = frameSize
+
+        let synchronousRequest = VNCoreMLRequest(model: model)
+        synchronousRequest.imageCropAndScaleOption = .scaleFill
+
+        let handler = VNImageRequestHandler(
+            cvPixelBuffer: pixelBuffer,
+            orientation: orientation,
+            options: [:]
+        )
+
+        try handler.perform([synchronousRequest])
+
+        if let objects = synchronousRequest.results as? [VNRecognizedObjectObservation] {
+            let detections = objects
+                .prefix(100)
+                .compactMap { observation -> DetectionResult? in
+                    let confidence = observation.labels.first?.confidence
+                        ?? observation.confidence
+
+                    guard confidence >= confidenceThreshold else {
+                        return nil
+                    }
+
+                    let rect = CGRect(
+                        x: observation.boundingBox.minX,
+                        y: 1.0 - observation.boundingBox.maxY,
+                        width: observation.boundingBox.width,
+                        height: observation.boundingBox.height
+                    )
+
+                    return DetectionResult(
+                        boundingBox: clampNormalizedRect(rect),
+                        confidence: confidence,
+                        fps: 0,
+                        hardware: BeyTailInferenceHardware.npu,
+                        trackId: 0,
+                        dominantColor: UIColor(hex: 0x00DDFF)
+                    )
+                }
+
+            return nonMaximumSuppression(
+                detections,
+                iouThreshold: nmsIoUThreshold
+            )
+        }
+
+        if let features = synchronousRequest.results as? [VNCoreMLFeatureValueObservation],
+           let array = features.first?.featureValue.multiArrayValue {
+            let decoded = decodeYOLOv10Output(
+                array,
+                sourceFrameSize: frameSize
+            )
+
+            return nonMaximumSuppression(
+                decoded,
+                iouThreshold: nmsIoUThreshold
+            )
+        }
+
+        return []
+    }
+
     // MARK: - Vision Result
 
     private func handleVisionResult(
