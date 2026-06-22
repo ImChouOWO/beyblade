@@ -181,9 +181,10 @@ struct VideoRenderPage: View {
                     .font(.system(size: 12))
                     .foregroundColor(.white.opacity(0.45))
             }
-
+            
             Spacer()
         }
+        .padding(.top, 25)
     }
 
     private var selectionContent: some View {

@@ -12,10 +12,6 @@ struct ContentView: View {
     @State private var showVideoPicker = false
     @State private var isPreparingVideoPicker = false
 
-    @State private var pendingVideoRenderRequest: VideoRenderRequest?
-    @State private var activeVideoRenderRequest: VideoRenderRequest?
-    @State private var reopenVideoPickerAfterRender = false
-
     @State private var pickerSessionID = UUID()
     @State private var presentedPickerSessionID: UUID?
     @State private var selectionPreparedPickerSessionID: UUID?
@@ -229,64 +225,17 @@ struct ContentView: View {
             .fullScreenCover(
                 isPresented: $showVideoPicker,
                 onDismiss: {
-                    let sessionID = presentedPickerSessionID ?? pickerSessionID
-                    handleVideoPickerDismiss(sessionID: sessionID)
+                    vm.start()
                 }
             ) {
-                RotatedVideoLibraryPickerView(
-                    isPresented: $showVideoPicker,
-                    sessionID: pickerSessionID,
-                    rotation: $iconRotation,
-                    extraRotationDegrees: videoLibraryExtraRotationDeg,
-                    onSelectionPrepared: { sessionID in
-                        handleSelectionPrepared(sessionID: sessionID)
-                    },
-                    onPicked: { sessionID, url in
-                        guard markPickerSessionHandled(sessionID) else {
-                            return
-                        }
-
-                        handleSelectedVideo(url)
-                    },
-                    onCancel: { sessionID in
-                        guard markPickerSessionHandled(sessionID) else {
-                            resetPickerUIState()
-                            return
-                        }
-
-                        resetPickerUIState()
-                        vm.cancelVideoPickerAndRecover()
-                    },
-                    onFailed: { sessionID in
-                        guard markPickerSessionHandled(sessionID) else {
-                            resetPickerUIState()
-                            return
-                        }
-
-                        resetPickerUIState()
-                        vm.videoSelectionFailed()
-                    }
-                )
-                .ignoresSafeArea()
-                .statusBarHidden(true)
-            }
-            .fullScreenCover(
-                item: $activeVideoRenderRequest,
-                onDismiss: {
-                    handleVideoRenderDismiss()
-                }
-            ) { request in
                 VideoRenderPage(
-                    request: request,
-                    onReselect: {
-                        reopenVideoPickerAfterRender = true
-                        activeVideoRenderRequest = nil
-                    },
+                    initialEffect: vm.selectedEffect,
                     onClose: {
-                        activeVideoRenderRequest = nil
+                        showVideoPicker = false
                     }
                 )
                 .ignoresSafeArea()
+                .preferredColorScheme(.dark)
                 .statusBarHidden(true)
             }
             .fullScreenCover(isPresented: $showEffectLibraryPage) {
@@ -324,8 +273,7 @@ struct ContentView: View {
                 case .active:
                     print("[SCENE_PHASE] active")
 
-                    if activeVideoRenderRequest == nil,
-                       pendingVideoRenderRequest == nil {
+                    if !showVideoPicker {
                         vm.start()
                     }
 
@@ -409,49 +357,16 @@ struct ContentView: View {
     // MARK: - Video Picker Handler
 
     private func openVideoPicker() {
-        guard vm.canOpenVideoLibrary else {
+        guard vm.canOpenVideoLibrary,
+              !isBusy,
+              !showVideoPicker else {
             return
         }
 
-        guard !isBusy else {
-            return
-        }
-
-        guard !isPreparingVideoPicker else {
-            return
-        }
-
-        guard !showVideoPicker else {
-            return
-        }
-
-        let newSessionID = UUID()
-
-        pickerSessionID = newSessionID
-        presentedPickerSessionID = nil
-        selectionPreparedPickerSessionID = nil
-        handledPickerSessionID = nil
-
-        isPreparingVideoPicker = true
-
-        Task { @MainActor in
-            let canOpen = await vm.prepareForVideoPickerAsync()
-
-            guard canOpen else {
-                resetPickerUIState()
-                return
-            }
-
-            guard pickerSessionID == newSessionID else {
-                resetPickerUIState()
-                vm.cancelVideoPickerAndRecover()
-                return
-            }
-
-            isPreparingVideoPicker = false
-            presentedPickerSessionID = newSessionID
-            showVideoPicker = true
-        }
+        // 直式影片特效頁改用系統 PhotosPicker。
+        // 進入前停止相機與即時推論，離開頁面後由 onDismiss 恢復。
+        vm.stop()
+        showVideoPicker = true
     }
 
     private func isValidPickerSession(_ sessionID: UUID) -> Bool {
@@ -484,25 +399,12 @@ struct ContentView: View {
     }
 
     private func handleSelectedVideo(_ url: URL) {
-        pendingVideoRenderRequest = VideoRenderRequest(
-            inputURL: url,
-            effect: vm.selectedEffect
-        )
-
+        _ = url
         resetPickerUIState()
-
-        // 不再把影片載入主 UI；停止相機與即時推論，交給獨立頁完整離線渲染。
-        vm.stop()
+        vm.cancelVideoPickerAndRecover()
     }
 
     private func handleVideoPickerDismiss(sessionID: UUID) {
-        if let request = pendingVideoRenderRequest {
-            pendingVideoRenderRequest = nil
-            resetPickerUIState()
-            activeVideoRenderRequest = request
-            return
-        }
-
         if selectionPreparedPickerSessionID == sessionID,
            handledPickerSessionID == nil {
             resetPickerUIState()
@@ -526,28 +428,6 @@ struct ContentView: View {
 
     private func handleVideoRenderDismiss() {
         vm.start()
-
-        guard reopenVideoPickerAfterRender else {
-            return
-        }
-
-        reopenVideoPickerAfterRender = false
-
-        Task { @MainActor in
-            // start() 會非同步啟動相機；等狀態機允許後再重新開啟影片庫。
-            for _ in 0..<50 {
-                if vm.canOpenVideoLibrary,
-                   !isBusy,
-                   activeVideoRenderRequest == nil {
-                    openVideoPicker()
-                    return
-                }
-
-                try? await Task.sleep(
-                    nanoseconds: 100_000_000
-                )
-            }
-        }
     }
 
     // MARK: - Top Bar
@@ -1029,7 +909,7 @@ private struct EffectLibraryPage: View {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 14, weight: .bold))
 
-                    Text("返回主頁面")
+                    Text("返回")
                         .font(.system(size: 14, weight: .semibold))
                 }
                 .foregroundColor(.white)
