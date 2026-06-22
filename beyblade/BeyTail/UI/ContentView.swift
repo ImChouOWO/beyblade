@@ -1,7 +1,6 @@
 import SwiftUI
 @preconcurrency import AVFoundation
 import UIKit
-@preconcurrency import Photos
 
 struct ContentView: View {
 
@@ -10,29 +9,7 @@ struct ContentView: View {
     @StateObject private var vm = MainViewModel()
 
     @State private var showVideoPicker = false
-    @State private var isPreparingVideoPicker = false
 
-    @State private var pickerSessionID = UUID()
-    @State private var presentedPickerSessionID: UUID?
-    @State private var selectionPreparedPickerSessionID: UUID?
-    @State private var handledPickerSessionID: UUID?
-
-    /*
-     固定畫布模式：
-     - AppDelegate 維持 .landscapeRight
-     - CameraPreview / VideoPlayer / TrailOverlay 不跟隨裝置方向旋轉
-     - 選單列固定在畫面右側
-     - 不修改 controlBarLayer 的外層旋轉與位置邏輯
-     - icon / 文字 / FPS / 效果按鈕跟隨 iconRotation
-     - hintBar 外層跟選單列方向一致，內部跟 iconRotation 一致
-     - BEY TAIL 額外補償 90 度
-     - busyOverlay 只旋轉中間卡片，不旋轉遮罩
-     - 影片庫改為自製 SwiftUI Grid
-     - 影片庫實際角度 = iconRotation + videoLibraryExtraRotationDeg
-     - layout 寬高交換也使用同一個實際角度，避免跑版
-     - 影片縮圖固定直拍比例 9:16
-     - 影片縮圖使用固定 cardWidth，避免寬度重疊
-    */
     @State private var iconRotation: Angle = .zero
     @State private var effectDragLocation: CGPoint?
 
@@ -41,17 +18,16 @@ struct ContentView: View {
     @State private var effectLongPressTask: Task<Void, Never>?
     @State private var isEffectDragSelecting = false
 
+    // 全螢幕拖曳選特效使用。
+    @State private var effectButtonFrame: CGRect = .zero
+    @State private var latestEffectDragLocation: CGPoint?
+
     private let fixedIsLandscape = false
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspectFill
     private let controlBarHeight: CGFloat = 110
 
-    // Top bar uses absolute full-screen coordinates.
-    // Increase topBarTopPadding to move it down; decrease it to move it up.
     private let topBarHeight: CGFloat = 40
     private let topBarTopPadding: CGFloat = 10
-
-    private let busyDeg: Double = 0
-    private let videoLibraryExtraRotationDeg: Double = 0
 
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
@@ -102,6 +78,7 @@ struct ContentView: View {
         .ignoresSafeArea()
         .allowsHitTesting(false)
     }
+
     private func isEffectMenuQuarterTurn(_ degrees: Double) -> Bool {
         let value = normalizedEffectMenuDegrees(degrees)
 
@@ -118,9 +95,9 @@ struct ContentView: View {
 
         return value
     }
+
     private let effectMenuWidth: CGFloat = 220
     private let effectMenuHeight: CGFloat = 360
-
     private let effectMenuGapToControlBar: CGFloat = 10
     private let effectMenuBottomPadding: CGFloat = 24
 
@@ -129,8 +106,13 @@ struct ContentView: View {
             let rotationDegrees = iconRotation.degrees
             let isQuarterTurn = isEffectMenuQuarterTurn(rotationDegrees)
 
-            let visualWidth = isQuarterTurn ? effectMenuHeight : effectMenuWidth
-            let visualHeight = isQuarterTurn ? effectMenuWidth : effectMenuHeight
+            let visualWidth = isQuarterTurn
+                ? effectMenuHeight
+                : effectMenuWidth
+
+            let visualHeight = isQuarterTurn
+                ? effectMenuWidth
+                : effectMenuHeight
 
             ZStack(alignment: .bottomTrailing) {
                 Color.clear
@@ -153,7 +135,10 @@ struct ContentView: View {
                         height: visualHeight
                     )
                     .padding(.trailing, 16)
-                    .padding(.bottom, controlBarHeight + effectMenuGapToControlBar)
+                    .padding(
+                        .bottom,
+                        controlBarHeight + effectMenuGapToControlBar
+                    )
                     .padding(.bottom, effectMenuBottomPadding)
                     .transition(.opacity)
                 }
@@ -212,7 +197,6 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
                 topBarLayer
-
                 hintLayer
                 controlBarLayer
                 effectMenuLayer
@@ -221,6 +205,17 @@ struct ContentView: View {
                     busyOverlay
                         .transition(.opacity)
                 }
+            }
+            // 手勢掛在整個畫面；只有從特效按鈕開始時才啟動選擇。
+            .contentShape(Rectangle())
+            .simultaneousGesture(
+                effectScreenPressGesture,
+                including: .all
+            )
+            .onPreferenceChange(
+                EffectButtonFramePreferenceKey.self
+            ) { frame in
+                effectButtonFrame = frame
             }
             .fullScreenCover(
                 isPresented: $showVideoPicker,
@@ -248,17 +243,10 @@ struct ContentView: View {
                 .statusBarHidden(true)
             }
             .onAppear {
-                UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-                updateIconRotation()
+                UIDevice.current
+                    .beginGeneratingDeviceOrientationNotifications()
 
-                print(
-                    "[CONTENT_LAYOUT_APPEAR]",
-                    "size:", size,
-                    "fixedCanvas:", true,
-                    "isLandscape:", isLandscape,
-                    "videoGravity:", videoGravity.rawValue,
-                    "iconRotation:", iconRotation
-                )
+                updateIconRotation()
 
                 vm.updatePreviewLayout(
                     overlaySize: size,
@@ -271,17 +259,14 @@ struct ContentView: View {
             .onChange(of: scenePhase) { _, newPhase in
                 switch newPhase {
                 case .active:
-                    print("[SCENE_PHASE] active")
-
                     if !showVideoPicker {
                         vm.start()
                     }
 
                 case .inactive:
-                    print("[SCENE_PHASE] inactive")
+                    break
 
                 case .background:
-                    print("[SCENE_PHASE] background")
                     vm.stop()
 
                 @unknown default:
@@ -289,15 +274,6 @@ struct ContentView: View {
                 }
             }
             .onChange(of: size) { _, newSize in
-                print(
-                    "[CONTENT_LAYOUT_CHANGE]",
-                    "size:", newSize,
-                    "fixedCanvas:", true,
-                    "isLandscape:", fixedIsLandscape,
-                    "videoGravity:", fixedVideoGravity.rawValue,
-                    "iconRotation:", iconRotation
-                )
-
                 vm.updatePreviewLayout(
                     overlaySize: newSize,
                     videoGravity: fixedVideoGravity
@@ -312,22 +288,13 @@ struct ContentView: View {
             ) { _ in
                 updateIconRotation()
             }
-            .onChange(of: vm.isSwitchingInputSource) { _, newValue in
-                if !newValue {
-                    isPreparingVideoPicker = false
-                }
-            }
-            .onChange(of: vm.isVideoLoading) { _, newValue in
-                if !newValue {
-                    isPreparingVideoPicker = false
-                }
-            }
-            .preferredColorScheme(ColorScheme.dark)
+            .preferredColorScheme(.dark)
         }
         .statusBarHidden(true)
     }
 
     // MARK: - Icon Rotation
+
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
 
@@ -347,14 +314,9 @@ struct ContentView: View {
         default:
             break
         }
-
-        print(
-            "[ICON_ROTATION]",
-            "deviceOrientation:", orientation.rawValue,
-            "iconRotation:", iconRotation.degrees
-        )
     }
-    // MARK: - Video Picker Handler
+
+    // MARK: - Video Picker
 
     private func openVideoPicker() {
         guard vm.canOpenVideoLibrary,
@@ -363,74 +325,12 @@ struct ContentView: View {
             return
         }
 
-        // 直式影片特效頁改用系統 PhotosPicker。
-        // 進入前停止相機與即時推論，離開頁面後由 onDismiss 恢復。
         vm.stop()
         showVideoPicker = true
     }
 
-    private func isValidPickerSession(_ sessionID: UUID) -> Bool {
-        pickerSessionID == sessionID ||
-        presentedPickerSessionID == sessionID ||
-        selectionPreparedPickerSessionID == sessionID
-    }
-
-    private func handleSelectionPrepared(sessionID: UUID) {
-        guard isValidPickerSession(sessionID) else {
-            return
-        }
-
-        selectionPreparedPickerSessionID = sessionID
-        isPreparingVideoPicker = false
-    }
-
-    @discardableResult
-    private func markPickerSessionHandled(_ sessionID: UUID) -> Bool {
-        guard isValidPickerSession(sessionID) else {
-            return false
-        }
-
-        if handledPickerSessionID == sessionID {
-            return false
-        }
-
-        handledPickerSessionID = sessionID
-        return true
-    }
-
-    private func handleSelectedVideo(_ url: URL) {
-        _ = url
-        resetPickerUIState()
-        vm.cancelVideoPickerAndRecover()
-    }
-
-    private func handleVideoPickerDismiss(sessionID: UUID) {
-        if selectionPreparedPickerSessionID == sessionID,
-           handledPickerSessionID == nil {
-            resetPickerUIState()
-            return
-        }
-
-        guard markPickerSessionHandled(sessionID) else {
-            resetPickerUIState()
-            return
-        }
-
-        resetPickerUIState()
-        vm.cancelVideoPickerAndRecover()
-    }
-
-    private func resetPickerUIState() {
-        showVideoPicker = false
-        isPreparingVideoPicker = false
-        presentedPickerSessionID = nil
-    }
-
-    private func handleVideoRenderDismiss() {
-        vm.start()
-    }
-
     // MARK: - Top Bar
+
     private var topBar: some View {
         HStack(spacing: 12) {
             Text("BEY TAIL")
@@ -480,7 +380,9 @@ struct ContentView: View {
 
                     Text("請將陀螺放置於鏡頭可視範圍內")
                         .font(.system(size: 11))
-                        .foregroundColor(Color(white: 0.9, opacity: 0.8))
+                        .foregroundColor(
+                            Color(white: 0.9, opacity: 0.8)
+                        )
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 9)
@@ -498,7 +400,6 @@ struct ContentView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 0) {
-
             Button {
                 openVideoPicker()
             } label: {
@@ -508,8 +409,13 @@ struct ContentView: View {
                         .foregroundColor(.white)
                         .frame(width: 44, height: 44)
                         .background(
-                            Color(white: 1, opacity: vm.canOpenVideoLibrary ? 0.12 : 0.05)
-                                .cornerRadius(10)
+                            Color(
+                                white: 1,
+                                opacity: vm.canOpenVideoLibrary
+                                    ? 0.12
+                                    : 0.05
+                            )
+                            .cornerRadius(10)
                         )
 
                     Text("影片庫")
@@ -523,8 +429,18 @@ struct ContentView: View {
                 .rotationEffect(iconRotation)
             }
             .frame(maxWidth: .infinity)
-            .disabled(!vm.canOpenVideoLibrary || isPreparingVideoPicker || showVideoPicker || isBusy)
-            .opacity((vm.canOpenVideoLibrary && !isPreparingVideoPicker && !showVideoPicker && !isBusy) ? 1.0 : 0.45)
+            .disabled(
+                !vm.canOpenVideoLibrary ||
+                showVideoPicker ||
+                isBusy
+            )
+            .opacity(
+                (
+                    vm.canOpenVideoLibrary &&
+                    !showVideoPicker &&
+                    !isBusy
+                ) ? 1.0 : 0.45
+            )
 
             ZStack {
                 Circle()
@@ -546,7 +462,7 @@ struct ContentView: View {
                     } else {
                         vm.toggleRecording()
                     }
-                }  label: {
+                } label: {
                     Image(systemName: centerButtonIconName)
                         .font(.system(size: 22))
                         .foregroundColor(.white)
@@ -566,11 +482,22 @@ struct ContentView: View {
                 ZStack {
                     VStack {
                         Text("\(vm.fps) FPS")
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(
+                                .system(
+                                    size: 11,
+                                    design: .monospaced
+                                )
+                            )
                             .foregroundColor(.white)
 
                         Text("[\(vm.hardwareLabel)]")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .font(
+                                .system(
+                                    size: 11,
+                                    weight: .bold,
+                                    design: .monospaced
+                                )
+                            )
                             .foregroundColor(vm.hardwareColor)
                     }
                     .rotationEffect(iconRotation)
@@ -590,7 +517,7 @@ struct ContentView: View {
         .frame(height: controlBarHeight)
         .background(Color(white: 0.05).opacity(0.95))
     }
-    
+
     private var centerButtonDisabled: Bool {
         if isBusy {
             return true
@@ -608,8 +535,12 @@ struct ContentView: View {
             return "arrow.uturn.backward"
         }
 
-        return vm.isRecording ? "stop.fill" : "video.fill"
+        return vm.isRecording
+            ? "stop.fill"
+            : "video.fill"
     }
+
+    // MARK: - Effect Button / Full-screen Drag
 
     private var effectButton: some View {
         Text(vm.selectedEffect.emoji)
@@ -629,11 +560,19 @@ struct ContentView: View {
             )
             .rotationEffect(iconRotation)
             .contentShape(Circle())
-            .gesture(effectButtonPressGesture)
+            .background(
+                GeometryReader { proxy in
+                    Color.clear
+                        .preference(
+                            key: EffectButtonFramePreferenceKey.self,
+                            value: proxy.frame(in: .global)
+                        )
+                }
+            )
             .opacity(isBusy ? 0.45 : 1.0)
     }
 
-    private var effectButtonPressGesture: some Gesture {
+    private var effectScreenPressGesture: some Gesture {
         DragGesture(
             minimumDistance: 0,
             coordinateSpace: .global
@@ -643,15 +582,36 @@ struct ContentView: View {
                 return
             }
 
+            // 只接受從特效按鈕開始的手勢。
             if effectPressStartDate == nil {
+                let expandedButtonFrame = effectButtonFrame.insetBy(
+                    dx: -14,
+                    dy: -14
+                )
+
+                guard expandedButtonFrame.contains(value.startLocation) else {
+                    return
+                }
+
                 beginEffectPress(at: value.location)
             }
+
+            guard effectPressStartDate != nil else {
+                return
+            }
+
+            latestEffectDragLocation = value.location
 
             if isEffectDragSelecting {
                 effectDragLocation = value.location
             }
         }
         .onEnded { _ in
+            // 不是從特效按鈕開始的手勢，不做處理。
+            guard effectPressStartDate != nil else {
+                return
+            }
+
             guard !isBusy else {
                 resetEffectPressState()
                 return
@@ -661,7 +621,9 @@ struct ContentView: View {
                 effectPressStartDate ?? Date()
             )
 
-            let shouldOpenPage = elapsed < 1.0 && !isEffectDragSelecting
+            let shouldOpenPage =
+                elapsed < 1.0 &&
+                !isEffectDragSelecting
 
             if shouldOpenPage {
                 resetEffectPressState()
@@ -685,23 +647,23 @@ struct ContentView: View {
     private func beginEffectPress(at location: CGPoint) {
         effectPressStartDate = Date()
         effectDragLocation = nil
+        latestEffectDragLocation = location
         isEffectDragSelecting = false
 
         effectLongPressTask?.cancel()
 
         effectLongPressTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            try? await Task.sleep(
+                nanoseconds: 250_000_000
+            )
 
-            guard !Task.isCancelled else {
-                return
-            }
-
-            guard effectPressStartDate != nil else {
+            guard !Task.isCancelled,
+                  effectPressStartDate != nil else {
                 return
             }
 
             isEffectDragSelecting = true
-            effectDragLocation = location
+            effectDragLocation = latestEffectDragLocation ?? location
 
             withAnimation(.easeOut(duration: 0.18)) {
                 vm.effectMenuVisible = true
@@ -715,8 +677,10 @@ struct ContentView: View {
 
         effectPressStartDate = nil
         effectDragLocation = nil
+        latestEffectDragLocation = nil
         isEffectDragSelecting = false
     }
+
     private var centerButtonGradient: LinearGradient {
         if vm.isUsingVideoFile {
             return LinearGradient(
@@ -772,7 +736,6 @@ struct ContentView: View {
                     .fill(Color.black.opacity(0.75))
             )
             .rotationEffect(iconRotation)
-
         }
         .allowsHitTesting(true)
     }
@@ -793,6 +756,22 @@ struct ContentView: View {
         return "處理中..."
     }
 }
+
+private struct EffectButtonFramePreferenceKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+
+    static func reduce(
+        value: inout CGRect,
+        nextValue: () -> CGRect
+    ) {
+        let nextFrame = nextValue()
+
+        if !nextFrame.isEmpty {
+            value = nextFrame
+        }
+    }
+}
+
 // MARK: - Effect Library Page
 
 private struct EffectLibraryPage: View {
@@ -802,8 +781,11 @@ private struct EffectLibraryPage: View {
 
     let rotation: Angle
 
-    @AppStorage("ownedEffectIDs") private var ownedEffectIDsRaw: String = ""
-    @AppStorage("effectMenuIDs") private var effectMenuIDsRaw: String = ""
+    @AppStorage("ownedEffectIDs")
+    private var ownedEffectIDsRaw: String = ""
+
+    @AppStorage("effectMenuIDs")
+    private var effectMenuIDsRaw: String = ""
 
     private let columns = [
         GridItem(.flexible(), spacing: 12),
@@ -988,8 +970,16 @@ private struct EffectLibraryPage: View {
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
-            .disabled(EffectType.shopEffects.allSatisfy { isOwned($0) })
-            .opacity(EffectType.shopEffects.allSatisfy { isOwned($0) } ? 0.45 : 1.0)
+            .disabled(
+                EffectType.shopEffects
+                    .allSatisfy { isOwned($0) }
+            )
+            .opacity(
+                EffectType.shopEffects
+                    .allSatisfy { isOwned($0) }
+                    ? 0.45
+                    : 1.0
+            )
         }
         .padding(18)
         .background(
@@ -997,7 +987,10 @@ private struct EffectLibraryPage: View {
                 .fill(Color(hex: 0x07111F).opacity(0.95))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color(hex: 0x00F5FF).opacity(0.32), lineWidth: 1.4)
+                        .stroke(
+                            Color(hex: 0x00F5FF).opacity(0.32),
+                            lineWidth: 1.4
+                        )
                 )
         )
     }
@@ -1042,11 +1035,13 @@ private struct EffectLibraryPage: View {
             return true
         }
 
-        return ids(from: ownedEffectIDsRaw).contains(effect.rawValue)
+        return ids(from: ownedEffectIDsRaw)
+            .contains(effect.rawValue)
     }
 
     private func isInMenu(_ effect: EffectType) -> Bool {
-        ids(from: effectMenuIDsRaw).contains(effect.rawValue)
+        ids(from: effectMenuIDsRaw)
+            .contains(effect.rawValue)
     }
 
     private func buyEffect(_ effect: EffectType) {
@@ -1076,7 +1071,8 @@ private struct EffectLibraryPage: View {
             menuIDs.remove(effect.rawValue)
 
             if selectedEffect == effect {
-                selectedEffect = EffectType.defaultMenuEffects.first ?? .lightning
+                selectedEffect = EffectType.defaultMenuEffects.first
+                    ?? .lightning
             }
         } else {
             menuIDs.insert(effect.rawValue)
@@ -1101,10 +1097,10 @@ private struct EffectLibraryPage: View {
     }
 
     private static func isQuarterTurn(_ angle: Angle) -> Bool {
-        let deg = normalizedDegrees(angle.degrees)
+        let degrees = normalizedDegrees(angle.degrees)
 
-        return abs(deg - 90) < 0.5 ||
-               abs(deg - 270) < 0.5
+        return abs(degrees - 90) < 0.5 ||
+            abs(degrees - 270) < 0.5
     }
 
     private static func normalizedDegrees(_ degrees: Double) -> Double {
@@ -1161,7 +1157,10 @@ private struct EffectShopCard: View {
                 .fill(Color.white.opacity(0.065))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(
+                            Color.white.opacity(0.08),
+                            lineWidth: 1
+                        )
                 )
         )
     }
@@ -1171,7 +1170,9 @@ private struct EffectShopCard: View {
             return "NT$\(effect.price)"
         }
 
-        return isInMenu ? "從選單移除" : "加入選單"
+        return isInMenu
+            ? "從選單移除"
+            : "加入選單"
     }
 
     private var buttonBackground: LinearGradient {
@@ -1205,782 +1206,6 @@ private struct EffectShopCard: View {
             startPoint: .leading,
             endPoint: .trailing
         )
-    }
-}
-
-struct RotatedVideoLibraryPickerView: View {
-
-    @Binding var isPresented: Bool
-
-    let sessionID: UUID
-
-    @Binding var rotation: Angle
-    let extraRotationDegrees: Double
-
-    let onSelectionPrepared: (UUID) -> Void
-    let onPicked: (UUID, URL) -> Void
-    let onCancel: (UUID) -> Void
-    let onFailed: (UUID) -> Void
-
-    @Environment(\.displayScale) private var displayScale
-
-    @State private var imageManager = PHCachingImageManager()
-
-    @State private var authorizationStatus: PHAuthorizationStatus =
-        PHPhotoLibrary.authorizationStatus(for: .readWrite)
-
-    @State private var assets: [PHAsset] = []
-    @State private var isLoadingAssets = true
-    @State private var isPreparingVideo = false
-    @State private var errorText: String?
-
-    private let gridSpacing: CGFloat = 12
-    private let headerDropY: CGFloat = 10
-
-    private var effectiveRotation: Angle {
-        .degrees(rotation.degrees + extraRotationDegrees)
-    }
-
-    var body: some View {
-        GeometryReader { geometry in
-            let screenSize = geometry.size
-            let angle = effectiveRotation
-            let contentSize = Self.contentSize(
-                screenSize: screenSize,
-                rotation: angle
-            )
-
-            ZStack {
-                Color.black
-                    .ignoresSafeArea()
-
-                pickerContent
-                    .frame(
-                        width: contentSize.width,
-                        height: contentSize.height
-                    )
-                    .clipped()
-                    .contentShape(Rectangle())
-                    .rotationEffect(angle)
-                    .position(
-                        x: screenSize.width / 2,
-                        y: screenSize.height / 2
-                    )
-            }
-        }
-        .interactiveDismissDisabled(isPreparingVideo)
-        .onAppear {
-            requestPhotoLibraryAccessIfNeeded()
-        }
-        .onDisappear {
-            imageManager.stopCachingImagesForAllAssets()
-        }
-    }
-
-    private var pickerContent: some View {
-        ZStack {
-            Color.black
-                .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                headerBar
-
-                Divider()
-                    .background(Color.white.opacity(0.12))
-
-                contentArea
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 8)
-
-            if isPreparingVideo {
-                preparingOverlay
-            }
-        }
-    }
-
-    private var headerBar: some View {
-        HStack(spacing: 12) {
-            Button {
-                guard !isPreparingVideo else {
-                    return
-                }
-
-                onCancel(sessionID)
-                isPresented = false
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 13, weight: .bold))
-
-                    Text("取消")
-                        .font(.system(size: 14, weight: .semibold))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    Capsule()
-                        .fill(Color.white.opacity(0.14))
-                )
-            }
-
-            Spacer(minLength: 8)
-
-            VStack(spacing: 2) {
-                Text("影片庫")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
-
-                Text("\(assets.count) 支影片")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
-                    .lineLimit(1)
-            }
-            .frame(minWidth: 96)
-
-            Spacer(minLength: 8)
-
-            Button {
-                guard !isPreparingVideo else {
-                    return
-                }
-
-                loadVideoAssets()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
-                    .background(
-                        Circle()
-                            .fill(Color.white.opacity(0.14))
-                    )
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.top, 12 + headerDropY)
-        .padding(.bottom, 12)
-        .frame(height: 66 + headerDropY)
-    }
-
-    @ViewBuilder
-    private var contentArea: some View {
-        switch authorizationStatus {
-        case .authorized, .limited:
-            if isLoadingAssets {
-                loadingView
-            } else if assets.isEmpty {
-                emptyView
-            } else {
-                assetGrid
-            }
-
-        case .notDetermined:
-            loadingView
-
-        case .denied, .restricted:
-            permissionDeniedView
-
-        @unknown default:
-            permissionDeniedView
-        }
-    }
-
-    private var assetGrid: some View {
-        GeometryReader { proxy in
-            let horizontalPadding: CGFloat = 12
-            let availableWidth = max(
-                1,
-                proxy.size.width - horizontalPadding * 2
-            )
-
-            let minCardWidth: CGFloat = 82
-            let maxCardWidth: CGFloat = 112
-
-            let rawColumnCount = Int(
-                (availableWidth + gridSpacing) / (minCardWidth + gridSpacing)
-            )
-
-            let columnCount = max(
-                2,
-                min(rawColumnCount, 4)
-            )
-
-            let computedCardWidth = (
-                availableWidth - CGFloat(columnCount - 1) * gridSpacing
-            ) / CGFloat(columnCount)
-
-            let cardWidth = min(
-                maxCardWidth,
-                max(minCardWidth, computedCardWidth)
-            )
-
-            let columns = Array(
-                repeating: GridItem(
-                    .fixed(cardWidth),
-                    spacing: gridSpacing,
-                    alignment: .top
-                ),
-                count: columnCount
-            )
-
-            ScrollView {
-                LazyVGrid(
-                    columns: columns,
-                    alignment: .center,
-                    spacing: gridSpacing
-                ) {
-                    ForEach(assets, id: \.localIdentifier) { asset in
-                        VideoLibraryAssetCell(
-                            asset: asset,
-                            imageManager: imageManager,
-                            displayScale: displayScale,
-                            cardWidth: cardWidth
-                        ) {
-                            selectVideoAsset(asset)
-                        }
-                        .disabled(isPreparingVideo)
-                        .opacity(isPreparingVideo ? 0.55 : 1.0)
-                    }
-                }
-                .padding(.horizontal, horizontalPadding)
-                .padding(.top, 12)
-                .padding(.bottom, 28)
-                .frame(maxWidth: .infinity, alignment: .center)
-            }
-            .scrollIndicators(.visible)
-        }
-    }
-
-    private var loadingView: some View {
-        VStack(spacing: 12) {
-            ProgressView()
-                .progressViewStyle(.circular)
-                .tint(.white)
-
-            Text("讀取影片庫中...")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(.white.opacity(0.85))
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var emptyView: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "video.slash.fill")
-                .font(.system(size: 36))
-                .foregroundColor(.white.opacity(0.45))
-
-            Text("找不到影片")
-                .font(.system(size: 16, weight: .bold))
-                .foregroundColor(.white)
-
-            Text("請確認相簿中是否有可讀取的影片。")
-                .font(.system(size: 13))
-                .foregroundColor(.white.opacity(0.55))
-                .multilineTextAlignment(.center)
-        }
-        .padding(.horizontal, 32)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var permissionDeniedView: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "lock.fill")
-                .font(.system(size: 34))
-                .foregroundColor(.white.opacity(0.45))
-
-            Text("無法讀取影片庫")
-                .font(.system(size: 16, weight: .bold))
-                .foregroundColor(.white)
-
-            Text("請到設定中允許 BeyTail 讀取照片與影片。")
-                .font(.system(size: 13))
-                .foregroundColor(.white.opacity(0.6))
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-
-            Button {
-                openAppSettings()
-            } label: {
-                Text("開啟設定")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 10)
-                    .background(
-                        Capsule()
-                            .fill(Color.white)
-                    )
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var preparingOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.42)
-                .ignoresSafeArea()
-
-            VStack(spacing: 12) {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white)
-
-                Text(errorText ?? "準備影片中...")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-            }
-            .padding(20)
-            .background(
-                RoundedRectangle(cornerRadius: 14)
-                    .fill(Color.black.opacity(0.82))
-            )
-        }
-        .allowsHitTesting(true)
-    }
-
-    private func requestPhotoLibraryAccessIfNeeded() {
-        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        authorizationStatus = currentStatus
-
-        switch currentStatus {
-        case .authorized, .limited:
-            loadVideoAssets()
-
-        case .notDetermined:
-            isLoadingAssets = true
-
-            PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
-                Task { @MainActor in
-                    authorizationStatus = newStatus
-
-                    switch newStatus {
-                    case .authorized, .limited:
-                        loadVideoAssets()
-
-                    default:
-                        isLoadingAssets = false
-                    }
-                }
-            }
-
-        case .denied, .restricted:
-            isLoadingAssets = false
-
-        @unknown default:
-            isLoadingAssets = false
-        }
-    }
-
-    private func loadVideoAssets() {
-        guard authorizationStatus == .authorized ||
-              authorizationStatus == .limited else {
-            isLoadingAssets = false
-            return
-        }
-
-        isLoadingAssets = true
-        errorText = nil
-
-        let options = PHFetchOptions()
-        options.sortDescriptors = [
-            NSSortDescriptor(
-                key: "creationDate",
-                ascending: false
-            )
-        ]
-
-        let result = PHAsset.fetchAssets(
-            with: .video,
-            options: options
-        )
-
-        var fetchedAssets: [PHAsset] = []
-        fetchedAssets.reserveCapacity(result.count)
-
-        result.enumerateObjects { asset, _, _ in
-            fetchedAssets.append(asset)
-        }
-
-        assets = fetchedAssets
-        isLoadingAssets = false
-
-        imageManager.stopCachingImagesForAllAssets()
-        imageManager.startCachingImages(
-            for: fetchedAssets,
-            targetSize: CGSize(width: 180, height: 320),
-            contentMode: .aspectFill,
-            options: nil
-        )
-    }
-
-    private func selectVideoAsset(_ asset: PHAsset) {
-        guard !isPreparingVideo else {
-            return
-        }
-
-        isPreparingVideo = true
-        errorText = nil
-
-        let options = PHVideoRequestOptions()
-        options.version = .current
-        options.deliveryMode = .automatic
-        options.isNetworkAccessAllowed = true
-
-        PHImageManager.default().requestAVAsset(
-            forVideo: asset,
-            options: options
-        ) { avAsset, _, _ in
-            guard let avAsset else {
-                Task { @MainActor in
-                    isPreparingVideo = false
-                    errorText = "無法取得影片資源"
-                    onFailed(sessionID)
-                    isPresented = false
-                }
-                return
-            }
-
-            Task {
-                do {
-                    let url = try await Self.prepareTemporaryVideoURL(
-                        from: avAsset
-                    )
-
-                    await MainActor.run {
-                        onSelectionPrepared(sessionID)
-                        isPresented = false
-
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            onPicked(sessionID, url)
-                        }
-                    }
-
-                } catch {
-                    await MainActor.run {
-                        isPreparingVideo = false
-                        errorText = "影片準備失敗"
-                        onFailed(sessionID)
-                        isPresented = false
-                    }
-                }
-            }
-        }
-    }
-
-    private func openAppSettings() {
-        guard let url = URL(string: UIApplication.openSettingsURLString) else {
-            return
-        }
-
-        UIApplication.shared.open(url)
-    }
-
-    private static func prepareTemporaryVideoURL(
-        from avAsset: AVAsset
-    ) async throws -> URL {
-        if let urlAsset = avAsset as? AVURLAsset {
-            do {
-                let ext = urlAsset.url.pathExtension.isEmpty
-                    ? "mov"
-                    : urlAsset.url.pathExtension
-
-                let copyURL = makeTemporaryVideoURL(fileExtension: ext)
-
-                if FileManager.default.fileExists(atPath: copyURL.path) {
-                    try FileManager.default.removeItem(at: copyURL)
-                }
-
-                try FileManager.default.copyItem(
-                    at: urlAsset.url,
-                    to: copyURL
-                )
-
-                return copyURL
-
-            } catch {
-                return try await exportTemporaryVideoURL(from: avAsset)
-            }
-        }
-
-        return try await exportTemporaryVideoURL(from: avAsset)
-    }
-
-    private static func exportTemporaryVideoURL(
-        from avAsset: AVAsset
-    ) async throws -> URL {
-        guard let exportSession = AVAssetExportSession(
-            asset: avAsset,
-            presetName: AVAssetExportPresetHighestQuality
-        ) else {
-            throw VideoLibraryPickerError.exportSessionUnavailable
-        }
-
-        let outputFileType: AVFileType
-
-        if exportSession.supportedFileTypes.contains(.mov) {
-            outputFileType = .mov
-        } else if exportSession.supportedFileTypes.contains(.mp4) {
-            outputFileType = .mp4
-        } else if let first = exportSession.supportedFileTypes.first {
-            outputFileType = first
-        } else {
-            throw VideoLibraryPickerError.unsupportedOutputType
-        }
-
-        let fileExtension = outputFileType == .mp4 ? "mp4" : "mov"
-        let outputURL = makeTemporaryVideoURL(fileExtension: fileExtension)
-
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            try? FileManager.default.removeItem(at: outputURL)
-        }
-
-        exportSession.shouldOptimizeForNetworkUse = true
-
-        try await exportSession.export(
-            to: outputURL,
-            as: outputFileType
-        )
-
-        return outputURL
-    }
-
-    private static func makeTemporaryVideoURL(
-        fileExtension: String
-    ) -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension(fileExtension)
-    }
-
-    private static func contentSize(
-        screenSize: CGSize,
-        rotation: Angle
-    ) -> CGSize {
-        if isQuarterTurn(rotation) {
-            return CGSize(
-                width: screenSize.height,
-                height: screenSize.width
-            )
-        }
-
-        return screenSize
-    }
-
-    private static func isQuarterTurn(_ angle: Angle) -> Bool {
-        let deg = normalizedDegrees(angle.degrees)
-
-        return abs(deg - 90) < 0.5 ||
-               abs(deg - 270) < 0.5
-    }
-
-    private static func normalizedDegrees(_ degrees: Double) -> Double {
-        var value = degrees.truncatingRemainder(dividingBy: 360)
-
-        if value < 0 {
-            value += 360
-        }
-
-        return value
-    }
-}
-
-
-private enum VideoLibraryPickerError: LocalizedError {
-    case exportSessionUnavailable
-    case unsupportedOutputType
-    case exportFailed
-    case exportCancelled
-
-    var errorDescription: String? {
-        switch self {
-        case .exportSessionUnavailable:
-            return "無法建立影片匯出工作"
-
-        case .unsupportedOutputType:
-            return "不支援的影片輸出格式"
-
-        case .exportFailed:
-            return "影片匯出失敗"
-
-        case .exportCancelled:
-            return "影片匯出已取消"
-        }
-    }
-}
-
-private struct VideoLibraryAssetCell: View {
-
-    let asset: PHAsset
-    let imageManager: PHCachingImageManager
-    let displayScale: CGFloat
-    let cardWidth: CGFloat
-    let onTap: () -> Void
-
-    private let portraitAspectRatio: CGFloat = 9.0 / 16.0
-
-    private var cardHeight: CGFloat {
-        cardWidth / portraitAspectRatio
-    }
-
-    var body: some View {
-        Button {
-            onTap()
-        } label: {
-            ZStack(alignment: .bottomLeading) {
-                VideoLibraryThumbnailView(
-                    asset: asset,
-                    imageManager: imageManager,
-                    displayScale: displayScale
-                )
-                .frame(
-                    width: cardWidth,
-                    height: cardHeight
-                )
-                .clipped()
-
-                LinearGradient(
-                    colors: [
-                        .clear,
-                        .black.opacity(0.72)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(
-                    width: cardWidth,
-                    height: cardHeight
-                )
-
-                HStack(spacing: 4) {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 9, weight: .bold))
-
-                    Text(durationText(asset.duration))
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .lineLimit(1)
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule()
-                        .fill(Color.black.opacity(0.65))
-                )
-                .padding(6)
-            }
-            .frame(
-                width: cardWidth,
-                height: cardHeight
-            )
-            .clipShape(
-                RoundedRectangle(cornerRadius: 12)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .frame(
-            width: cardWidth,
-            height: cardHeight
-        )
-    }
-
-    private func durationText(_ duration: TimeInterval) -> String {
-        let totalSeconds = max(0, Int(duration.rounded()))
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
-        let seconds = totalSeconds % 60
-
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
-        }
-
-        return String(format: "%d:%02d", minutes, seconds)
-    }
-}
-
-private struct VideoLibraryThumbnailView: View {
-
-    let asset: PHAsset
-    let imageManager: PHCachingImageManager
-    let displayScale: CGFloat
-
-    @State private var image: UIImage?
-    @State private var requestID: PHImageRequestID = PHInvalidImageRequestID
-
-    var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white)
-            }
-        }
-        .clipped()
-        .onAppear {
-            requestThumbnail()
-        }
-        .onDisappear {
-            cancelThumbnailRequest()
-        }
-    }
-
-    private func requestThumbnail() {
-        guard image == nil else {
-            return
-        }
-
-        cancelThumbnailRequest()
-
-        let scale = displayScale
-
-        let targetSize = CGSize(
-            width: 180 * scale,
-            height: 320 * scale
-        )
-
-        let options = PHImageRequestOptions()
-        options.deliveryMode = .opportunistic
-        options.resizeMode = .fast
-        options.isNetworkAccessAllowed = true
-
-        requestID = imageManager.requestImage(
-            for: asset,
-            targetSize: targetSize,
-            contentMode: .aspectFill,
-            options: options
-        ) { requestedImage, _ in
-            guard let requestedImage else {
-                return
-            }
-
-            Task { @MainActor in
-                image = requestedImage
-            }
-        }
-    }
-
-    private func cancelThumbnailRequest() {
-        guard requestID != PHInvalidImageRequestID else {
-            return
-        }
-
-        imageManager.cancelImageRequest(requestID)
-        requestID = PHInvalidImageRequestID
     }
 }
 
@@ -2030,7 +1255,9 @@ final class CameraPreviewUIView: UIView {
 
     var previewLayer: AVCaptureVideoPreviewLayer {
         guard let layer = layer as? AVCaptureVideoPreviewLayer else {
-            fatalError("CameraPreviewUIView layer is not AVCaptureVideoPreviewLayer")
+            fatalError(
+                "CameraPreviewUIView layer is not AVCaptureVideoPreviewLayer"
+            )
         }
 
         return layer
@@ -2067,14 +1294,6 @@ final class CameraPreviewUIView: UIView {
 
         previewLayer.frame = bounds
         applyPreviewRotationIfNeeded(force: false)
-
-        print(
-            "[PREVIEW_LAYOUT]",
-            "bounds:", bounds.size,
-            "fixedCanvas:", true,
-            "isLandscape:", isLandscape,
-            "videoGravity:", previewLayer.videoGravity.rawValue
-        )
     }
 
     private func applyPreviewRotationIfNeeded(force: Bool) {
@@ -2089,35 +1308,15 @@ final class CameraPreviewUIView: UIView {
         }
 
         guard connection.isVideoRotationAngleSupported(previewAngle) else {
-            print(
-                "[WARN] previewLayer videoRotationAngle not supported:",
-                previewAngle
-            )
             return
         }
 
         connection.videoRotationAngle = previewAngle
         lastAppliedPreviewAngle = previewAngle
-
-        print(
-            "[PREVIEW_ROTATION]",
-            "previewAngle:", previewAngle,
-            "fixedCanvas:", true,
-            "bounds:", bounds.size,
-            "isLandscape:", isLandscape,
-            "automaticallyAdjustsVideoMirroring:", connection.automaticallyAdjustsVideoMirroring,
-            "isVideoMirrored:", connection.isVideoMirrored
-        )
     }
 
     private func fixedPreviewRotationAngle() -> CGFloat {
-        /*
-         固定順時針 90 度橫向基準。
-         對應 CameraManager:
-         videoRotationAngle = 0
-         visionImageOrientation = .down
-        */
-        return isLandscape ? 0 : 90
+        isLandscape ? 0 : 90
     }
 }
 
