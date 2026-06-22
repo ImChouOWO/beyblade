@@ -1065,6 +1065,10 @@ final class MainViewModel: ObservableObject {
             )
         }
 
+        if recordingManager.isRecording {
+            recordingManager.append(sampleBuffer: buffer)
+        }
+
         inferenceEngine.processFrame(
             buffer,
             orientation: orientation
@@ -1118,8 +1122,12 @@ final class MainViewModel: ObservableObject {
                 return
             }
 
+            let recordingOrientation = UIDevice.current.orientation
+
             print("[RECORD] call startRecording")
-            self.recordingManager.startRecording()
+            self.recordingManager.startRecording(
+                deviceOrientation: recordingOrientation
+            )
         }
     }
 
