@@ -22,45 +22,31 @@ final class RecordingManager {
 
     private var didStartSession = false
     private var pendingStopAfterStart = false
-    private var firstPresentationTime: CMTime?
-
-    private let writingQueue = DispatchQueue(
-        label: "com.beytail.recording.writer.queue",
-        qos: .userInitiated
-    )
 
     var onStarted: ((Bool) -> Void)?
     var onStopped: ((URL?) -> Void)?
 
-    // MARK: - Start
-
-    func startRecording(deviceOrientation: UIDeviceOrientation = UIDevice.current.orientation) {
+    func startRecording(deviceOrientation: UIDeviceOrientation) {
         switch state {
         case .idle:
             break
-
         case .starting:
             print("[Recording] start ignored: already starting")
             return
-
         case .recording:
             print("[Recording] start ignored: already recording")
             onStarted?(true)
             return
-
         case .stopping:
             print("[Recording] start ignored: still stopping")
             onStarted?(false)
             return
         }
 
-        print("[Recording] camera-buffer recording requested")
-
         state = .starting
         isRecording = false
         pendingStopAfterStart = false
         didStartSession = false
-        firstPresentationTime = nil
 
         let url = makeOutputURL()
         outputURL = url
@@ -118,7 +104,7 @@ final class RecordingManager {
                 return
             }
 
-            handleStartFinished(errorMessage: nil)
+            handleStartFinished(success: true)
 
         } catch {
             print("[Recording] start error:", error.localizedDescription)
@@ -128,14 +114,12 @@ final class RecordingManager {
         }
     }
 
-    private func handleStartFinished(errorMessage: String?) {
+    private func handleStartFinished(success: Bool) {
         guard state == .starting else {
-            print("[Recording] start callback ignored, current state:", state.rawValue)
             return
         }
 
-        if let errorMessage {
-            print("[Recording] start error:", errorMessage)
+        guard success else {
             resetWriterState()
             state = .idle
             isRecording = false
@@ -144,35 +128,17 @@ final class RecordingManager {
             return
         }
 
-        print("[Recording] start success")
-
         state = .recording
         isRecording = true
-
         onStarted?(true)
 
         if pendingStopAfterStart {
-            print("[Recording] pending stop detected after start")
             pendingStopAfterStart = false
             stopRecording()
         }
     }
 
-    // MARK: - Append Camera Frame
-
-    nonisolated func append(sampleBuffer: CMSampleBuffer) {
-        let copiedBuffer = sampleBuffer
-
-        Task { @MainActor [weak self, copiedBuffer] in
-            guard let self else {
-                return
-            }
-
-            self.appendOnMainActor(sampleBuffer: copiedBuffer)
-        }
-    }
-
-    private func appendOnMainActor(sampleBuffer: CMSampleBuffer) {
+    func append(sampleBuffer: CMSampleBuffer) {
         guard state == .recording,
               isRecording,
               let writer,
@@ -187,79 +153,53 @@ final class RecordingManager {
         if !didStartSession {
             writer.startSession(atSourceTime: presentationTime)
             didStartSession = true
-            firstPresentationTime = presentationTime
         }
 
         guard videoInput.isReadyForMoreMediaData else {
             return
         }
 
-        writingQueue.async { [weak videoInput, weak adaptor] in
-            guard let videoInput,
-                  let adaptor,
-                  videoInput.isReadyForMoreMediaData else {
-                return
-            }
+        let success = adaptor.append(
+            pixelBuffer,
+            withPresentationTime: presentationTime
+        )
 
-            let success = adaptor.append(
-                pixelBuffer,
-                withPresentationTime: presentationTime
-            )
-
-            if !success {
-                print("[Recording] append frame failed")
-            }
+        if !success {
+            print("[Recording] append frame failed")
         }
     }
-
-    // MARK: - Stop
 
     func stopRecording() {
         switch state {
         case .idle:
-            print("[Recording] stop requested while idle")
             isRecording = false
             onStopped?(nil)
             return
-
         case .starting:
-            print("[Recording] stop requested while starting, defer stop")
             pendingStopAfterStart = true
             return
-
         case .recording:
             break
-
         case .stopping:
-            print("[Recording] stop ignored: already stopping")
             return
         }
-
-        print("[Recording] stopRecording requested")
 
         state = .stopping
         isRecording = false
 
-        let writer = self.writer
-        let videoInput = self.videoInput
-        let url = self.outputURL
+        let url = outputURL
 
         videoInput?.markAsFinished()
 
         writer?.finishWriting { [weak self, url] in
             Task { @MainActor [weak self, url] in
-                guard let self else {
-                    return
-                }
-
-                self.handleStopFinished(outputURL: url)
+                self?.handleStopFinished(outputURL: url)
             }
         }
     }
 
     private func handleStopFinished(outputURL: URL?) {
         guard state == .stopping else {
-            print("[Recording] stop callback ignored, current state:", state.rawValue)
             return
         }
 
@@ -290,15 +230,10 @@ final class RecordingManager {
             return
         }
 
-        print("[Recording] stop success:", outputURL.path)
         onStopped?(outputURL)
     }
 
-    // MARK: - Force Reset
-
     func forceReset() {
-        print("[Recording] forceReset, state:", state.rawValue)
-
         pendingStopAfterStart = false
         isRecording = false
         state = .idle
@@ -307,8 +242,6 @@ final class RecordingManager {
         writer?.cancelWriting()
         resetWriterState()
     }
-
-    // MARK: - Save
 
     func saveToPhotoLibrary(
         url: URL,
@@ -331,16 +264,13 @@ final class RecordingManager {
                     switch newStatus {
                     case .authorized, .limited:
                         self.performSaveToPhotoLibrary(url: url, completion: completion)
-
                     default:
-                        print("[Recording] photo library permission denied")
                         completion(false)
                     }
                 }
             }
 
         default:
-            print("[Recording] photo library permission unavailable:", status.rawValue)
             completion(false)
         }
     }
@@ -352,11 +282,9 @@ final class RecordingManager {
         PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
         } completionHandler: { success, error in
-            let errorMessage = error?.localizedDescription
-
-            Task { @MainActor [success, errorMessage] in
-                if let errorMessage {
-                    print("[Recording] save error:", errorMessage)
+            Task { @MainActor [success, error] in
+                if let error {
+                    print("[Recording] save error:", error.localizedDescription)
                 }
 
                 completion(success)
@@ -364,15 +292,12 @@ final class RecordingManager {
         }
     }
 
-    // MARK: - Helpers
-
     private func resetWriterState() {
         writer = nil
         videoInput = nil
         adaptor = nil
         outputURL = nil
         didStartSession = false
-        firstPresentationTime = nil
     }
 
     private func makeOutputURL() -> URL {
@@ -387,7 +312,6 @@ final class RecordingManager {
         switch orientation {
         case .portrait, .portraitUpsideDown, .landscapeLeft, .landscapeRight:
             return orientation
-
         default:
             return .portrait
         }
@@ -397,13 +321,10 @@ final class RecordingManager {
         switch orientation {
         case .landscapeLeft:
             return CGAffineTransform(rotationAngle: .pi / 2)
-
         case .landscapeRight:
             return CGAffineTransform(rotationAngle: -.pi / 2)
-
         case .portraitUpsideDown:
             return CGAffineTransform(rotationAngle: .pi)
-
         default:
             return .identity
         }
