@@ -7,11 +7,8 @@ enum InferenceHardware: String {
     case mock = "MOCK"
 }
 
-// BEYTAIL_STOREKIT_PATCH 2026.06.23-2
-enum EffectType: String, CaseIterable, Identifiable {
+enum EffectType: String, CaseIterable {
     case lightning, fire, stardust, wave, thunder, vortex, dark
-
-    var id: String { rawValue }
 
     var emoji: String {
         switch self {
@@ -19,9 +16,9 @@ enum EffectType: String, CaseIterable, Identifiable {
         case .fire:      return "🔥"
         case .stardust:  return "✨"
         case .wave:      return "🌊"
-        case .thunder:   return "🛡️"
-        case .vortex:    return "⚔️"
-        case .dark:      return "❄️"
+        case .thunder:   return "⛏️"
+        case .vortex:    return "🌀"
+        case .dark:      return "🌑"
         }
     }
 
@@ -39,25 +36,23 @@ enum EffectType: String, CaseIterable, Identifiable {
 
     var description: String {
         switch self {
-        case .lightning:
-            return "固定黃色 #FFDD22 尾跡，400ms"
-        case .fire:
-            return "固定紅色 #FF2A12 尾跡，600ms"
-        case .stardust:
-            return "抓取陀螺主色尾跡，280ms"
-        case .wave:
-            return "水感尾跡、水珠粒子與漣漪效果，800ms"
-        case .thunder:
-            return "力場尾跡、噴射火花與旋轉六角裝甲，450ms"
-        case .vortex:
-            return "刀刃尾跡、金屬火花與劍氣效果，280ms"
-        case .dark:
-            return "冰裂尾跡與碎冰拋射效果，800ms"
+        case .lightning: return "電流閃動軌跡"
+        case .fire:      return "炙熱火焰軌跡"
+        case .stardust:  return "晶瑩散射軌跡"
+        case .wave:      return "水波流動軌跡"
+        case .thunder:   return "防禦幾何能量盾"
+        case .vortex:    return "斬擊刀光軌跡"
+        case .dark:      return "冰封碎裂軌跡"
         }
     }
 
     var price: Int {
-        isDefaultOwned ? 0 : 30
+        switch self {
+        case .lightning, .fire, .stardust:
+            return 0
+        case .wave, .thunder, .vortex, .dark:
+            return 30
+        }
     }
 
     var isDefaultOwned: Bool {
@@ -67,38 +62,6 @@ enum EffectType: String, CaseIterable, Identifiable {
         case .wave, .thunder, .vortex, .dark:
             return false
         }
-    }
-
-    var requiresPurchase: Bool {
-        !isDefaultOwned
-    }
-
-    /// 相容舊程式碼；此屬性只代表「此特效是付費商品」，
-    /// 實際是否已購買請使用 EffectPurchaseStore.isPurchased(_:)。
-    var isLocked: Bool {
-        requiresPurchase
-    }
-
-    var productID: String? {
-        switch self {
-        case .lightning, .fire, .stardust:
-            return nil
-        case .wave:
-            return "chou.beyblade.effect.wave"
-        case .thunder:
-            return "chou.beyblade.effect.steel_shield"
-        case .vortex:
-            return "chou.beyblade.effect.blade_dance"
-        case .dark:
-            return "chou.beyblade.effect.ice_break"
-        }
-    }
-
-    static let premiumPackProductID = "chou.beyblade.effects.premium_pack"
-
-    static var allProductIDs: Set<String> {
-        Set(shopEffects.compactMap(\.productID))
-            .union([premiumPackProductID])
     }
 
     static var defaultOwnedEffects: [EffectType] {
@@ -119,13 +82,13 @@ enum EffectType: String, CaseIterable, Identifiable {
 
     var colorOverride: UIColor? {
         switch self {
-        case .lightning: return UIColor(hex: 0xFFDD22)
-        case .fire:      return UIColor(hex: 0xFF2A12)
+        case .lightning: return UIColor(hex: 0x00F5FF)
+        case .fire:      return UIColor(hex: 0xFF6B35)
         case .stardust:  return nil
         case .wave:      return UIColor(hex: 0x0088FF)
-        case .thunder:   return UIColor(hex: 0xFFD34E)
-        case .vortex:    return UIColor(hex: 0xD8D8D8)
-        case .dark:      return UIColor(hex: 0x9DEBFF)
+        case .thunder:   return UIColor(hex: 0xFFCC00)
+        case .vortex:    return UIColor(hex: 0xBF5FFF)
+        case .dark:      return UIColor(hex: 0x440066)
         }
     }
 
@@ -159,10 +122,14 @@ enum EffectType: String, CaseIterable, Identifiable {
         case .fire:      return 600
         case .stardust:  return 280
         case .wave:      return 800
-        case .thunder:   return 450
-        case .vortex:    return 280
-        case .dark:      return 800
+        case .thunder:   return 360
+        case .vortex:    return 900
+        case .dark:      return 1000
         }
+    }
+
+    var isLocked: Bool {
+        !isDefaultOwned
     }
 }
 

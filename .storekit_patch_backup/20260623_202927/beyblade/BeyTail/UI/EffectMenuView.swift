@@ -14,8 +14,6 @@ struct EffectMenuView: View {
     @Binding var selectedEffect: EffectType
     @Binding var isVisible: Bool
 
-    @ObservedObject private var purchaseStore = EffectPurchaseStore.shared
-
     /// ContentView 傳入的全螢幕 global 手指位置。
     var dragLocation: CGPoint? = nil
 
@@ -39,23 +37,17 @@ struct EffectMenuView: View {
             .split(separator: ",")
             .map(String.init)
 
-        let configuredEffects: [EffectType]
-
         if ids.isEmpty {
-            configuredEffects = EffectType.defaultMenuEffects
-        } else {
-            configuredEffects = EffectType.allCases.filter {
-                ids.contains($0.rawValue)
-            }
+            return EffectType.defaultMenuEffects
         }
 
-        let allowedEffects = configuredEffects.filter {
-            purchaseStore.isPurchased($0)
+        let effects = EffectType.allCases.filter {
+            ids.contains($0.rawValue)
         }
 
-        return allowedEffects.isEmpty
+        return effects.isEmpty
             ? EffectType.defaultMenuEffects
-            : allowedEffects
+            : effects
     }
 
     /// 實際由上到下顯示的特效順序。
@@ -166,9 +158,6 @@ struct EffectMenuView: View {
                 )
             }
             .onChange(of: effectMenuIDsRaw) { _, _ in
-                removeInvalidSelectionIfNeeded()
-            }
-            .onChange(of: purchaseStore.purchasedProductIDs) { _, _ in
                 removeInvalidSelectionIfNeeded()
             }
             .onAppear {

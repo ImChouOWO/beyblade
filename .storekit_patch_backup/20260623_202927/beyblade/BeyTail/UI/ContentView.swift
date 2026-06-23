@@ -850,7 +850,6 @@ private struct EffectButtonFramePreferenceKey: PreferenceKey {
 
 // MARK: - Effect Library Page
 
-// BEYTAIL_STOREKIT_PATCH 2026.06.23-2
 private struct EffectLibraryPage: View {
 
     @Binding var selectedEffect: EffectType
@@ -858,13 +857,11 @@ private struct EffectLibraryPage: View {
 
     let rotation: Angle
 
-    @ObservedObject private var purchaseStore = EffectPurchaseStore.shared
+    @AppStorage("ownedEffectIDs")
+    private var ownedEffectIDsRaw: String = ""
 
     @AppStorage("effectMenuIDs")
     private var effectMenuIDsRaw: String = ""
-
-    @State private var trialEffect: EffectType?
-    @State private var alertMessage: String?
 
     private let columns = [
         GridItem(.flexible(), spacing: 12),
@@ -872,15 +869,11 @@ private struct EffectLibraryPage: View {
     ]
 
     private var ownedEffects: [EffectType] {
-        EffectType.allCases.filter { purchaseStore.isPurchased($0) }
+        EffectType.allCases.filter { isOwned($0) }
     }
 
     private var shopEffects: [EffectType] {
-        EffectType.shopEffects.filter { !purchaseStore.isPurchased($0) }
-    }
-
-    private var ownsAllPaidEffects: Bool {
-        EffectType.shopEffects.allSatisfy { purchaseStore.isPurchased($0) }
+        EffectType.shopEffects.filter { !isOwned($0) }
     }
 
     var body: some View {
@@ -909,49 +902,8 @@ private struct EffectLibraryPage: View {
                     )
             }
         }
-        .task {
-            initializeDefaultMenuIfNeeded()
-            await purchaseStore.loadProductsAndEntitlements()
-            removeUnownedEffectsFromMenu()
-        }
-        .onChange(of: purchaseStore.purchasedProductIDs) { _, _ in
-            removeUnownedEffectsFromMenu()
-        }
-        .fullScreenCover(
-            isPresented: Binding(
-                get: { trialEffect != nil },
-                set: { presented in
-                    if !presented {
-                        trialEffect = nil
-                    }
-                }
-            )
-        ) {
-            if let trialEffect {
-                VideoRenderPage(
-                    initialEffect: trialEffect,
-                    trialEffect: trialEffect,
-                    onClose: {
-                        self.trialEffect = nil
-                    }
-                )
-                .ignoresSafeArea()
-                .preferredColorScheme(.dark)
-                .statusBarHidden(true)
-            }
-        }
-        .alert(
-            "特效商店",
-            isPresented: Binding(
-                get: { alertMessage != nil },
-                set: { presented in
-                    if !presented { alertMessage = nil }
-                }
-            )
-        ) {
-            Button("確定", role: .cancel) {}
-        } message: {
-            Text(alertMessage ?? "")
+        .onAppear {
+            initializeDefaultStorageIfNeeded()
         }
     }
 
@@ -975,13 +927,8 @@ private struct EffectLibraryPage: View {
                                     effect: effect,
                                     isOwned: false,
                                     isInMenu: false,
-                                    displayPrice: purchaseStore.displayPrice(for: effect),
-                                    isBusy: purchaseStore.purchasingProductID == effect.productID,
-                                    onPrimary: {
-                                        purchase(effect)
-                                    },
-                                    onTrial: {
-                                        trialEffect = effect
+                                    onTap: {
+                                        buyEffect(effect)
                                     }
                                 )
                             }
@@ -996,12 +943,9 @@ private struct EffectLibraryPage: View {
                                 effect: effect,
                                 isOwned: true,
                                 isInMenu: isInMenu(effect),
-                                displayPrice: effect.isDefaultOwned ? "免費" : "已購買",
-                                isBusy: false,
-                                onPrimary: {
+                                onTap: {
                                     toggleMenuEffect(effect)
-                                },
-                                onTrial: nil
+                                }
                             )
                         }
                     }
@@ -1030,7 +974,8 @@ private struct EffectLibraryPage: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
                 .background(
-                    Capsule().fill(Color.white.opacity(0.14))
+                    Capsule()
+                        .fill(Color.white.opacity(0.14))
                 )
             }
 
@@ -1042,29 +987,8 @@ private struct EffectLibraryPage: View {
 
             Spacer()
 
-            Button {
-                restorePurchases()
-            } label: {
-                HStack(spacing: 5) {
-                    if purchaseStore.isRestoring {
-                        ProgressView()
-                            .tint(.white)
-                            .scaleEffect(0.75)
-                    } else {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 12, weight: .bold))
-                    }
-
-                    Text("恢復")
-                        .font(.system(size: 12, weight: .semibold))
-                }
-                .foregroundColor(.white)
-                .frame(width: 82, height: 36)
-                .background(
-                    Capsule().fill(Color.white.opacity(0.14))
-                )
-            }
-            .disabled(purchaseStore.isRestoring)
+            Color.clear
+                .frame(width: 104, height: 1)
         }
         .padding(.horizontal, 16)
         .padding(.top, 18)
@@ -1087,49 +1011,51 @@ private struct EffectLibraryPage: View {
                         .foregroundColor(.white.opacity(0.55))
                         .lineLimit(2)
 
-                    Text(
-                        ownsAllPaidEffects
-                            ? "已擁有全部特效"
-                            : purchaseStore.premiumPackDisplayPrice
-                    )
-                    .font(.system(size: 20, weight: .black))
-                    .foregroundColor(Color(hex: 0x00F5FF))
+                    HStack(spacing: 8) {
+                        Text("原價 NT$120")
+                            .font(.system(size: 12))
+                            .strikethrough()
+                            .foregroundColor(.white.opacity(0.38))
+
+                        Text("NT$100")
+                            .font(.system(size: 20, weight: .black))
+                            .foregroundColor(Color(hex: 0x00F5FF))
+                    }
                 }
 
                 Spacer()
             }
 
             Button {
-                purchaseLimitedPack()
+                buyLimitedPack()
             } label: {
-                HStack(spacing: 8) {
-                    if purchaseStore.purchasingProductID == EffectType.premiumPackProductID {
-                        ProgressView().tint(.white)
-                    }
-
-                    Text(ownsAllPaidEffects ? "已擁有" : "購買限定特效包")
-                        .font(.system(size: 15, weight: .bold))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(
-                    LinearGradient(
-                        colors: [
-                            Color(hex: 0xBF5FFF),
-                            Color(hex: 0x00F5FF)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
+                Text("立即購買  省 NT$20")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                Color(hex: 0xBF5FFF),
+                                Color(hex: 0x00F5FF)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
                     )
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .disabled(
-                ownsAllPaidEffects ||
-                purchaseStore.purchasingProductID != nil
+                EffectType.shopEffects
+                    .allSatisfy { isOwned($0) }
             )
-            .opacity(ownsAllPaidEffects ? 0.45 : 1.0)
+            .opacity(
+                EffectType.shopEffects
+                    .allSatisfy { isOwned($0) }
+                    ? 0.45
+                    : 1.0
+            )
         }
         .padding(18)
         .background(
@@ -1151,16 +1077,26 @@ private struct EffectLibraryPage: View {
             .foregroundColor(.white.opacity(0.55))
     }
 
-    private func initializeDefaultMenuIfNeeded() {
-        guard effectMenuIDsRaw.isEmpty else { return }
+    private func initializeDefaultStorageIfNeeded() {
+        if ownedEffectIDsRaw.isEmpty {
+            ownedEffectIDsRaw = EffectType.defaultOwnedEffects
+                .map(\.rawValue)
+                .joined(separator: ",")
+        }
 
-        effectMenuIDsRaw = EffectType.defaultMenuEffects
-            .map(\.rawValue)
-            .joined(separator: ",")
+        if effectMenuIDsRaw.isEmpty {
+            effectMenuIDsRaw = EffectType.defaultMenuEffects
+                .map(\.rawValue)
+                .joined(separator: ",")
+        }
     }
 
     private func ids(from raw: String) -> Set<String> {
-        Set(raw.split(separator: ",").map(String.init))
+        Set(
+            raw
+                .split(separator: ",")
+                .map(String.init)
+        )
     }
 
     private func raw(from ids: Set<String>) -> String {
@@ -1170,12 +1106,40 @@ private struct EffectLibraryPage: View {
             .joined(separator: ",")
     }
 
+    private func isOwned(_ effect: EffectType) -> Bool {
+        if effect.isDefaultOwned {
+            return true
+        }
+
+        return ids(from: ownedEffectIDsRaw)
+            .contains(effect.rawValue)
+    }
+
     private func isInMenu(_ effect: EffectType) -> Bool {
-        ids(from: effectMenuIDsRaw).contains(effect.rawValue)
+        ids(from: effectMenuIDsRaw)
+            .contains(effect.rawValue)
+    }
+
+    private func buyEffect(_ effect: EffectType) {
+        var ownedIDs = ids(from: ownedEffectIDsRaw)
+        ownedIDs.insert(effect.rawValue)
+        ownedEffectIDsRaw = raw(from: ownedIDs)
+    }
+
+    private func buyLimitedPack() {
+        var ownedIDs = ids(from: ownedEffectIDsRaw)
+
+        for effect in EffectType.shopEffects {
+            ownedIDs.insert(effect.rawValue)
+        }
+
+        ownedEffectIDsRaw = raw(from: ownedIDs)
     }
 
     private func toggleMenuEffect(_ effect: EffectType) {
-        guard purchaseStore.isPurchased(effect) else { return }
+        guard isOwned(effect) else {
+            return
+        }
 
         var menuIDs = ids(from: effectMenuIDsRaw)
 
@@ -1183,7 +1147,8 @@ private struct EffectLibraryPage: View {
             menuIDs.remove(effect.rawValue)
 
             if selectedEffect == effect {
-                selectedEffect = EffectType.defaultMenuEffects.first ?? .lightning
+                selectedEffect = EffectType.defaultMenuEffects.first
+                    ?? .lightning
             }
         } else {
             menuIDs.insert(effect.rawValue)
@@ -1191,48 +1156,6 @@ private struct EffectLibraryPage: View {
         }
 
         effectMenuIDsRaw = raw(from: menuIDs)
-    }
-
-    private func removeUnownedEffectsFromMenu() {
-        let filtered = ids(from: effectMenuIDsRaw).filter { rawID in
-            guard let effect = EffectType(rawValue: rawID) else { return false }
-            return purchaseStore.isPurchased(effect)
-        }
-
-        effectMenuIDsRaw = raw(from: Set(filtered))
-
-        if !purchaseStore.isPurchased(selectedEffect) {
-            selectedEffect = .lightning
-        }
-    }
-
-    private func purchase(_ effect: EffectType) {
-        Task {
-            _ = await purchaseStore.purchase(effect)
-            if let message = purchaseStore.lastErrorMessage {
-                alertMessage = message
-            }
-        }
-    }
-
-    private func purchaseLimitedPack() {
-        Task {
-            _ = await purchaseStore.purchasePremiumPack()
-            if let message = purchaseStore.lastErrorMessage {
-                alertMessage = message
-            }
-        }
-    }
-
-    private func restorePurchases() {
-        Task {
-            let restored = await purchaseStore.restorePurchases()
-            if restored {
-                alertMessage = "購買紀錄已恢復"
-            } else if let message = purchaseStore.lastErrorMessage {
-                alertMessage = message
-            }
-        }
     }
 
     private static func contentSize(
@@ -1251,12 +1174,18 @@ private struct EffectLibraryPage: View {
 
     private static func isQuarterTurn(_ angle: Angle) -> Bool {
         let degrees = normalizedDegrees(angle.degrees)
-        return abs(degrees - 90) < 0.5 || abs(degrees - 270) < 0.5
+
+        return abs(degrees - 90) < 0.5 ||
+            abs(degrees - 270) < 0.5
     }
 
     private static func normalizedDegrees(_ degrees: Double) -> Double {
         var value = degrees.truncatingRemainder(dividingBy: 360)
-        if value < 0 { value += 360 }
+
+        if value < 0 {
+            value += 360
+        }
+
         return value
     }
 }
@@ -1266,23 +1195,15 @@ private struct EffectShopCard: View {
     let effect: EffectType
     let isOwned: Bool
     let isInMenu: Bool
-    let displayPrice: String
-    let isBusy: Bool
-    let onPrimary: () -> Void
-    let onTrial: (() -> Void)?
+    let onTap: () -> Void
 
     var body: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text(effect.emoji)
-                    .font(.system(size: 34))
+        VStack(spacing: 12) {
+            Text(effect.emoji)
+                .font(.system(size: 34))
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer()
-
-                Text(isOwned ? displayPrice : "付費")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundColor(.white.opacity(0.62))
-            }
+            Spacer(minLength: 4)
 
             Text(effect.displayName)
                 .font(.system(size: 17, weight: .black))
@@ -1290,73 +1211,53 @@ private struct EffectShopCard: View {
                 .multilineTextAlignment(.center)
 
             Text(effect.description)
-                .font(.system(size: 10))
+                .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.5))
                 .multilineTextAlignment(.center)
-                .lineLimit(3)
-                .frame(minHeight: 38)
+                .lineLimit(2)
 
-            Spacer(minLength: 2)
-
-            Button(action: onPrimary) {
-                HStack(spacing: 6) {
-                    if isBusy {
-                        ProgressView()
-                            .tint(.white)
-                            .scaleEffect(0.75)
-                    }
-
-                    Text(primaryTitle)
-                        .font(.system(size: 12, weight: .bold))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 9)
-                .background(primaryBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-            }
-            .disabled(isBusy)
-
-            if let onTrial, !isOwned {
-                Button(action: onTrial) {
-                    Text("試用 10 秒")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundColor(Color(hex: 0x00F5FF))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(Color.white.opacity(0.065))
-                        .clipShape(RoundedRectangle(cornerRadius: 9))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 9)
-                                .stroke(Color(hex: 0x00F5FF).opacity(0.35), lineWidth: 1)
-                        )
-                }
+            Button(action: onTap) {
+                Text(buttonTitle)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(buttonBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
             }
         }
         .padding(14)
-        .frame(height: isOwned ? 226 : 262)
+        .frame(height: 210)
         .background(
             RoundedRectangle(cornerRadius: 18)
                 .fill(Color.white.opacity(0.065))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                        .stroke(
+                            Color.white.opacity(0.08),
+                            lineWidth: 1
+                        )
                 )
         )
     }
 
-    private var primaryTitle: String {
+    private var buttonTitle: String {
         if !isOwned {
-            return displayPrice
+            return "NT$\(effect.price)"
         }
 
-        return isInMenu ? "從選單移除" : "加入選單"
+        return isInMenu
+            ? "從選單移除"
+            : "加入選單"
     }
 
-    private var primaryBackground: LinearGradient {
+    private var buttonBackground: LinearGradient {
         if !isOwned {
             return LinearGradient(
-                colors: [Color(hex: 0xBF5FFF), Color(hex: 0x00F5FF)],
+                colors: [
+                    Color(hex: 0xBF5FFF),
+                    Color(hex: 0x00F5FF)
+                ],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -1364,7 +1265,10 @@ private struct EffectShopCard: View {
 
         if isInMenu {
             return LinearGradient(
-                colors: [Color.red.opacity(0.55), Color.red.opacity(0.35)],
+                colors: [
+                    Color.red.opacity(0.55),
+                    Color.red.opacity(0.35)
+                ],
                 startPoint: .leading,
                 endPoint: .trailing
             )

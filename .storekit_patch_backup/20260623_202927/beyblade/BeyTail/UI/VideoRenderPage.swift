@@ -42,14 +42,9 @@ private struct PickedVideoFile: Transferable, Sendable {
 ///
 /// 流程：原生 PhotosPicker 選片 → 選擇特效 → 完整離線渲染
 /// → 預覽 → 重新選擇／下載／分享。
-// BEYTAIL_STOREKIT_PATCH 2026.06.23-2
 struct VideoRenderPage: View {
 
     let onClose: () -> Void
-
-    @ObservedObject private var purchaseStore = EffectPurchaseStore.shared
-
-    private let forcedTrialEffect: EffectType?
 
     @State private var pickerItem: PhotosPickerItem?
     @State private var inputURL: URL?
@@ -63,7 +58,6 @@ struct VideoRenderPage: View {
     @State private var progress = 0.0
 
     @State private var resultURL: URL?
-    @State private var trialInputURL: URL?
     @State private var player: AVPlayer?
 
     @State private var isSaving = false
@@ -72,40 +66,22 @@ struct VideoRenderPage: View {
 
     init(
         initialEffect: EffectType,
-        trialEffect: EffectType? = nil,
         onClose: @escaping () -> Void
     ) {
         self.onClose = onClose
-        self.forcedTrialEffect = trialEffect
-        _selectedEffect = State(initialValue: trialEffect ?? initialEffect)
-    }
 
-    private var isTrialMode: Bool {
-        guard forcedTrialEffect != nil else { return false }
-        return !purchaseStore.isPurchased(selectedEffect)
-    }
-
-    private var canUseSelectedEffect: Bool {
-        purchaseStore.isPurchased(selectedEffect) || isTrialMode
-    }
-
-    private var selectorEffects: [EffectType] {
-        if let forcedTrialEffect {
-            return [forcedTrialEffect]
-        }
-
-        return EffectType.allCases
+        _selectedEffect = State(
+            initialValue: initialEffect.isLocked
+                ? .lightning
+                : initialEffect
+        )
     }
 
     private var canStartProcessing: Bool {
         inputURL != nil &&
-        canUseSelectedEffect &&
+        !selectedEffect.isLocked &&
         !isLoadingVideo &&
         !isProcessing
-    }
-
-    private var canExportResult: Bool {
-        !isTrialMode
     }
 
     var body: some View {
@@ -132,16 +108,10 @@ struct VideoRenderPage: View {
         }
         .preferredColorScheme(.dark)
         .statusBarHidden(false)
-        .task {
-            await purchaseStore.loadProductsAndEntitlements()
-
-            if forcedTrialEffect == nil,
-               !purchaseStore.isPurchased(selectedEffect) {
-                selectedEffect = .lightning
-            }
-        }
         .onChange(of: pickerItem) { _, newItem in
-            guard let newItem else { return }
+            guard let newItem else {
+                return
+            }
 
             Task {
                 await loadVideo(newItem)
@@ -166,7 +136,7 @@ struct VideoRenderPage: View {
             player?.pause()
         }
         .sheet(isPresented: $showShareSheet) {
-            if let resultURL, canExportResult {
+            if let resultURL {
                 VideoRenderShareSheet(items: [resultURL])
             }
         }
@@ -175,7 +145,9 @@ struct VideoRenderPage: View {
             isPresented: Binding(
                 get: { alertMessage != nil },
                 set: { presented in
-                    if !presented { alertMessage = nil }
+                    if !presented {
+                        alertMessage = nil
+                    }
                 }
             )
         ) {
@@ -201,19 +173,15 @@ struct VideoRenderPage: View {
             .opacity(isProcessing ? 0.45 : 1)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(isTrialMode ? "特效試用" : "影片特效")
+                Text("影片特效")
                     .font(.system(size: 22, weight: .bold))
                     .foregroundColor(.white)
 
-                Text(
-                    isTrialMode
-                        ? "僅限相簿影片前 10 秒，不提供下載與分享"
-                        : "為相簿中的影片加上軌跡特效"
-                )
-                .font(.system(size: 12))
-                .foregroundColor(.white.opacity(0.45))
+                Text("為相簿中的影片加上軌跡特效")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.45))
             }
-
+            
             Spacer()
         }
         .padding(.top, 25)
@@ -221,10 +189,6 @@ struct VideoRenderPage: View {
 
     private var selectionContent: some View {
         VStack(alignment: .leading, spacing: 22) {
-            if isTrialMode {
-                trialNotice
-            }
-
             PhotosPicker(
                 selection: $pickerItem,
                 matching: .videos,
@@ -254,7 +218,8 @@ struct VideoRenderPage: View {
                     Spacer()
 
                     if isLoadingVideo {
-                        ProgressView().tint(.cyan)
+                        ProgressView()
+                            .tint(.cyan)
                     } else {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 13, weight: .semibold))
@@ -275,37 +240,13 @@ struct VideoRenderPage: View {
             .disabled(isLoadingVideo || isProcessing)
 
             effectSelector
+
             startButton
 
             if isProcessing {
                 processingCard
             }
         }
-    }
-
-    private var trialNotice: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "clock.badge.exclamationmark.fill")
-                .foregroundColor(.yellow)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("10 秒試用模式")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.white)
-
-                Text("輸出只保留影片前 10 秒；試用結果不能儲存到相簿，也不能分享。")
-                    .font(.system(size: 11))
-                    .foregroundColor(.white.opacity(0.55))
-            }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.yellow.opacity(0.09))
-        .clipShape(RoundedRectangle(cornerRadius: 13))
-        .overlay(
-            RoundedRectangle(cornerRadius: 13)
-                .stroke(Color.yellow.opacity(0.25), lineWidth: 1)
-        )
     }
 
     private var effectSelector: some View {
@@ -316,7 +257,7 @@ struct VideoRenderPage: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 9) {
-                    ForEach(selectorEffects, id: \.self) { effect in
+                    ForEach(EffectType.allCases, id: \.self) { effect in
                         effectChip(effect)
                     }
                 }
@@ -327,16 +268,9 @@ struct VideoRenderPage: View {
 
     private func effectChip(_ effect: EffectType) -> some View {
         let selected = selectedEffect == effect
-        let owned = purchaseStore.isPurchased(effect)
-        let trialAllowed = forcedTrialEffect == effect
-        let enabled = (owned || trialAllowed) && !isProcessing
+        let enabled = !effect.isLocked && !isProcessing
 
         return Button {
-            guard enabled else {
-                alertMessage = "請先到特效商店購買，或從商店使用 10 秒試用"
-                return
-            }
-
             selectedEffect = effect
         } label: {
             HStack(spacing: 6) {
@@ -346,16 +280,16 @@ struct VideoRenderPage: View {
                 Text(effect.displayName)
                     .font(.system(size: 13, weight: .medium))
 
-                if trialAllowed && !owned {
-                    Text("試用")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.yellow)
-                } else if !owned {
+                if effect.isLocked {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 9, weight: .bold))
                 }
             }
-            .foregroundColor(enabled ? .white : .white.opacity(0.28))
+            .foregroundColor(
+                effect.isLocked
+                    ? .white.opacity(0.28)
+                    : .white
+            )
             .padding(.horizontal, 13)
             .frame(height: 40)
             .background(
@@ -386,15 +320,12 @@ struct VideoRenderPage: View {
         } label: {
             HStack(spacing: 8) {
                 if isProcessing {
-                    ProgressView().tint(.white)
+                    ProgressView()
+                        .tint(.white)
                 }
 
-                Text(
-                    isProcessing
-                        ? "處理中"
-                        : (isTrialMode ? "開始試用（10 秒）" : "開始處理")
-                )
-                .font(.system(size: 16, weight: .bold))
+                Text(isProcessing ? "處理中" : "開始處理")
+                    .font(.system(size: 16, weight: .bold))
             }
             .foregroundColor(.white)
             .frame(maxWidth: .infinity, minHeight: 52)
@@ -419,7 +350,7 @@ struct VideoRenderPage: View {
     private var processingCard: some View {
         VStack(spacing: 12) {
             HStack {
-                Text(isTrialMode ? "正在渲染 10 秒試用" : "正在完整渲染影片")
+                Text("正在完整渲染影片")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(.white)
 
@@ -449,7 +380,7 @@ struct VideoRenderPage: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(isTrialMode ? "試用完成" : "處理完成")
+                    Text("處理完成")
                         .font(.system(size: 18, weight: .bold))
                         .foregroundColor(.white)
 
@@ -465,10 +396,6 @@ struct VideoRenderPage: View {
                     .foregroundColor(.green)
             }
 
-            if isTrialMode {
-                trialNotice
-            }
-
             if let player {
                 VideoPlayer(player: player)
                     .frame(maxWidth: .infinity)
@@ -479,7 +406,9 @@ struct VideoRenderPage: View {
                         RoundedRectangle(cornerRadius: 16)
                             .stroke(Color.white.opacity(0.12), lineWidth: 1)
                     }
-                    .onAppear { player.play() }
+                    .onAppear {
+                        player.play()
+                    }
             }
 
             HStack(spacing: 10) {
@@ -492,21 +421,19 @@ struct VideoRenderPage: View {
                 }
 
                 resultButton(
-                    title: isTrialMode ? "試用不可下載" : (isSaving ? "儲存中" : "下載"),
+                    title: isSaving ? "儲存中" : "下載",
                     systemImage: "square.and.arrow.down",
                     tint: .cyan,
-                    enabled: !isSaving && canExportResult
+                    enabled: !isSaving
                 ) {
                     saveToPhotoLibrary()
                 }
 
                 resultButton(
-                    title: isTrialMode ? "試用不可分享" : "分享",
+                    title: "分享",
                     systemImage: "square.and.arrow.up",
-                    tint: .purple,
-                    enabled: canExportResult
+                    tint: .purple
                 ) {
-                    guard canExportResult else { return }
                     showShareSheet = true
                 }
             }
@@ -526,12 +453,10 @@ struct VideoRenderPage: View {
                     .font(.system(size: 18, weight: .semibold))
 
                 Text(title)
-                    .font(.system(size: 10, weight: .semibold))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
+                    .font(.system(size: 11, weight: .semibold))
             }
             .foregroundColor(enabled ? tint : .gray)
-            .frame(maxWidth: .infinity, minHeight: 64)
+            .frame(maxWidth: .infinity, minHeight: 60)
             .background(Color.white.opacity(enabled ? 0.08 : 0.035))
             .clipShape(RoundedRectangle(cornerRadius: 13))
         }
@@ -544,7 +469,9 @@ struct VideoRenderPage: View {
         isLoadingVideo = true
         alertMessage = nil
 
-        defer { isLoadingVideo = false }
+        defer {
+            isLoadingVideo = false
+        }
 
         do {
             guard let pickedVideo = try await item.loadTransferable(
@@ -553,19 +480,18 @@ struct VideoRenderPage: View {
                 throw makeError("無法讀取選取的影片")
             }
 
-            removeFileIfNeeded(inputURL)
-            removeFileIfNeeded(trialInputURL)
-            trialInputURL = nil
+            if let oldInputURL {
+                try? FileManager.default.removeItem(at: oldInputURL)
+            }
 
             let asset = AVURLAsset(url: pickedVideo.url)
             let duration = try await asset.load(.duration).seconds
 
             inputURL = pickedVideo.url
             videoInfo = String(
-                format: "已選擇影片 ・ %d:%02d%@",
+                format: "已選擇影片 ・ %d:%02d",
                 Int(duration) / 60,
-                Int(duration) % 60,
-                isTrialMode && duration > 10 ? "（取前 10 秒）" : ""
+                Int(duration) % 60
             )
         } catch {
             pickerItem = nil
@@ -575,86 +501,24 @@ struct VideoRenderPage: View {
         }
     }
 
+    private var oldInputURL: URL? {
+        inputURL
+    }
+
     private func startProcessing() {
-        guard let inputURL, canStartProcessing else { return }
+        guard let inputURL,
+              canStartProcessing else {
+            return
+        }
 
         player?.pause()
         player = nil
-        removeFileIfNeeded(resultURL)
         resultURL = nil
         progress = 0
         isProcessing = true
         cancelRequested = false
         alertMessage = nil
 
-        Task { @MainActor in
-            do {
-                let renderInputURL = try await prepareRenderInputURL(inputURL)
-                beginRendering(inputURL: renderInputURL)
-            } catch {
-                isProcessing = false
-                progress = 0
-                alertMessage = error.localizedDescription
-            }
-        }
-    }
-
-    @MainActor
-    private func prepareRenderInputURL(_ originalURL: URL) async throws -> URL {
-        guard isTrialMode else { return originalURL }
-
-        removeFileIfNeeded(trialInputURL)
-        trialInputURL = nil
-
-        let asset = AVURLAsset(url: originalURL)
-        let duration = try await asset.load(.duration).seconds
-
-        guard duration > 10 else {
-            return originalURL
-        }
-
-        guard let exportSession = AVAssetExportSession(
-            asset: asset,
-            presetName: AVAssetExportPresetHighestQuality
-        ) else {
-            throw makeError("無法建立 10 秒試用影片")
-        }
-
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("beytail_trial_\(UUID().uuidString).mov")
-
-        try? FileManager.default.removeItem(at: outputURL)
-
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = exportSession.supportedFileTypes.contains(.mov)
-            ? .mov
-            : exportSession.supportedFileTypes.first
-        exportSession.shouldOptimizeForNetworkUse = false
-        exportSession.timeRange = CMTimeRange(
-            start: .zero,
-            duration: CMTime(seconds: 10, preferredTimescale: 600)
-        )
-
-        await withCheckedContinuation { continuation in
-            exportSession.exportAsynchronously {
-                continuation.resume()
-            }
-        }
-
-        switch exportSession.status {
-        case .completed:
-            trialInputURL = outputURL
-            return outputURL
-
-        case .cancelled:
-            throw makeError("已取消建立試用影片")
-
-        default:
-            throw exportSession.error ?? makeError("建立 10 秒試用影片失敗")
-        }
-    }
-
-    private func beginRendering(inputURL: URL) {
         let processor = VideoRenderProcessor()
         self.processor = processor
 
@@ -693,13 +557,16 @@ struct VideoRenderPage: View {
         player?.pause()
         player = nil
 
-        removeFileIfNeeded(resultURL)
-        removeFileIfNeeded(inputURL)
-        removeFileIfNeeded(trialInputURL)
+        if let resultURL {
+            try? FileManager.default.removeItem(at: resultURL)
+        }
+
+        if let inputURL {
+            try? FileManager.default.removeItem(at: inputURL)
+        }
 
         resultURL = nil
         inputURL = nil
-        trialInputURL = nil
         pickerItem = nil
         videoInfo = "點擊選擇影片"
         progress = 0
@@ -707,12 +574,10 @@ struct VideoRenderPage: View {
     }
 
     private func saveToPhotoLibrary() {
-        guard canExportResult else {
-            alertMessage = "試用影片不能下載"
+        guard let resultURL,
+              !isSaving else {
             return
         }
-
-        guard let resultURL, !isSaving else { return }
 
         isSaving = true
 
@@ -724,9 +589,13 @@ struct VideoRenderPage: View {
             } completionHandler: { success, error in
                 Task { @MainActor in
                     isSaving = false
-                    alertMessage = success
-                        ? "影片已儲存到相簿"
-                        : (error?.localizedDescription ?? "影片儲存失敗")
+
+                    if success {
+                        alertMessage = "影片已儲存到相簿"
+                    } else {
+                        alertMessage = error?.localizedDescription
+                            ?? "影片儲存失敗"
+                    }
                 }
             }
         }
@@ -758,16 +627,15 @@ struct VideoRenderPage: View {
         processor?.cancel()
         player?.pause()
 
-        removeFileIfNeeded(inputURL)
-        removeFileIfNeeded(resultURL)
-        removeFileIfNeeded(trialInputURL)
+        if let inputURL {
+            try? FileManager.default.removeItem(at: inputURL)
+        }
+
+        if let resultURL {
+            try? FileManager.default.removeItem(at: resultURL)
+        }
 
         onClose()
-    }
-
-    private func removeFileIfNeeded(_ url: URL?) {
-        guard let url else { return }
-        try? FileManager.default.removeItem(at: url)
     }
 
     private func makeError(_ message: String) -> NSError {

@@ -15,13 +15,6 @@ final class MainViewModel: ObservableObject {
 
     @Published var selectedEffect: EffectType = .lightning {
         didSet {
-            guard EffectPurchaseStore.shared.isPurchased(selectedEffect) else {
-                if selectedEffect != .lightning {
-                    selectedEffect = .lightning
-                }
-                return
-            }
-
             trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
             trailOverlayView.currentEffect = selectedEffect
         }
