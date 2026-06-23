@@ -17,14 +17,20 @@ final class RecordingManager {
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
-    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var outputURL: URL?
 
+    private var requestedOrientation: UIDeviceOrientation = .portrait
     private var didStartSession = false
     private var pendingStopAfterStart = false
 
+    private var firstPresentationTime: CMTime?
+    private var lastPresentationTime: CMTime?
+    private var appendedFrameCount = 0
+
     var onStarted: ((Bool) -> Void)?
     var onStopped: ((URL?) -> Void)?
+
+    // MARK: - Start
 
     func startRecording(deviceOrientation: UIDeviceOrientation) {
         switch state {
@@ -43,93 +49,24 @@ final class RecordingManager {
             return
         }
 
-        state = .starting
-        isRecording = false
+        requestedOrientation = normalizedOrientation(deviceOrientation)
         pendingStopAfterStart = false
         didStartSession = false
+        firstPresentationTime = nil
+        lastPresentationTime = nil
+        appendedFrameCount = 0
 
-        let url = makeOutputURL()
-        outputURL = url
+        outputURL = makeOutputURL()
+        writer = nil
+        videoInput = nil
 
-        do {
-            if FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.removeItem(at: url)
-            }
-
-            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
-            let settings: [String: Any] = [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: 720,
-                AVVideoHeightKey: 1280,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: 8_000_000,
-                    AVVideoExpectedSourceFrameRateKey: 30,
-                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-                ]
-            ]
-
-            let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-            input.expectsMediaDataInRealTime = true
-            input.transform = preferredTransform(for: normalizedOrientation(deviceOrientation))
-
-            guard writer.canAdd(input) else {
-                print("[Recording] cannot add video input")
-                resetWriterState()
-                state = .idle
-                onStarted?(false)
-                return
-            }
-
-            writer.add(input)
-
-            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-                assetWriterInput: input,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey as String: 720,
-                    kCVPixelBufferHeightKey as String: 1280
-                ]
-            )
-
-            self.writer = writer
-            self.videoInput = input
-            self.adaptor = adaptor
-
-            guard writer.startWriting() else {
-                print("[Recording] startWriting failed:", writer.error?.localizedDescription ?? "unknown")
-                resetWriterState()
-                state = .idle
-                onStarted?(false)
-                return
-            }
-
-            handleStartFinished(success: true)
-
-        } catch {
-            print("[Recording] start error:", error.localizedDescription)
-            resetWriterState()
-            state = .idle
-            onStarted?(false)
-        }
-    }
-
-    private func handleStartFinished(success: Bool) {
-        guard state == .starting else {
-            return
-        }
-
-        guard success else {
-            resetWriterState()
-            state = .idle
-            isRecording = false
-            pendingStopAfterStart = false
-            onStarted?(false)
-            return
-        }
-
-        state = .recording
+        state = .starting
         isRecording = true
+
+        // Writer 會在第一個相機 sampleBuffer 到達時，依照真實尺寸建立。
+        // 這樣不需要假設一定是 720x1280，也不會把 UI 畫面寫入影片。
+        state = .recording
+        print("[Recording] waiting for first camera frame, orientation:", requestedOrientation.rawValue)
         onStarted?(true)
 
         if pendingStopAfterStart {
@@ -138,36 +75,147 @@ final class RecordingManager {
         }
     }
 
+    // MARK: - Append camera frames only
+
     func append(sampleBuffer: CMSampleBuffer) {
         guard state == .recording,
               isRecording,
-              let writer,
+              CMSampleBufferDataIsReady(sampleBuffer),
+              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+            return
+        }
+
+        if writer == nil {
+            guard configureWriter(
+                formatDescription: formatDescription,
+                firstSampleBuffer: sampleBuffer
+            ) else {
+                failRecording("unable to configure AVAssetWriter")
+                return
+            }
+        }
+
+        guard let writer,
               let videoInput,
-              let adaptor,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+              writer.status == .writing else {
             return
         }
 
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
+        guard presentationTime.isValid,
+              !presentationTime.isIndefinite else {
+            return
+        }
+
         if !didStartSession {
             writer.startSession(atSourceTime: presentationTime)
             didStartSession = true
+            firstPresentationTime = presentationTime
         }
 
         guard videoInput.isReadyForMoreMediaData else {
             return
         }
 
-        let success = adaptor.append(
-            pixelBuffer,
-            withPresentationTime: presentationTime
-        )
+        guard videoInput.append(sampleBuffer) else {
+            print("[Recording] append failed:", writer.error?.localizedDescription ?? "unknown")
+            return
+        }
 
-        if !success {
-            print("[Recording] append frame failed")
+        appendedFrameCount += 1
+        lastPresentationTime = presentationTime
+
+        if appendedFrameCount % 30 == 0,
+           let firstPresentationTime {
+            let duration = CMTimeGetSeconds(
+                CMTimeSubtract(presentationTime, firstPresentationTime)
+            )
+            print(
+                "[Recording] frames:", appendedFrameCount,
+                "duration:", String(format: "%.2f", duration)
+            )
         }
     }
+
+    private func configureWriter(
+        formatDescription: CMFormatDescription,
+        firstSampleBuffer: CMSampleBuffer
+    ) -> Bool {
+        guard let outputURL else {
+            return false
+        }
+
+        do {
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                try FileManager.default.removeItem(at: outputURL)
+            }
+
+            let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+            let width = Int(dimensions.width)
+            let height = Int(dimensions.height)
+
+            guard width > 0, height > 0 else {
+                print("[Recording] invalid frame size:", width, "x", height)
+                return false
+            }
+
+            let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+            let settings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: recommendedBitRate(width: width, height: height),
+                    AVVideoExpectedSourceFrameRateKey: 30,
+                    AVVideoMaxKeyFrameIntervalKey: 30,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+
+            let input = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: settings,
+                sourceFormatHint: formatDescription
+            )
+            input.expectsMediaDataInRealTime = true
+            input.transform = preferredTransform(
+                for: requestedOrientation,
+                sourceWidth: width,
+                sourceHeight: height
+            )
+
+            guard writer.canAdd(input) else {
+                print("[Recording] cannot add video input")
+                return false
+            }
+
+            writer.add(input)
+
+            guard writer.startWriting() else {
+                print("[Recording] startWriting failed:", writer.error?.localizedDescription ?? "unknown")
+                return false
+            }
+
+            self.writer = writer
+            self.videoInput = input
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(firstSampleBuffer)
+            print(
+                "[Recording] writer configured:",
+                "size=\(width)x\(height)",
+                "firstPTS=\(CMTimeGetSeconds(pts))"
+            )
+
+            return true
+        } catch {
+            print("[Recording] configure error:", error.localizedDescription)
+            return false
+        }
+    }
+
+    // MARK: - Stop
 
     func stopRecording() {
         switch state {
@@ -175,11 +223,14 @@ final class RecordingManager {
             isRecording = false
             onStopped?(nil)
             return
+
         case .starting:
             pendingStopAfterStart = true
             return
+
         case .recording:
             break
+
         case .stopping:
             return
         }
@@ -187,61 +238,119 @@ final class RecordingManager {
         state = .stopping
         isRecording = false
 
-        let url = outputURL
+        guard let writer,
+              let videoInput,
+              let outputURL,
+              didStartSession,
+              appendedFrameCount > 0 else {
+            print("[Recording] stop failed: no camera frames were appended")
+            resetWriterState(cancelWriter: true)
+            state = .idle
+            onStopped?(nil)
+            return
+        }
 
-        videoInput?.markAsFinished()
+        let duration: Double
+        if let firstPresentationTime,
+           let lastPresentationTime {
+            duration = max(
+                0,
+                CMTimeGetSeconds(
+                    CMTimeSubtract(lastPresentationTime, firstPresentationTime)
+                )
+            )
+        } else {
+            duration = 0
+        }
 
-        writer?.finishWriting { [weak self, url] in
-            Task { @MainActor [weak self, url] in
-                self?.handleStopFinished(outputURL: url)
+        print(
+            "[Recording] finishing:",
+            "frames=\(appendedFrameCount)",
+            "duration=\(String(format: "%.2f", duration))"
+        )
+
+        videoInput.markAsFinished()
+
+        writer.finishWriting { [weak self, outputURL] in
+            Task { @MainActor [weak self, outputURL] in
+                self?.handleStopFinished(outputURL: outputURL)
             }
         }
     }
 
-    private func handleStopFinished(outputURL: URL?) {
+    private func handleStopFinished(outputURL: URL) {
         guard state == .stopping else {
             return
         }
 
-        let writerStatus = writer?.status
-        let writerError = writer?.error?.localizedDescription
+        let status = writer?.status
+        let errorMessage = writer?.error?.localizedDescription
 
-        resetWriterState()
+        resetWriterState(cancelWriter: false)
         state = .idle
         isRecording = false
         pendingStopAfterStart = false
 
-        if let writerError {
-            print("[Recording] stop error:", writerError)
+        if let errorMessage {
+            print("[Recording] finish error:", errorMessage)
             onStopped?(nil)
             return
         }
 
-        guard writerStatus == .completed else {
-            print("[Recording] writer not completed:", String(describing: writerStatus))
+        guard status == .completed else {
+            print("[Recording] writer status:", String(describing: status))
             onStopped?(nil)
             return
         }
 
-        guard let outputURL,
-              FileManager.default.fileExists(atPath: outputURL.path) else {
+        guard FileManager.default.fileExists(atPath: outputURL.path) else {
             print("[Recording] output file does not exist")
             onStopped?(nil)
             return
         }
 
+        print("[Recording] completed:", outputURL.path)
         onStopped?(outputURL)
     }
 
+    private func failRecording(_ message: String) {
+        print("[Recording] failed:", message)
+        resetWriterState(cancelWriter: true)
+        state = .idle
+        isRecording = false
+        pendingStopAfterStart = false
+        onStopped?(nil)
+    }
+
+    // MARK: - Reset
+
     func forceReset() {
+        print("[Recording] forceReset, state:", state.rawValue)
+
         pendingStopAfterStart = false
         isRecording = false
         state = .idle
-
-        videoInput?.markAsFinished()
-        writer?.cancelWriting()
-        resetWriterState()
+        resetWriterState(cancelWriter: true)
     }
+
+    private func resetWriterState(cancelWriter: Bool) {
+        if cancelWriter,
+           let writer,
+           writer.status == .writing {
+            videoInput?.markAsFinished()
+            writer.cancelWriting()
+        }
+
+        writer = nil
+        videoInput = nil
+        outputURL = nil
+        didStartSession = false
+        firstPresentationTime = nil
+        lastPresentationTime = nil
+        appendedFrameCount = 0
+    }
+
+    // MARK: - Photo library
 
     func saveToPhotoLibrary(
         url: URL,
@@ -286,19 +395,12 @@ final class RecordingManager {
                 if let error {
                     print("[Recording] save error:", error.localizedDescription)
                 }
-
                 completion(success)
             }
         }
     }
 
-    private func resetWriterState() {
-        writer = nil
-        videoInput = nil
-        adaptor = nil
-        outputURL = nil
-        didStartSession = false
-    }
+    // MARK: - Helpers
 
     private func makeOutputURL() -> URL {
         let timestamp = Int(Date().timeIntervalSince1970)
@@ -308,7 +410,9 @@ final class RecordingManager {
             .appendingPathComponent(fileName)
     }
 
-    private func normalizedOrientation(_ orientation: UIDeviceOrientation) -> UIDeviceOrientation {
+    private func normalizedOrientation(
+        _ orientation: UIDeviceOrientation
+    ) -> UIDeviceOrientation {
         switch orientation {
         case .portrait, .portraitUpsideDown, .landscapeLeft, .landscapeRight:
             return orientation
@@ -317,16 +421,58 @@ final class RecordingManager {
         }
     }
 
-    private func preferredTransform(for orientation: UIDeviceOrientation) -> CGAffineTransform {
+    private func preferredTransform(
+        for orientation: UIDeviceOrientation,
+        sourceWidth: Int,
+        sourceHeight: Int
+    ) -> CGAffineTransform {
+        // CameraManager 現在固定輸出 videoRotationAngle = 90，
+        // 因此 sampleBuffer 通常已是直式 720x1280。
+        let sourceIsPortrait = sourceHeight >= sourceWidth
+
+        guard sourceIsPortrait else {
+            switch orientation {
+            case .portrait:
+                return CGAffineTransform(rotationAngle: .pi / 2)
+            case .portraitUpsideDown:
+                return CGAffineTransform(rotationAngle: -.pi / 2)
+            case .landscapeRight:
+                return CGAffineTransform(rotationAngle: .pi)
+            default:
+                return .identity
+            }
+        }
+
         switch orientation {
         case .landscapeLeft:
-            return CGAffineTransform(rotationAngle: .pi / 2)
-        case .landscapeRight:
+            // UIDevice 的 landscapeLeft 表示裝置左側朝下，
+            // 對已是直式的相機 frame 應順時針旋轉 90 度。
             return CGAffineTransform(rotationAngle: -.pi / 2)
+
+        case .landscapeRight:
+            // UIDevice 的 landscapeRight 表示裝置右側朝下，
+            // 對已是直式的相機 frame 應逆時針旋轉 90 度。
+            return CGAffineTransform(rotationAngle: .pi / 2)
+
         case .portraitUpsideDown:
             return CGAffineTransform(rotationAngle: .pi)
+
         default:
             return .identity
         }
+    }
+
+    private func recommendedBitRate(width: Int, height: Int) -> Int {
+        let pixels = width * height
+
+        if pixels >= 1920 * 1080 {
+            return 12_000_000
+        }
+
+        if pixels >= 1280 * 720 {
+            return 8_000_000
+        }
+
+        return 4_000_000
     }
 }
