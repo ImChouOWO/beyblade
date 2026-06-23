@@ -10,11 +10,6 @@ struct ContentView: View {
 
     @State private var showVideoPicker = false
 
-    @AppStorage("is60FPSMode")
-    private var is60FPSMode = false
-
-    @State private var showSettingsSheet = false
-
     @State private var iconRotation: Angle = .zero
     @State private var effectDragLocation: CGPoint?
 
@@ -33,7 +28,6 @@ struct ContentView: View {
 
     private let topBarHeight: CGFloat = 40
     private let topBarTopPadding: CGFloat = 10
-    private let uiAnimationDuration: Double = 0.25
 
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
@@ -158,36 +152,6 @@ struct ContentView: View {
         .allowsHitTesting(vm.effectMenuVisible)
     }
 
-    // MARK: - Settings Sheet Addition
-
-    private var settingsSheetLayer: some View {
-        GeometryReader { _ in
-            ZStack(alignment: .bottom) {
-                if showSettingsSheet {
-                    Color.black.opacity(0.45)
-                        .ignoresSafeArea()
-                        .onTapGesture {
-                            closeSettingsSheet()
-                        }
-
-                    SettingsSheetView(
-                        isPresented: $showSettingsSheet,
-                        is60FPSMode: $is60FPSMode,
-                        iconRotation: iconRotation,
-                        animationDuration: uiAnimationDuration
-                    )
-                    .transition(
-                        .move(edge: .bottom)
-                            .combined(with: .opacity)
-                    )
-                }
-            }
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(showSettingsSheet)
-        .zIndex(100)
-    }
-
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
@@ -236,7 +200,6 @@ struct ContentView: View {
                 hintLayer
                 controlBarLayer
                 effectMenuLayer
-                settingsSheetLayer
 
                 if isBusy {
                     busyOverlay
@@ -285,13 +248,6 @@ struct ContentView: View {
 
                 updateIconRotation()
 
-                CameraFrameRateCoordinator.shared.bind(
-                    to: vm.cameraManager
-                )
-                CameraFrameRateCoordinator.shared.set60FPSMode(
-                    is60FPSMode
-                )
-
                 vm.updatePreviewLayout(
                     overlaySize: size,
                     videoGravity: videoGravity
@@ -325,11 +281,6 @@ struct ContentView: View {
 
                 vm.cameraManager.updateVideoRotation()
             }
-            .onChange(of: is60FPSMode) { _, enabled in
-                CameraFrameRateCoordinator.shared.set60FPSMode(
-                    enabled
-                )
-            }
             .onReceive(
                 NotificationCenter.default.publisher(
                     for: UIDevice.orientationDidChangeNotification
@@ -346,41 +297,22 @@ struct ContentView: View {
 
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
-        let targetRotation: Angle
 
         switch orientation {
         case .portrait:
-            targetRotation = .degrees(0)
+            iconRotation = .degrees(0)
 
         case .landscapeLeft:
-            targetRotation = .degrees(90)
+            iconRotation = .degrees(90)
 
         case .portraitUpsideDown:
-            targetRotation = .degrees(180)
+            iconRotation = .degrees(180)
 
         case .landscapeRight:
-            targetRotation = .degrees(-90)
+            iconRotation = .degrees(-90)
 
         default:
-            return
-        }
-
-        guard targetRotation != iconRotation else {
-            return
-        }
-
-        withAnimation(
-            .easeInOut(duration: uiAnimationDuration)
-        ) {
-            iconRotation = targetRotation
-        }
-    }
-
-    private func closeSettingsSheet() {
-        withAnimation(
-            .easeInOut(duration: uiAnimationDuration)
-        ) {
-            showSettingsSheet = false
+            break
         }
     }
 
@@ -417,15 +349,7 @@ struct ContentView: View {
             Spacer()
 
             Button {
-                guard !isBusy else {
-                    return
-                }
-
-                withAnimation(
-                    .easeInOut(duration: uiAnimationDuration)
-                ) {
-                    showSettingsSheet = true
-                }
+                // settings
             } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16))
