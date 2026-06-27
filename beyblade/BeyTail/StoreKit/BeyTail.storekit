@@ -1,0 +1,189 @@
+{
+  "appPolicies" : {
+    "eula" : "",
+    "policies" : [
+      {
+        "locale" : "en_US",
+        "policyText" : "",
+        "policyURL" : ""
+      }
+    ]
+  },
+  "identifier" : "7510A5F0",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "792818BB",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.wave",
+      "referenceName" : "wave",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "6B024A82",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.money_impact",
+      "referenceName" : "money_impact",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "DEF8DE7C",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.blade_dance",
+      "referenceName" : "blade_dance",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "FFE748AF",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.ice_break",
+      "referenceName" : "ice_break",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "A426F6E6",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.crimson_lotus",
+      "referenceName" : "crimson_lotus",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "21C01EF3",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.death_ray",
+      "referenceName" : "death_ray",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "1624F554",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.emerald",
+      "referenceName" : "effect.emerald",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "17B38C91",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.ink_wash",
+      "referenceName" : "ink_wash",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "40",
+      "familyShareable" : false,
+      "internalID" : "6D90F646",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effect.spray_paint",
+      "referenceName" : "spray_paint",
+      "type" : "NonConsumable"
+    },
+    {
+      "displayPrice" : "0.99",
+      "familyShareable" : false,
+      "internalID" : "39D41F60",
+      "localizations" : [
+        {
+          "description" : "",
+          "displayName" : "",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.ahher0893.beyblade.effects.premium_pack",
+      "referenceName" : "premium_pack",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_askToBuyEnabled" : false,
+    "_billingGracePeriodEnabled" : false,
+    "_billingIssuesEnabled" : false,
+    "_disableDialogs" : false,
+    "_failTransactionsEnabled" : false,
+    "_locale" : "zh_Hant",
+    "_renewalBillingIssuesEnabled" : false,
+    "_storefront" : "TWN",
+    "_storeKitErrors" : [
+
+    ],
+    "_timeRate" : 0
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 5,
+    "minor" : 0
+  }
+}
