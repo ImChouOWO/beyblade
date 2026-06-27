@@ -150,13 +150,13 @@
       "type" : "NonConsumable"
     },
     {
-      "displayPrice" : "0.99",
+      "displayPrice" : "190",
       "familyShareable" : false,
       "internalID" : "39D41F60",
       "localizations" : [
         {
-          "description" : "",
-          "displayName" : "",
+          "description" : "解鎖多個付費特效",
+          "displayName" : "特效禮包",
           "locale" : "en_US"
         }
       ],

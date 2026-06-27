@@ -40,23 +40,72 @@ final class EffectPurchaseStore: ObservableObject {
     }
 
     func loadProducts() async {
-        guard !isLoadingProducts else { return }
+        guard !isLoadingProducts else {
+            return
+        }
 
         isLoadingProducts = true
-        defer { isLoadingProducts = false }
+        lastErrorMessage = nil
+
+        defer {
+            isLoadingProducts = false
+        }
+
+        let requestedIDs = EffectType.allProductIDs
+
+        print("========== StoreKit Debug ==========")
+        print("[StoreKit] Requested count:", requestedIDs.count)
+
+        for id in requestedIDs.sorted() {
+            print("[StoreKit] Requested ID:", id)
+        }
 
         do {
             let products = try await Product.products(
-                for: Array(EffectType.allProductIDs)
+                for: Array(requestedIDs)
             )
+
+            print("[StoreKit] Loaded count:", products.count)
+
+            for product in products {
+                print(
+                    "[StoreKit] Loaded:",
+                    product.id,
+                    "| price:",
+                    product.displayPrice,
+                    "| raw price:",
+                    product.price
+                )
+            }
+
             productsByID = Dictionary(
-                uniqueKeysWithValues: products.map { ($0.id, $0) }
+                uniqueKeysWithValues: products.map {
+                    ($0.id, $0)
+                }
             )
+
+            let loadedIDs = Set(products.map(\.id))
+            let missingIDs = requestedIDs.subtracting(loadedIDs)
+
+            if !missingIDs.isEmpty {
+                for id in missingIDs.sorted() {
+                    print("[StoreKit] Missing ID:", id)
+                }
+
+                lastErrorMessage =
+                    "StoreKit 有 \(missingIDs.count) 個商品未載入"
+            }
+
+            print("====================================")
         } catch {
-            lastErrorMessage = "無法載入 App Store 商品：\(error.localizedDescription)"
+            productsByID = [:]
+
+            lastErrorMessage =
+                "無法載入商品：\(error.localizedDescription)"
+
+            print("[StoreKit] Error:", error)
         }
     }
-
     func refreshPurchasedProducts() async {
         var purchased = Set<String>()
 
