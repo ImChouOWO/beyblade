@@ -73,8 +73,4 @@ final class PicTrailOverlayView: MTKView {
             )
         }
     }
-
-    deinit {
-        delegate = nil
-    }
 }
