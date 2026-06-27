@@ -419,6 +419,74 @@ final class CameraManager: NSObject {
         )
     }
 
+    // MARK: - Tap To Focus
+
+    func focus(at devicePoint: CGPoint) {
+        let point = CGPoint(
+            x: min(max(devicePoint.x, 0), 1),
+            y: min(max(devicePoint.y, 0), 1)
+        )
+
+        sessionQueue.async { [weak self] in
+            guard let self,
+                  let input = self.session.inputs
+                    .compactMap({ $0 as? AVCaptureDeviceInput })
+                    .first(where: { $0.device.hasMediaType(.video) }) else {
+                return
+            }
+
+            let device = input.device
+
+            do {
+                try device.lockForConfiguration()
+                defer {
+                    device.unlockForConfiguration()
+                }
+
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = point
+
+                    if device.isFocusModeSupported(.autoFocus) {
+                        device.focusMode = .autoFocus
+                    } else if device.isFocusModeSupported(
+                        .continuousAutoFocus
+                    ) {
+                        device.focusMode = .continuousAutoFocus
+                    }
+                }
+
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = point
+
+                    if device.isExposureModeSupported(.autoExpose) {
+                        device.exposureMode = .autoExpose
+                    } else if device.isExposureModeSupported(
+                        .continuousAutoExposure
+                    ) {
+                        device.exposureMode = .continuousAutoExposure
+                    }
+                }
+
+                if device.isSmoothAutoFocusSupported {
+                    device.isSmoothAutoFocusEnabled = true
+                }
+
+                device.isSubjectAreaChangeMonitoringEnabled = true
+
+                print(
+                    "[CAMERA] focus point:",
+                    point.x,
+                    point.y
+                )
+            } catch {
+                print(
+                    "[CAMERA] focus configuration failed:",
+                    error.localizedDescription
+                )
+            }
+        }
+    }
+
     // MARK: - Frame Rate
 
     private func configureFrameRate(_ device: AVCaptureDevice) {

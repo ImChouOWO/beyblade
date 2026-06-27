@@ -205,7 +205,10 @@ struct ContentView: View {
                         CameraPreviewView(
                             session: vm.cameraManager.session,
                             videoGravity: videoGravity,
-                            isLandscape: isLandscape
+                            isLandscape: isLandscape,
+                            onFocus: { devicePoint in
+                                vm.focusCamera(at: devicePoint)
+                            }
                         )
                     }
                 }
@@ -278,6 +281,28 @@ struct ContentView: View {
                 )
                 .preferredColorScheme(.dark)
                 .statusBarHidden(true)
+            }
+            .sheet(
+                isPresented: Binding(
+                    get: {
+                        vm.isRecordingResultPresented
+                    },
+                    set: { isPresented in
+                        if !isPresented {
+                            vm.dismissRecordingResult()
+                        }
+                    }
+                )
+            ) {
+                if let videoURL = vm.completedRecordingURL {
+                    RecordingCompletionSheet(
+                        vm: vm,
+                        videoURL: videoURL
+                    )
+                    .presentationDetents([.height(330)])
+                    .presentationDragIndicator(.visible)
+                    .interactiveDismissDisabled(vm.recordingSaveState == .saving)
+                }
             }
             .onAppear {
                 UIDevice.current
@@ -557,24 +582,7 @@ struct ContentView: View {
             VStack(spacing: 4) {
                 ZStack {
                     VStack {
-                        Text("\(vm.fps) FPS")
-                            .font(
-                                .system(
-                                    size: 11,
-                                    design: .monospaced
-                                )
-                            )
-                            .foregroundColor(.white)
-
-                        Text("[\(vm.hardwareLabel)]")
-                            .font(
-                                .system(
-                                    size: 11,
-                                    weight: .bold,
-                                    design: .monospaced
-                                )
-                            )
-                            .foregroundColor(vm.hardwareColor)
+                        
                     }
                     .rotationEffect(iconRotation)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1388,6 +1396,7 @@ struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
     let videoGravity: AVLayerVideoGravity
     let isLandscape: Bool
+    let onFocus: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
         let view = CameraPreviewUIView()
@@ -1395,6 +1404,7 @@ struct CameraPreviewView: UIViewRepresentable {
         view.attachSession(session)
         view.setVideoGravity(videoGravity)
         view.setIsLandscape(isLandscape)
+        view.setFocusHandler(onFocus)
         return view
     }
 
@@ -1405,6 +1415,7 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.attachSession(session)
         uiView.setVideoGravity(videoGravity)
         uiView.setIsLandscape(isLandscape)
+        uiView.setFocusHandler(onFocus)
         uiView.setNeedsLayout()
     }
 
@@ -1412,6 +1423,7 @@ struct CameraPreviewView: UIViewRepresentable {
         _ uiView: CameraPreviewUIView,
         coordinator: ()
     ) {
+        uiView.setFocusHandler(nil)
         uiView.detachSession()
     }
 }
@@ -1420,6 +1432,17 @@ final class CameraPreviewUIView: UIView {
 
     private var isLandscape = false
     private var lastAppliedPreviewAngle: CGFloat = -1
+
+    private var onFocus: ((CGPoint) -> Void)?
+
+    private let focusIndicatorView = UIView(
+        frame: CGRect(
+            x: 0,
+            y: 0,
+            width: 72,
+            height: 72
+        )
+    )
 
     override static var layerClass: AnyClass {
         AVCaptureVideoPreviewLayer.self
@@ -1433,6 +1456,102 @@ final class CameraPreviewUIView: UIView {
         }
 
         return layer
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configureFocusInteraction()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureFocusInteraction()
+    }
+
+    private func configureFocusInteraction() {
+        isUserInteractionEnabled = true
+
+        let tapGesture = UITapGestureRecognizer(
+            target: self,
+            action: #selector(handleFocusTap(_:))
+        )
+
+        tapGesture.numberOfTapsRequired = 1
+        addGestureRecognizer(tapGesture)
+
+        focusIndicatorView.isUserInteractionEnabled = false
+        focusIndicatorView.backgroundColor = .clear
+        focusIndicatorView.layer.borderWidth = 1.5
+        focusIndicatorView.layer.borderColor =
+            UIColor.systemYellow.cgColor
+        focusIndicatorView.layer.cornerRadius = 5
+        focusIndicatorView.alpha = 0
+
+        addSubview(focusIndicatorView)
+    }
+
+    func setFocusHandler(
+        _ handler: ((CGPoint) -> Void)?
+    ) {
+        onFocus = handler
+    }
+
+    @objc
+    private func handleFocusTap(
+        _ recognizer: UITapGestureRecognizer
+    ) {
+        guard recognizer.state == .ended else {
+            return
+        }
+
+        let layerPoint = recognizer.location(in: self)
+
+        guard bounds.contains(layerPoint) else {
+            return
+        }
+
+        let devicePoint =
+            previewLayer.captureDevicePointConverted(
+                fromLayerPoint: layerPoint
+            )
+
+        showFocusIndicator(at: layerPoint)
+        onFocus?(devicePoint)
+    }
+
+    private func showFocusIndicator(
+        at point: CGPoint
+    ) {
+        focusIndicatorView.layer.removeAllAnimations()
+
+        focusIndicatorView.center = point
+        focusIndicatorView.alpha = 1
+        focusIndicatorView.transform = CGAffineTransform(
+            scaleX: 1.3,
+            y: 1.3
+        )
+
+        UIView.animate(
+            withDuration: 0.18,
+            delay: 0,
+            options: [
+                .curveEaseOut,
+                .beginFromCurrentState
+            ]
+        ) {
+            self.focusIndicatorView.transform = .identity
+        } completion: { _ in
+            UIView.animate(
+                withDuration: 0.25,
+                delay: 0.65,
+                options: [
+                    .curveEaseOut,
+                    .beginFromCurrentState
+                ]
+            ) {
+                self.focusIndicatorView.alpha = 0
+            }
+        }
     }
 
     func attachSession(_ session: AVCaptureSession) {
