@@ -146,12 +146,12 @@ final class PicTrailSceneBuilder {
         now: TimeInterval,
         geometry: inout PicFrameGeometry
     ) {
-        let yellow = rgba(UIColor(hex: 0xFFDD22))
+        let yellow = rgba(UIColor(hex: 0xFFFF55))
         let white = SIMD4<Float>(1, 1, 0.92, 1)
 
         appendRibbon(
             samples,
-            width: 26,
+            width: 30,
             baseColor: yellow,
             usePointColor: false,
             style: .lightning,
@@ -164,7 +164,7 @@ final class PicTrailSceneBuilder {
 
         appendRibbon(
             samples,
-            width: 9,
+            width: 20,
             baseColor: yellow,
             usePointColor: false,
             style: .lightning,
@@ -177,7 +177,7 @@ final class PicTrailSceneBuilder {
 
         appendRibbon(
             samples,
-            width: 2.5,
+            width: 25,
             baseColor: white,
             usePointColor: false,
             style: .lightning,
@@ -291,7 +291,7 @@ final class PicTrailSceneBuilder {
     ) {
         appendRibbon(
             samples,
-            width: 14,
+            width: 20,
             baseColor: SIMD4(1, 1, 1, 1),
             usePointColor: true,
             style: .stardust,
@@ -304,7 +304,7 @@ final class PicTrailSceneBuilder {
 
         appendRibbon(
             samples,
-            width: 3,
+            width: 16,
             baseColor: SIMD4(1, 1, 1, 1),
             usePointColor: true,
             style: .stardust,
