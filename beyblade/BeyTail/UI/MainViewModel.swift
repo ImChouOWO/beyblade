@@ -23,6 +23,7 @@ final class MainViewModel: ObservableObject {
             }
 
             trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
+            recordingTrailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
             trailOverlayView.currentEffect = selectedEffect
         }
     }
@@ -71,6 +72,7 @@ final class MainViewModel: ObservableObject {
     let inferenceEngine = InferenceEngine()
     let tracker = BeybladeTracker()
     let trailEffectEngine = TrailEffectEngine()
+    let recordingTrailEffectEngine = TrailEffectEngine()
     let trailOverlayView = TrailOverlayView()
     let videoFrameSource = VideoFrameSource()
     let recordingManager = RecordingManager()
@@ -192,6 +194,7 @@ final class MainViewModel: ObservableObject {
     init() {
         trailOverlayView.effectEngine = trailEffectEngine
         trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
+        recordingTrailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
         trailOverlayView.currentEffect = selectedEffect
 
         inferenceEngine.onResult = { [weak self] detections in
@@ -430,6 +433,7 @@ final class MainViewModel: ObservableObject {
 
         tracker.reset()
         trailEffectEngine.clear()
+        recordingTrailEffectEngine.clear()
         trailOverlayView.debugBoundingBoxes = []
 
         videoFrameSource.onFrame = nil
@@ -478,6 +482,19 @@ final class MainViewModel: ObservableObject {
             rawDetections: tracked,
             mappedDetections: mappedResults
         )
+
+        if recordingManager.isRecording {
+            let recordingNow = CACurrentMediaTime()
+
+            for result in tracked where result.trackId > 0 {
+                recordingTrailEffectEngine.addPoint(
+                    trackId: result.trackId,
+                    center: result.center,
+                    color: result.dominantColor,
+                    timestamp: recordingNow
+                )
+            }
+        }
 
         for result in mappedResults {
             guard result.trackId > 0 else {
@@ -1095,13 +1112,30 @@ final class MainViewModel: ObservableObject {
             )
         }
 
-        if recordingManager.isRecording {
-            recordingManager.append(sampleBuffer: buffer)
-        }
+        appendRecordingFrame(buffer)
 
         inferenceEngine.processFrame(
             buffer,
             orientation: orientation
+        )
+    }
+
+    private func appendRecordingFrame(
+        _ buffer: CMSampleBuffer
+    ) {
+        guard recordingManager.isRecording else {
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        let trackData = recordingTrailEffectEngine
+            .getPointsByTrack(now: now)
+
+        recordingManager.append(
+            sampleBuffer: buffer,
+            trackData: trackData,
+            effect: selectedEffect,
+            now: now
         )
     }
 
@@ -1501,6 +1535,7 @@ final class MainViewModel: ObservableObject {
         if policy.clearTracking {
             tracker.reset()
             trailEffectEngine.clear()
+            recordingTrailEffectEngine.clear()
             trailOverlayView.debugBoundingBoxes = []
             resetDetectionStatus()
         }
@@ -1584,9 +1619,7 @@ final class MainViewModel: ObservableObject {
             orientation: orientation
         )
 
-        if recordingManager.isRecording {
-            recordingManager.append(sampleBuffer: buffer)
-        }
+        appendRecordingFrame(buffer)
 
         inferenceEngine.processFrame(
             buffer,
