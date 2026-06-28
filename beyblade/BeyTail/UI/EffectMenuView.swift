@@ -1,7 +1,7 @@
 import SwiftUI
 import Combine
 
-private let effectMenuAutoScrollTimer = Timer
+private let quickEffectMenuAutoScrollTimer = Timer
     .publish(
         every: 0.12,
         on: .main,
@@ -9,12 +9,19 @@ private let effectMenuAutoScrollTimer = Timer
     )
     .autoconnect()
 
-struct EffectMenuView: View {
+private let quickEffectAccentColor = Color(
+    red: 0.0,
+    green: 245.0 / 255.0,
+    blue: 1.0
+)
+
+struct QuickEffectMenuView: View {
 
     @Binding var selectedEffect: EffectType
     @Binding var isVisible: Bool
 
-    @ObservedObject private var purchaseStore = EffectPurchaseStore.shared
+    @ObservedObject private var purchaseStore =
+        EffectPurchaseStore.shared
 
     /// ContentView 傳入的全螢幕 global 手指位置。
     var dragLocation: CGPoint? = nil
@@ -27,6 +34,7 @@ struct EffectMenuView: View {
     @State private var hoveredEffect: EffectType?
     @State private var autoScrollDirection: AutoScrollDirection?
 
+    private let maximumVisibleEffects = 6
     private let autoScrollEdgeSize: CGFloat = 54
 
     private enum AutoScrollDirection {
@@ -35,57 +43,80 @@ struct EffectMenuView: View {
     }
 
     private var menuEffects: [EffectType] {
-        let ids = effectMenuIDsRaw
-            .split(separator: ",")
-            .map(String.init)
+        let configuredEffects = configuredMenuEffects
 
-        let configuredEffects: [EffectType]
-
-        if ids.isEmpty {
-            configuredEffects = EffectType.defaultMenuEffects
-        } else {
-            configuredEffects = EffectType.allCases.filter {
-                ids.contains($0.rawValue)
-            }
-        }
-
-        let allowedEffects = configuredEffects.filter {
+        let purchasedEffects = configuredEffects.filter {
             purchaseStore.isPurchased($0)
         }
 
-        return allowedEffects.isEmpty
-            ? EffectType.defaultMenuEffects
-            : allowedEffects
+        let fallbackEffects = EffectType.defaultMenuEffects.filter {
+            purchaseStore.isPurchased($0)
+        }
+
+        let resolvedEffects = purchasedEffects.isEmpty
+            ? fallbackEffects
+            : purchasedEffects
+
+        return Array(
+            resolvedEffects.prefix(maximumVisibleEffects)
+        )
     }
 
-    /// 實際由上到下顯示的特效順序。
+    private var configuredMenuEffects: [EffectType] {
+        let configuredIDs = Set(
+            effectMenuIDsRaw
+                .split(separator: ",")
+                .map(String.init)
+        )
+
+        guard !configuredIDs.isEmpty else {
+            return Array(
+                EffectType.defaultMenuEffects
+                    .prefix(maximumVisibleEffects)
+            )
+        }
+
+        return Array(
+            EffectType.allCases
+                .filter {
+                    configuredIDs.contains($0.rawValue)
+                }
+                .prefix(maximumVisibleEffects)
+        )
+    }
+
     private var displayedEffects: [EffectType] {
         Array(menuEffects.reversed())
+    }
+
+    private var menuHeight: CGFloat {
+        let count = max(displayedEffects.count, 1)
+        let rowHeight: CGFloat = 50
+        let verticalPadding: CGFloat = 16
+        let rowSpacing: CGFloat = 5
+
+        return verticalPadding
+            + CGFloat(count) * rowHeight
+            + CGFloat(max(count - 1, 0)) * rowSpacing
     }
 
     var body: some View {
         ScrollViewReader { scrollProxy in
             ScrollView(
                 .vertical,
-                showsIndicators: true
+                showsIndicators: false
             ) {
                 VStack(spacing: 5) {
                     ForEach(
                         displayedEffects,
                         id: \.self
                     ) { effect in
-                        EffectRowView(
+                        QuickEffectRowView(
                             effect: effect,
                             isSelected: effect == selectedEffect,
                             isHovered: effect == hoveredEffect,
                             onTap: {
-                                selectedEffect = effect
-
-                                withAnimation(
-                                    .easeOut(duration: 0.2)
-                                ) {
-                                    isVisible = false
-                                }
+                                selectEffect(effect)
                             }
                         )
                         .id(effect)
@@ -93,11 +124,9 @@ struct EffectMenuView: View {
                             GeometryReader { proxy in
                                 Color.clear
                                     .preference(
-                                        key: EffectRowFramePreferenceKey.self,
+                                        key: QuickEffectRowFramePreferenceKey.self,
                                         value: [
-                                            effect: proxy.frame(
-                                                in: .global
-                                            )
+                                            effect: proxy.frame(in: .global)
                                         ]
                                     )
                             }
@@ -107,27 +136,13 @@ struct EffectMenuView: View {
                 .padding(.vertical, 8)
             }
             .frame(width: 220)
-            .frame(maxHeight: 360)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(
-                        Color(white: 0.04)
-                            .opacity(0.92)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(
-                                Color(hex: 0x00F5FF)
-                                    .opacity(0.18),
-                                lineWidth: 1
-                            )
-                    )
-            )
+            .frame(height: menuHeight)
+            .background(menuBackground)
             .background(
                 GeometryReader { proxy in
                     Color.clear
                         .preference(
-                            key: EffectMenuFramePreferenceKey.self,
+                            key: QuickEffectMenuFramePreferenceKey.self,
                             value: proxy.frame(in: .global)
                         )
                 }
@@ -136,25 +151,24 @@ struct EffectMenuView: View {
                 RoundedRectangle(cornerRadius: 16)
             )
             .onPreferenceChange(
-                EffectRowFramePreferenceKey.self
+                QuickEffectRowFramePreferenceKey.self
             ) { frames in
                 rowFrames = frames
 
-                // 捲動後列位置會改變；使用目前手指位置重新判斷。
                 DispatchQueue.main.async {
                     updateSelectionByDragLocation(dragLocation)
                 }
             }
             .onPreferenceChange(
-                EffectMenuFramePreferenceKey.self
+                QuickEffectMenuFramePreferenceKey.self
             ) { frame in
                 menuFrame = frame
             }
-            .onChange(of: dragLocation) { _, newLocation in
+            .onChange(of: dragLocation) { newLocation in
                 updateSelectionByDragLocation(newLocation)
                 updateAutoScrollDirection(newLocation)
             }
-            .onReceive(effectMenuAutoScrollTimer) { _ in
+            .onReceive(quickEffectMenuAutoScrollTimer) { _ in
                 guard let direction = autoScrollDirection,
                       dragLocation != nil else {
                     return
@@ -165,27 +179,64 @@ struct EffectMenuView: View {
                     proxy: scrollProxy
                 )
             }
-            .onChange(of: effectMenuIDsRaw) { _, _ in
+            .onChange(of: effectMenuIDsRaw) { _ in
+                enforceMaximumEffectCount()
                 removeInvalidSelectionIfNeeded()
             }
-            .onChange(of: purchaseStore.purchasedProductIDs) { _, _ in
+            .onChange(of: purchaseStore.purchasedProductIDs) { _ in
                 removeInvalidSelectionIfNeeded()
             }
             .onAppear {
                 initializeDefaultMenuIfNeeded()
+                enforceMaximumEffectCount()
                 removeInvalidSelectionIfNeeded()
             }
             .onDisappear {
+                hoveredEffect = nil
                 autoScrollDirection = nil
+                rowFrames.removeAll()
+                menuFrame = .zero
             }
             .transition(
                 .asymmetric(
-                    insertion: .move(edge: .bottom)
+                    insertion:
+                        .move(edge: .bottom)
                         .combined(with: .opacity),
-                    removal: .move(edge: .bottom)
+                    removal:
+                        .move(edge: .bottom)
                         .combined(with: .opacity)
                 )
             )
+        }
+    }
+
+    private var menuBackground: some View {
+        RoundedRectangle(cornerRadius: 16)
+            .fill(
+                Color(white: 0.04)
+                    .opacity(0.92)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(
+                        quickEffectAccentColor
+                            .opacity(0.18),
+                        lineWidth: 1
+                    )
+            )
+    }
+
+    private func selectEffect(_ effect: EffectType) {
+        guard menuEffects.contains(effect) else {
+            return
+        }
+
+        selectedEffect = effect
+
+        withAnimation(
+            .easeOut(duration: 0.2)
+        ) {
+            isVisible = false
         }
     }
 
@@ -194,22 +245,59 @@ struct EffectMenuView: View {
             return
         }
 
-        effectMenuIDsRaw = EffectType.defaultMenuEffects
+        effectMenuIDsRaw =
+            EffectType.defaultMenuEffects
+            .prefix(maximumVisibleEffects)
             .map(\.rawValue)
             .joined(separator: ",")
     }
 
+    private func enforceMaximumEffectCount() {
+        let rawIDs = Set(
+            effectMenuIDsRaw
+                .split(separator: ",")
+                .map(String.init)
+        )
+
+        guard !rawIDs.isEmpty else {
+            return
+        }
+
+        let limitedEffects =
+            EffectType.allCases
+            .filter {
+                rawIDs.contains($0.rawValue)
+            }
+            .prefix(maximumVisibleEffects)
+
+        let normalizedRaw = limitedEffects
+            .map(\.rawValue)
+            .joined(separator: ",")
+
+        guard normalizedRaw != effectMenuIDsRaw else {
+            return
+        }
+
+        effectMenuIDsRaw = normalizedRaw
+    }
+
     private func removeInvalidSelectionIfNeeded() {
+        guard !menuEffects.isEmpty else {
+            selectedEffect =
+                EffectType.defaultMenuEffects.first ?? .lightning
+            return
+        }
+
         guard !menuEffects.contains(selectedEffect) else {
             return
         }
 
-        selectedEffect = menuEffects.first
-            ?? EffectType.defaultMenuEffects[0]
+        selectedEffect =
+            menuEffects.first
+            ?? EffectType.defaultMenuEffects.first
+            ?? .lightning
     }
 
-    /// 依照手指的垂直位置選擇最接近的特效。
-    /// 不判斷 x 座標，因此可在整個螢幕寬度內操作。
     private func updateSelectionByDragLocation(
         _ location: CGPoint?
     ) {
@@ -223,20 +311,21 @@ struct EffectMenuView: View {
             return
         }
 
-        let visibleMenuFrame = menuFrame.insetBy(
-            dx: 0,
-            dy: -4
-        )
+        let visibleMenuFrame =
+            menuFrame.insetBy(
+                dx: 0,
+                dy: -4
+            )
 
         let visibleRows = rowFrames.filter {
             $0.value.intersects(visibleMenuFrame)
         }
 
-        let candidates = visibleRows.isEmpty
+        let candidates =
+            visibleRows.isEmpty
             ? rowFrames
             : visibleRows
 
-        // 手指超出選單上下方時，仍映射到最接近的可見列。
         let targetY: CGFloat
 
         if menuFrame.isEmpty {
@@ -251,12 +340,18 @@ struct EffectMenuView: View {
             )
         }
 
-        let nearestEffect = candidates.min { lhs, rhs in
-            abs(lhs.value.midY - targetY)
-                < abs(rhs.value.midY - targetY)
-        }?.key
+        let nearestEffect =
+            candidates.min {
+                lhs,
+                rhs in
 
-        guard let nearestEffect else {
+                abs(lhs.value.midY - targetY)
+                    <
+                    abs(rhs.value.midY - targetY)
+            }?.key
+
+        guard let nearestEffect,
+              menuEffects.contains(nearestEffect) else {
             return
         }
 
@@ -267,12 +362,12 @@ struct EffectMenuView: View {
         }
     }
 
-    /// 判斷手指是否進入選單的上、下自動捲動區域。
     private func updateAutoScrollDirection(
         _ location: CGPoint?
     ) {
         guard let location,
-              !menuFrame.isEmpty else {
+              !menuFrame.isEmpty,
+              displayedEffects.count > 1 else {
             autoScrollDirection = nil
             return
         }
@@ -290,7 +385,6 @@ struct EffectMenuView: View {
         autoScrollDirection = nil
     }
 
-    /// 每次計時移動一個特效項目，讓未顯示項目逐步進入畫面。
     private func performAutoScrollStep(
         _ direction: AutoScrollDirection,
         proxy: ScrollViewProxy
@@ -299,11 +393,11 @@ struct EffectMenuView: View {
             return
         }
 
-        let currentEffect = hoveredEffect ?? selectedEffect
+        let currentEffect =
+            hoveredEffect ?? selectedEffect
 
-        let currentIndex = displayedEffects
-            .firstIndex(of: currentEffect)
-            ?? 0
+        let currentIndex =
+            displayedEffects.firstIndex(of: currentEffect) ?? 0
 
         let targetIndex: Int
 
@@ -322,16 +416,18 @@ struct EffectMenuView: View {
             return
         }
 
-        let targetEffect = displayedEffects[targetIndex]
+        let targetEffect =
+            displayedEffects[targetIndex]
 
         hoveredEffect = targetEffect
         selectedEffect = targetEffect
 
-        let anchor: UnitPoint = direction == .up
-            ? .top
-            : .bottom
+        let anchor: UnitPoint =
+            direction == .up ? .top : .bottom
 
-        withAnimation(.linear(duration: 0.08)) {
+        withAnimation(
+            .linear(duration: 0.08)
+        ) {
             proxy.scrollTo(
                 targetEffect,
                 anchor: anchor
@@ -340,7 +436,9 @@ struct EffectMenuView: View {
     }
 }
 
-private struct EffectMenuFramePreferenceKey: PreferenceKey {
+private struct QuickEffectMenuFramePreferenceKey:
+    PreferenceKey {
+
     static var defaultValue: CGRect = .zero
 
     static func reduce(
@@ -355,18 +453,23 @@ private struct EffectMenuFramePreferenceKey: PreferenceKey {
     }
 }
 
-private struct EffectRowFramePreferenceKey: PreferenceKey {
-    static var defaultValue: [EffectType: CGRect] = [:]
+private struct QuickEffectRowFramePreferenceKey:
+    PreferenceKey {
+
+    static var defaultValue:
+        [EffectType: CGRect] = [:]
 
     static func reduce(
         value: inout [EffectType: CGRect],
         nextValue: () -> [EffectType: CGRect]
     ) {
-        value.merge(nextValue()) { _, new in new }
+        value.merge(nextValue()) { _, newValue in
+            newValue
+        }
     }
 }
 
-private struct EffectRowView: View {
+private struct QuickEffectRowView: View {
 
     let effect: EffectType
     let isSelected: Bool
@@ -374,49 +477,59 @@ private struct EffectRowView: View {
     let onTap: () -> Void
 
     var body: some View {
-        let isActive = isSelected || isHovered
-
         Button(action: onTap) {
             HStack(spacing: 10) {
                 Text(effect.emoji)
                     .font(.system(size: 20))
 
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(
+                    alignment: .leading,
+                    spacing: 1
+                ) {
                     Text(effect.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(Color(white: 0.92))
+                        .font(
+                            .system(
+                                size: 13,
+                                weight: .semibold
+                            )
+                        )
+                        .foregroundColor(
+                            Color(white: 0.92)
+                        )
+                        .lineLimit(1)
 
                     Text(effect.description)
                         .font(.system(size: 9))
-                        .foregroundColor(Color(white: 0.55))
+                        .foregroundColor(
+                            Color(white: 0.55)
+                        )
+                        .lineLimit(1)
                 }
 
-                Spacer()
+                Spacer(minLength: 8)
 
-                Text(isSelected ? "✓" : "")
-                    .font(.system(size: 12, weight: .bold))
-                    .foregroundColor(Color(hex: 0x00F5FF))
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(
+                            .system(
+                                size: 12,
+                                weight: .bold
+                            )
+                        )
+                        .foregroundColor(
+                            quickEffectAccentColor
+                        )
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 12)
-                    .fill(
-                        isActive
-                            ? Color(hex: 0x00F5FF)
-                                .opacity(isSelected ? 0.12 : 0.08)
-                            : Color.clear
-                    )
+                    .fill(rowBackgroundColor)
                     .overlay(
                         RoundedRectangle(cornerRadius: 12)
                             .stroke(
-                                isSelected
-                                    ? Color(hex: 0x00F5FF).opacity(0.4)
-                                    : (
-                                        isHovered
-                                            ? Color(hex: 0x00F5FF).opacity(0.25)
-                                            : Color(white: 1, opacity: 0.07)
-                                    ),
+                                rowBorderColor,
                                 lineWidth: 1
                             )
                     )
@@ -425,14 +538,29 @@ private struct EffectRowView: View {
         .buttonStyle(.plain)
         .padding(.horizontal, 8)
     }
-}
 
-extension Color {
-    init(hex: UInt32) {
-        self.init(
-            red: Double((hex >> 16) & 0xFF) / 255,
-            green: Double((hex >> 8) & 0xFF) / 255,
-            blue: Double(hex & 0xFF) / 255
-        )
+    private var rowBackgroundColor: Color {
+        guard isSelected || isHovered else {
+            return .clear
+        }
+
+        return quickEffectAccentColor
+            .opacity(
+                isSelected ? 0.12 : 0.08
+            )
+    }
+
+    private var rowBorderColor: Color {
+        if isSelected {
+            return quickEffectAccentColor
+                .opacity(0.4)
+        }
+
+        if isHovered {
+            return quickEffectAccentColor
+                .opacity(0.25)
+        }
+
+        return Color.white.opacity(0.07)
     }
 }

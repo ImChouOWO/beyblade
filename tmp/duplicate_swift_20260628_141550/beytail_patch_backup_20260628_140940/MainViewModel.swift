@@ -15,6 +15,13 @@ final class MainViewModel: ObservableObject {
 
     @Published var selectedEffect: EffectType = .lightning {
         didSet {
+            guard EffectPurchaseStore.shared.isPurchased(selectedEffect) else {
+                if selectedEffect != .lightning {
+                    selectedEffect = .lightning
+                }
+                return
+            }
+
             trailEffectEngine.fadeDurationMs = selectedEffect.fadeDurationMs
             trailOverlayView.currentEffect = selectedEffect
         }
@@ -40,6 +47,17 @@ final class MainViewModel: ObservableObject {
     @Published private(set) var canReturnToCamera = false
 
     @Published private(set) var loadingText = ""
+
+    enum RecordingSaveState: Equatable {
+        case idle
+        case saving
+        case saved
+        case failed(String)
+    }
+
+    @Published private(set) var completedRecordingURL: URL?
+    @Published private(set) var isRecordingResultPresented = false
+    @Published private(set) var recordingSaveState: RecordingSaveState = .idle
 
     // MARK: - Components
 
@@ -1214,8 +1232,109 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        recordingManager.saveToPhotoLibrary(url: url) { success in
-            print("[RECORD] saveToPhotoLibrary:", success)
+        if let previousURL = completedRecordingURL,
+           previousURL != url,
+           FileManager.default.fileExists(atPath: previousURL.path) {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
+
+        completedRecordingURL = url
+        recordingSaveState = .idle
+        isRecordingResultPresented = true
+    }
+
+    func saveCompletedRecording() {
+        guard let url = completedRecordingURL else {
+            recordingSaveState = .failed("找不到錄影檔案")
+            return
+        }
+
+        guard recordingSaveState != .saving,
+              recordingSaveState != .saved else {
+            return
+        }
+
+        recordingSaveState = .saving
+
+        recordingManager.saveToPhotoLibrary(url: url) { [weak self] success in
+            guard let self else {
+                return
+            }
+
+            if success {
+                self.recordingSaveState = .saved
+                print("[RECORD] completed video saved to photo library")
+            } else {
+                self.recordingSaveState = .failed(
+                    "無法儲存影片，請檢查相簿權限"
+                )
+            }
+        }
+    }
+
+    func dismissRecordingResult() {
+        let url = completedRecordingURL
+
+        completedRecordingURL = nil
+        isRecordingResultPresented = false
+        recordingSaveState = .idle
+
+        guard let url,
+              FileManager.default.fileExists(atPath: url.path) else {
+            return
+        }
+
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            print(
+                "[RECORD] remove temporary file failed:",
+                error.localizedDescription
+            )
+        }
+    }
+
+    func rerecordCompletedVideo() {
+        guard activeEvent == nil else {
+            return
+        }
+
+        let hasCompletedVideo = completedRecordingURL != nil
+        dismissRecordingResult()
+
+        guard hasCompletedVideo else {
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            // 等待 Bottom Sheet 完成收合，避免 UI 與錄影狀態同時切換。
+            await self.sleepMilliseconds(350)
+
+            guard self.appMode == .cameraPreview,
+                  self.activeEvent == nil else {
+                return
+            }
+
+            self.startRecordingEvent()
+        }
+    }
+
+    func focusCamera(at devicePoint: CGPoint) {
+        guard !isUsingVideoFile,
+              !isSwitchingInputSource else {
+            return
+        }
+
+        switch appMode {
+        case .cameraPreview, .recording, .preparingRecording:
+            cameraManager.focus(at: devicePoint)
+
+        default:
+            break
         }
     }
 
@@ -1446,6 +1565,10 @@ final class MainViewModel: ObservableObject {
             from: buffer,
             orientation: orientation
         )
+
+        if recordingManager.isRecording {
+            recordingManager.append(sampleBuffer: buffer)
+        }
 
         inferenceEngine.processFrame(
             buffer,

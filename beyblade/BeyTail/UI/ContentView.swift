@@ -10,6 +10,15 @@ struct ContentView: View {
 
     @State private var showVideoPicker = false
 
+    // BEYTAIL_FEEDBACK_PATCH 2026.06.28-1
+    @AppStorage("hasShownEffectLongPressTip")
+    private var hasShownEffectLongPressTip = false
+
+    @AppStorage("effectMenuIDs")
+    private var effectMenuIDsRaw: String = ""
+
+    @State private var showEffectLongPressTip = false
+
     @AppStorage("is60FPSMode")
     private var is60FPSMode = false
 
@@ -53,6 +62,95 @@ struct ContentView: View {
         }
         .ignoresSafeArea()
         .allowsHitTesting(true)
+    }
+
+    // MARK: - Recognition / Recording Status
+
+    private var recognitionStatusLayer: some View {
+        GeometryReader { geometry in
+            let statusHeight: CGFloat = 30
+
+            recognitionStatusBar
+                .frame(height: statusHeight)
+                .position(
+                    x: geometry.size.width / 2,
+                    y: geometry.size.height
+                        - controlBarHeight
+                        - 10
+                        - statusHeight / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    private var recognitionStatusBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Image(
+                    systemName: vm.hasCompletedFirstInference
+                        ? "viewfinder.circle.fill"
+                        : "hourglass"
+                )
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(
+                    vm.hasCompletedFirstInference
+                        ? Color(hex: 0x00F5FF)
+                        : .yellow
+                )
+
+                Text(recognitionStatusText)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+            }
+
+            if vm.isRecording {
+                Rectangle()
+                    .fill(Color.white.opacity(0.18))
+                    .frame(width: 1, height: 14)
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 7, height: 7)
+
+                    Text(formatRecordingElapsed(vm.recordingElapsedSeconds))
+                        .font(
+                            .system(
+                                size: 11,
+                                weight: .bold,
+                                design: .monospaced
+                            )
+                        )
+                        .foregroundColor(.white)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.72))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.1), lineWidth: 1)
+                )
+        )
+        .rotationEffect(iconRotation)
+    }
+
+    private var recognitionStatusText: String {
+        guard vm.hasCompletedFirstInference else {
+            return "辨識準備中"
+        }
+
+        return "辨識到 \(vm.detectedBeybladeCount) 顆陀螺"
+    }
+
+    private func formatRecordingElapsed(_ seconds: Int) -> String {
+        let minutes = seconds / 60
+        let remainingSeconds = seconds % 60
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
 
     private var topBarLayer: some View {
@@ -103,7 +201,24 @@ struct ContentView: View {
     }
 
     private let effectMenuWidth: CGFloat = 220
-    private let effectMenuHeight: CGFloat = 360
+    private let maximumQuickEffectCount = 6
+
+    private var configuredQuickEffectCount: Int {
+        let storedCount = effectMenuIDsRaw
+            .split(separator: ",")
+            .count
+        let fallbackCount = EffectType.defaultMenuEffects.count
+        let count = storedCount == 0 ? fallbackCount : storedCount
+        return min(max(count, 1), maximumQuickEffectCount)
+    }
+
+    private var effectMenuHeight: CGFloat {
+        let count = configuredQuickEffectCount
+        let rowsHeight = CGFloat(count) * 50
+        let spacingHeight = CGFloat(max(count - 1, 0)) * 5
+        return 16 + rowsHeight + spacingHeight
+    }
+
     private let effectMenuGapToControlBar: CGFloat = 10
     private let effectMenuBottomPadding: CGFloat = 24
 
@@ -125,7 +240,7 @@ struct ContentView: View {
 
                 if vm.effectMenuVisible {
                     ZStack {
-                        EffectMenuView(
+                        QuickEffectMenuView(
                             selectedEffect: $vm.selectedEffect,
                             isVisible: $vm.effectMenuVisible,
                             dragLocation: effectDragLocation
@@ -134,7 +249,7 @@ struct ContentView: View {
                             width: effectMenuWidth,
                             height: effectMenuHeight
                         )
-                        .rotationEffect(.degrees(rotationDegrees))
+                        .rotationEffect(Angle.degrees(rotationDegrees))
                     }
                     .frame(
                         width: visualWidth,
@@ -236,7 +351,7 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
                 topBarLayer
-                hintLayer
+                recognitionStatusLayer
                 controlBarLayer
                 effectMenuLayer
                 settingsSheetLayer
@@ -299,16 +414,29 @@ struct ContentView: View {
                         vm: vm,
                         videoURL: videoURL
                     )
-                    .presentationDetents([.height(330)])
+                    .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
                     .interactiveDismissDisabled(vm.recordingSaveState == .saving)
                 }
+            }
+            .alert(
+                "操作提示",
+                isPresented: $showEffectLongPressTip
+            ) {
+                Button("知道了", role: .cancel) {}
+            } message: {
+                Text("長按可切換特效")
             }
             .onAppear {
                 UIDevice.current
                     .beginGeneratingDeviceOrientationNotifications()
 
                 updateIconRotation()
+
+                if !hasShownEffectLongPressTip {
+                    hasShownEffectLongPressTip = true
+                    showEffectLongPressTip = true
+                }
 
                 CameraFrameRateCoordinator.shared.bind(
                     to: vm.cameraManager
@@ -325,7 +453,7 @@ struct ContentView: View {
                 vm.cameraManager.updateVideoRotation()
                 vm.start()
             }
-            .onChange(of: scenePhase) { _, newPhase in
+            .onChange(of: scenePhase) { newPhase in
                 switch newPhase {
                 case .active:
                     if !showVideoPicker {
@@ -342,7 +470,7 @@ struct ContentView: View {
                     break
                 }
             }
-            .onChange(of: size) { _, newSize in
+            .onChange(of: size) { newSize in
                 vm.updatePreviewLayout(
                     overlaySize: newSize,
                     videoGravity: fixedVideoGravity
@@ -350,7 +478,7 @@ struct ContentView: View {
 
                 vm.cameraManager.updateVideoRotation()
             }
-            .onChange(of: is60FPSMode) { _, enabled in
+            .onChange(of: is60FPSMode) { enabled in
                 CameraFrameRateCoordinator.shared.set60FPSMode(
                     enabled
                 )
@@ -579,24 +707,8 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity)
 
-            VStack(spacing: 4) {
-                ZStack {
-                    VStack {
-                        
-                    }
-                    .rotationEffect(iconRotation)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 8)
-
-                    HStack {
-                        Spacer()
-
-                        effectButton
-                            .padding(.trailing, 8)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity)
+            effectButton
+                .frame(maxWidth: .infinity)
         }
         .frame(height: controlBarHeight)
         .background(Color(white: 0.05).opacity(0.95))
@@ -627,33 +739,38 @@ struct ContentView: View {
     // MARK: - Effect Button / Full-screen Drag
 
     private var effectButton: some View {
-        Text(vm.selectedEffect.emoji)
-            .font(.system(size: 24))
-            .frame(width: 52, height: 52)
-            .background(
-                Circle()
-                    .fill(Color(white: 0.08))
-                    .overlay(
-                        Circle()
-                            .stroke(
-                                Color(hex: 0x00F5FF)
-                                    .opacity(0.5),
-                                lineWidth: 1.5
-                            )
-                    )
-            )
-            .rotationEffect(iconRotation)
-            .contentShape(Circle())
-            .background(
-                GeometryReader { proxy in
-                    Color.clear
-                        .preference(
-                            key: EffectButtonFramePreferenceKey.self,
-                            value: proxy.frame(in: .global)
+        VStack(spacing: 4) {
+            Text(vm.selectedEffect.emoji)
+                .font(.system(size: 20))
+                .frame(width: 44, height: 44)
+                .background(
+                    Color(white: 1, opacity: 0.12)
+                        .cornerRadius(10)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(
+                                    Color(hex: 0x00F5FF).opacity(0.42),
+                                    lineWidth: 1
+                                )
                         )
-                }
-            )
-            .opacity(isBusy ? 0.45 : 1.0)
+                )
+
+            Text("特效庫")
+                .font(.system(size: 10))
+                .foregroundColor(Color(white: 0.5))
+        }
+        .rotationEffect(iconRotation)
+        .contentShape(Rectangle())
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(
+                        key: EffectButtonFramePreferenceKey.self,
+                        value: proxy.frame(in: .global)
+                    )
+            }
+        )
+        .opacity(isBusy ? 0.45 : 1.0)
     }
 
     private var effectScreenPressGesture: some Gesture {
@@ -879,6 +996,8 @@ private struct EffectLibraryPage: View {
         GridItem(.flexible(), spacing: 12)
     ]
 
+    private let maximumMenuEffectCount = 6
+
     private var ownedEffects: [EffectType] {
         EffectType.allCases.filter { purchaseStore.isPurchased($0) }
     }
@@ -922,7 +1041,9 @@ private struct EffectLibraryPage: View {
             await purchaseStore.loadProductsAndEntitlements()
             removeUnownedEffectsFromMenu()
         }
-        .onChange(of: purchaseStore.purchasedProductIDs) { _, _ in
+        .onChange(
+                of: purchaseStore.purchasedProductIDs
+            ) { _ in
             removeUnownedEffectsFromMenu()
         }
         .fullScreenCover(
@@ -1194,6 +1315,11 @@ private struct EffectLibraryPage: View {
                 selectedEffect = EffectType.defaultMenuEffects.first ?? .lightning
             }
         } else {
+            guard menuIDs.count < maximumMenuEffectCount else {
+                alertMessage = "長按快捷特效最多只能加入 6 個"
+                return
+            }
+
             menuIDs.insert(effect.rawValue)
             selectedEffect = effect
         }
@@ -1202,12 +1328,17 @@ private struct EffectLibraryPage: View {
     }
 
     private func removeUnownedEffectsFromMenu() {
-        let filtered = ids(from: effectMenuIDsRaw).filter { rawID in
-            guard let effect = EffectType(rawValue: rawID) else { return false }
-            return purchaseStore.isPurchased(effect)
-        }
+        let currentIDs = ids(from: effectMenuIDsRaw)
+        let filtered = EffectType.allCases
+            .filter { effect in
+                currentIDs.contains(effect.rawValue) &&
+                    purchaseStore.isPurchased(effect)
+            }
+            .prefix(maximumMenuEffectCount)
 
-        effectMenuIDsRaw = raw(from: Set(filtered))
+        effectMenuIDsRaw = filtered
+            .map(\.rawValue)
+            .joined(separator: ",")
 
         if !purchaseStore.isPurchased(selectedEffect) {
             selectedEffect = .lightning

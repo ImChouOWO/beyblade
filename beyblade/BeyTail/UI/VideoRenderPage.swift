@@ -601,7 +601,9 @@ struct VideoRenderPage: View {
 
     @MainActor
     private func prepareRenderInputURL(_ originalURL: URL) async throws -> URL {
-        guard isTrialMode else { return originalURL }
+        guard isTrialMode else {
+            return originalURL
+        }
 
         removeFileIfNeeded(trialInputURL)
         trialInputURL = nil
@@ -621,36 +623,41 @@ struct VideoRenderPage: View {
         }
 
         let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("beytail_trial_\(UUID().uuidString).mov")
+            .appendingPathComponent(
+                "beytail_trial_\(UUID().uuidString).mov"
+            )
 
         try? FileManager.default.removeItem(at: outputURL)
 
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = exportSession.supportedFileTypes.contains(.mov)
-            ? .mov
-            : exportSession.supportedFileTypes.first
+        guard exportSession.supportedFileTypes.contains(.mov) else {
+            throw makeError("目前影片不支援 MOV 輸出格式")
+        }
+
         exportSession.shouldOptimizeForNetworkUse = false
         exportSession.timeRange = CMTimeRange(
             start: .zero,
-            duration: CMTime(seconds: 10, preferredTimescale: 600)
+            duration: CMTime(
+                seconds: 10,
+                preferredTimescale: 600
+            )
         )
 
-        await withCheckedContinuation { continuation in
-            exportSession.exportAsynchronously {
-                continuation.resume()
-            }
-        }
+        do {
+            try await exportSession.export(
+                to: outputURL,
+                as: .mov
+            )
 
-        switch exportSession.status {
-        case .completed:
             trialInputURL = outputURL
             return outputURL
-
-        case .cancelled:
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: outputURL)
             throw makeError("已取消建立試用影片")
-
-        default:
-            throw exportSession.error ?? makeError("建立 10 秒試用影片失敗")
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw makeError(
+                "建立 10 秒試用影片失敗：\(error.localizedDescription)"
+            )
         }
     }
 
@@ -796,3 +803,22 @@ private struct VideoRenderShareSheet: UIViewControllerRepresentable {
         context: Context
     ) {}
 }
+
+// MARK: - Hex Color Support
+
+extension Color {
+    init(hex: Int, opacity: Double = 1.0) {
+        let red = Double((hex >> 16) & 0xFF) / 255.0
+        let green = Double((hex >> 8) & 0xFF) / 255.0
+        let blue = Double(hex & 0xFF) / 255.0
+
+        self.init(
+            .sRGB,
+            red: red,
+            green: green,
+            blue: blue,
+            opacity: opacity
+        )
+    }
+}
+

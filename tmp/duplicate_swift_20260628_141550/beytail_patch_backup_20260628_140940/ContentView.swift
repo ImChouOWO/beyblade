@@ -10,6 +10,11 @@ struct ContentView: View {
 
     @State private var showVideoPicker = false
 
+    @AppStorage("is60FPSMode")
+    private var is60FPSMode = false
+
+    @State private var showSettingsSheet = false
+
     @State private var iconRotation: Angle = .zero
     @State private var effectDragLocation: CGPoint?
 
@@ -28,6 +33,7 @@ struct ContentView: View {
 
     private let topBarHeight: CGFloat = 40
     private let topBarTopPadding: CGFloat = 10
+    private let uiAnimationDuration: Double = 0.25
 
     private var isBusy: Bool {
         vm.isVideoLoading || vm.isSwitchingInputSource
@@ -152,6 +158,36 @@ struct ContentView: View {
         .allowsHitTesting(vm.effectMenuVisible)
     }
 
+    // MARK: - Settings Sheet Addition
+
+    private var settingsSheetLayer: some View {
+        GeometryReader { _ in
+            ZStack(alignment: .bottom) {
+                if showSettingsSheet {
+                    Color.black.opacity(0.45)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            closeSettingsSheet()
+                        }
+
+                    SettingsSheetView(
+                        isPresented: $showSettingsSheet,
+                        is60FPSMode: $is60FPSMode,
+                        iconRotation: iconRotation,
+                        animationDuration: uiAnimationDuration
+                    )
+                    .transition(
+                        .move(edge: .bottom)
+                            .combined(with: .opacity)
+                    )
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(showSettingsSheet)
+        .zIndex(100)
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
@@ -169,7 +205,10 @@ struct ContentView: View {
                         CameraPreviewView(
                             session: vm.cameraManager.session,
                             videoGravity: videoGravity,
-                            isLandscape: isLandscape
+                            isLandscape: isLandscape,
+                            onFocus: { devicePoint in
+                                vm.focusCamera(at: devicePoint)
+                            }
                         )
                     }
                 }
@@ -200,6 +239,7 @@ struct ContentView: View {
                 hintLayer
                 controlBarLayer
                 effectMenuLayer
+                settingsSheetLayer
 
                 if isBusy {
                     busyOverlay
@@ -242,11 +282,40 @@ struct ContentView: View {
                 .preferredColorScheme(.dark)
                 .statusBarHidden(true)
             }
+            .sheet(
+                isPresented: Binding(
+                    get: {
+                        vm.isRecordingResultPresented
+                    },
+                    set: { isPresented in
+                        if !isPresented {
+                            vm.dismissRecordingResult()
+                        }
+                    }
+                )
+            ) {
+                if let videoURL = vm.completedRecordingURL {
+                    RecordingCompletionSheet(
+                        vm: vm,
+                        videoURL: videoURL
+                    )
+                    .presentationDetents([.height(330)])
+                    .presentationDragIndicator(.visible)
+                    .interactiveDismissDisabled(vm.recordingSaveState == .saving)
+                }
+            }
             .onAppear {
                 UIDevice.current
                     .beginGeneratingDeviceOrientationNotifications()
 
                 updateIconRotation()
+
+                CameraFrameRateCoordinator.shared.bind(
+                    to: vm.cameraManager
+                )
+                CameraFrameRateCoordinator.shared.set60FPSMode(
+                    is60FPSMode
+                )
 
                 vm.updatePreviewLayout(
                     overlaySize: size,
@@ -281,6 +350,11 @@ struct ContentView: View {
 
                 vm.cameraManager.updateVideoRotation()
             }
+            .onChange(of: is60FPSMode) { _, enabled in
+                CameraFrameRateCoordinator.shared.set60FPSMode(
+                    enabled
+                )
+            }
             .onReceive(
                 NotificationCenter.default.publisher(
                     for: UIDevice.orientationDidChangeNotification
@@ -297,22 +371,41 @@ struct ContentView: View {
 
     private func updateIconRotation() {
         let orientation = UIDevice.current.orientation
+        let targetRotation: Angle
 
         switch orientation {
         case .portrait:
-            iconRotation = .degrees(0)
+            targetRotation = .degrees(0)
 
         case .landscapeLeft:
-            iconRotation = .degrees(90)
+            targetRotation = .degrees(90)
 
         case .portraitUpsideDown:
-            iconRotation = .degrees(180)
+            targetRotation = .degrees(180)
 
         case .landscapeRight:
-            iconRotation = .degrees(-90)
+            targetRotation = .degrees(-90)
 
         default:
-            break
+            return
+        }
+
+        guard targetRotation != iconRotation else {
+            return
+        }
+
+        withAnimation(
+            .easeInOut(duration: uiAnimationDuration)
+        ) {
+            iconRotation = targetRotation
+        }
+    }
+
+    private func closeSettingsSheet() {
+        withAnimation(
+            .easeInOut(duration: uiAnimationDuration)
+        ) {
+            showSettingsSheet = false
         }
     }
 
@@ -349,7 +442,15 @@ struct ContentView: View {
             Spacer()
 
             Button {
-                // settings
+                guard !isBusy else {
+                    return
+                }
+
+                withAnimation(
+                    .easeInOut(duration: uiAnimationDuration)
+                ) {
+                    showSettingsSheet = true
+                }
             } label: {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16))
@@ -481,24 +582,7 @@ struct ContentView: View {
             VStack(spacing: 4) {
                 ZStack {
                     VStack {
-                        Text("\(vm.fps) FPS")
-                            .font(
-                                .system(
-                                    size: 11,
-                                    design: .monospaced
-                                )
-                            )
-                            .foregroundColor(.white)
-
-                        Text("[\(vm.hardwareLabel)]")
-                            .font(
-                                .system(
-                                    size: 11,
-                                    weight: .bold,
-                                    design: .monospaced
-                                )
-                            )
-                            .foregroundColor(vm.hardwareColor)
+                        
                     }
                     .rotationEffect(iconRotation)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -774,6 +858,7 @@ private struct EffectButtonFramePreferenceKey: PreferenceKey {
 
 // MARK: - Effect Library Page
 
+// BEYTAIL_STOREKIT_PATCH 2026.06.23-2
 private struct EffectLibraryPage: View {
 
     @Binding var selectedEffect: EffectType
@@ -781,11 +866,13 @@ private struct EffectLibraryPage: View {
 
     let rotation: Angle
 
-    @AppStorage("ownedEffectIDs")
-    private var ownedEffectIDsRaw: String = ""
+    @ObservedObject private var purchaseStore = EffectPurchaseStore.shared
 
     @AppStorage("effectMenuIDs")
     private var effectMenuIDsRaw: String = ""
+
+    @State private var trialEffect: EffectType?
+    @State private var alertMessage: String?
 
     private let columns = [
         GridItem(.flexible(), spacing: 12),
@@ -793,11 +880,15 @@ private struct EffectLibraryPage: View {
     ]
 
     private var ownedEffects: [EffectType] {
-        EffectType.allCases.filter { isOwned($0) }
+        EffectType.allCases.filter { purchaseStore.isPurchased($0) }
     }
 
     private var shopEffects: [EffectType] {
-        EffectType.shopEffects.filter { !isOwned($0) }
+        EffectType.shopEffects.filter { !purchaseStore.isPurchased($0) }
+    }
+
+    private var ownsAllPaidEffects: Bool {
+        EffectType.shopEffects.allSatisfy { purchaseStore.isPurchased($0) }
     }
 
     var body: some View {
@@ -826,8 +917,49 @@ private struct EffectLibraryPage: View {
                     )
             }
         }
-        .onAppear {
-            initializeDefaultStorageIfNeeded()
+        .task {
+            initializeDefaultMenuIfNeeded()
+            await purchaseStore.loadProductsAndEntitlements()
+            removeUnownedEffectsFromMenu()
+        }
+        .onChange(of: purchaseStore.purchasedProductIDs) { _, _ in
+            removeUnownedEffectsFromMenu()
+        }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { trialEffect != nil },
+                set: { presented in
+                    if !presented {
+                        trialEffect = nil
+                    }
+                }
+            )
+        ) {
+            if let trialEffect {
+                VideoRenderPage(
+                    initialEffect: trialEffect,
+                    trialEffect: trialEffect,
+                    onClose: {
+                        self.trialEffect = nil
+                    }
+                )
+                .ignoresSafeArea()
+                .preferredColorScheme(.dark)
+                .statusBarHidden(true)
+            }
+        }
+        .alert(
+            "特效商店",
+            isPresented: Binding(
+                get: { alertMessage != nil },
+                set: { presented in
+                    if !presented { alertMessage = nil }
+                }
+            )
+        ) {
+            Button("確定", role: .cancel) {}
+        } message: {
+            Text(alertMessage ?? "")
         }
     }
 
@@ -851,8 +983,13 @@ private struct EffectLibraryPage: View {
                                     effect: effect,
                                     isOwned: false,
                                     isInMenu: false,
-                                    onTap: {
-                                        buyEffect(effect)
+                                    displayPrice: purchaseStore.displayPrice(for: effect),
+                                    isBusy: purchaseStore.purchasingProductID == effect.productID,
+                                    onPrimary: {
+                                        purchase(effect)
+                                    },
+                                    onTrial: {
+                                        trialEffect = effect
                                     }
                                 )
                             }
@@ -867,9 +1004,12 @@ private struct EffectLibraryPage: View {
                                 effect: effect,
                                 isOwned: true,
                                 isInMenu: isInMenu(effect),
-                                onTap: {
+                                displayPrice: effect.isDefaultOwned ? "免費" : "已購買",
+                                isBusy: false,
+                                onPrimary: {
                                     toggleMenuEffect(effect)
-                                }
+                                },
+                                onTrial: nil
                             )
                         }
                     }
@@ -898,8 +1038,7 @@ private struct EffectLibraryPage: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 9)
                 .background(
-                    Capsule()
-                        .fill(Color.white.opacity(0.14))
+                    Capsule().fill(Color.white.opacity(0.14))
                 )
             }
 
@@ -911,8 +1050,29 @@ private struct EffectLibraryPage: View {
 
             Spacer()
 
-            Color.clear
-                .frame(width: 104, height: 1)
+            Button {
+                restorePurchases()
+            } label: {
+                HStack(spacing: 5) {
+                    if purchaseStore.isRestoring {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.75)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+
+                    Text("恢復")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .frame(width: 82, height: 36)
+                .background(
+                    Capsule().fill(Color.white.opacity(0.14))
+                )
+            }
+            .disabled(purchaseStore.isRestoring)
         }
         .padding(.horizontal, 16)
         .padding(.top, 18)
@@ -935,51 +1095,49 @@ private struct EffectLibraryPage: View {
                         .foregroundColor(.white.opacity(0.55))
                         .lineLimit(2)
 
-                    HStack(spacing: 8) {
-                        Text("原價 NT$120")
-                            .font(.system(size: 12))
-                            .strikethrough()
-                            .foregroundColor(.white.opacity(0.38))
-
-                        Text("NT$100")
-                            .font(.system(size: 20, weight: .black))
-                            .foregroundColor(Color(hex: 0x00F5FF))
-                    }
+                    Text(
+                        ownsAllPaidEffects
+                            ? "已擁有全部特效"
+                            : purchaseStore.premiumPackDisplayPrice
+                    )
+                    .font(.system(size: 20, weight: .black))
+                    .foregroundColor(Color(hex: 0x00F5FF))
                 }
 
                 Spacer()
             }
 
             Button {
-                buyLimitedPack()
+                purchaseLimitedPack()
             } label: {
-                Text("立即購買  省 NT$20")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(
-                        LinearGradient(
-                            colors: [
-                                Color(hex: 0xBF5FFF),
-                                Color(hex: 0x00F5FF)
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
+                HStack(spacing: 8) {
+                    if purchaseStore.purchasingProductID == EffectType.premiumPackProductID {
+                        ProgressView().tint(.white)
+                    }
+
+                    Text(ownsAllPaidEffects ? "已擁有" : "購買限定特效包")
+                        .font(.system(size: 15, weight: .bold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(
+                    LinearGradient(
+                        colors: [
+                            Color(hex: 0xBF5FFF),
+                            Color(hex: 0x00F5FF)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
                     )
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .disabled(
-                EffectType.shopEffects
-                    .allSatisfy { isOwned($0) }
+                ownsAllPaidEffects ||
+                purchaseStore.purchasingProductID != nil
             )
-            .opacity(
-                EffectType.shopEffects
-                    .allSatisfy { isOwned($0) }
-                    ? 0.45
-                    : 1.0
-            )
+            .opacity(ownsAllPaidEffects ? 0.45 : 1.0)
         }
         .padding(18)
         .background(
@@ -1001,26 +1159,16 @@ private struct EffectLibraryPage: View {
             .foregroundColor(.white.opacity(0.55))
     }
 
-    private func initializeDefaultStorageIfNeeded() {
-        if ownedEffectIDsRaw.isEmpty {
-            ownedEffectIDsRaw = EffectType.defaultOwnedEffects
-                .map(\.rawValue)
-                .joined(separator: ",")
-        }
+    private func initializeDefaultMenuIfNeeded() {
+        guard effectMenuIDsRaw.isEmpty else { return }
 
-        if effectMenuIDsRaw.isEmpty {
-            effectMenuIDsRaw = EffectType.defaultMenuEffects
-                .map(\.rawValue)
-                .joined(separator: ",")
-        }
+        effectMenuIDsRaw = EffectType.defaultMenuEffects
+            .map(\.rawValue)
+            .joined(separator: ",")
     }
 
     private func ids(from raw: String) -> Set<String> {
-        Set(
-            raw
-                .split(separator: ",")
-                .map(String.init)
-        )
+        Set(raw.split(separator: ",").map(String.init))
     }
 
     private func raw(from ids: Set<String>) -> String {
@@ -1030,40 +1178,12 @@ private struct EffectLibraryPage: View {
             .joined(separator: ",")
     }
 
-    private func isOwned(_ effect: EffectType) -> Bool {
-        if effect.isDefaultOwned {
-            return true
-        }
-
-        return ids(from: ownedEffectIDsRaw)
-            .contains(effect.rawValue)
-    }
-
     private func isInMenu(_ effect: EffectType) -> Bool {
-        ids(from: effectMenuIDsRaw)
-            .contains(effect.rawValue)
-    }
-
-    private func buyEffect(_ effect: EffectType) {
-        var ownedIDs = ids(from: ownedEffectIDsRaw)
-        ownedIDs.insert(effect.rawValue)
-        ownedEffectIDsRaw = raw(from: ownedIDs)
-    }
-
-    private func buyLimitedPack() {
-        var ownedIDs = ids(from: ownedEffectIDsRaw)
-
-        for effect in EffectType.shopEffects {
-            ownedIDs.insert(effect.rawValue)
-        }
-
-        ownedEffectIDsRaw = raw(from: ownedIDs)
+        ids(from: effectMenuIDsRaw).contains(effect.rawValue)
     }
 
     private func toggleMenuEffect(_ effect: EffectType) {
-        guard isOwned(effect) else {
-            return
-        }
+        guard purchaseStore.isPurchased(effect) else { return }
 
         var menuIDs = ids(from: effectMenuIDsRaw)
 
@@ -1071,8 +1191,7 @@ private struct EffectLibraryPage: View {
             menuIDs.remove(effect.rawValue)
 
             if selectedEffect == effect {
-                selectedEffect = EffectType.defaultMenuEffects.first
-                    ?? .lightning
+                selectedEffect = EffectType.defaultMenuEffects.first ?? .lightning
             }
         } else {
             menuIDs.insert(effect.rawValue)
@@ -1080,6 +1199,48 @@ private struct EffectLibraryPage: View {
         }
 
         effectMenuIDsRaw = raw(from: menuIDs)
+    }
+
+    private func removeUnownedEffectsFromMenu() {
+        let filtered = ids(from: effectMenuIDsRaw).filter { rawID in
+            guard let effect = EffectType(rawValue: rawID) else { return false }
+            return purchaseStore.isPurchased(effect)
+        }
+
+        effectMenuIDsRaw = raw(from: Set(filtered))
+
+        if !purchaseStore.isPurchased(selectedEffect) {
+            selectedEffect = .lightning
+        }
+    }
+
+    private func purchase(_ effect: EffectType) {
+        Task {
+            _ = await purchaseStore.purchase(effect)
+            if let message = purchaseStore.lastErrorMessage {
+                alertMessage = message
+            }
+        }
+    }
+
+    private func purchaseLimitedPack() {
+        Task {
+            _ = await purchaseStore.purchasePremiumPack()
+            if let message = purchaseStore.lastErrorMessage {
+                alertMessage = message
+            }
+        }
+    }
+
+    private func restorePurchases() {
+        Task {
+            let restored = await purchaseStore.restorePurchases()
+            if restored {
+                alertMessage = "購買紀錄已恢復"
+            } else if let message = purchaseStore.lastErrorMessage {
+                alertMessage = message
+            }
+        }
     }
 
     private static func contentSize(
@@ -1098,18 +1259,12 @@ private struct EffectLibraryPage: View {
 
     private static func isQuarterTurn(_ angle: Angle) -> Bool {
         let degrees = normalizedDegrees(angle.degrees)
-
-        return abs(degrees - 90) < 0.5 ||
-            abs(degrees - 270) < 0.5
+        return abs(degrees - 90) < 0.5 || abs(degrees - 270) < 0.5
     }
 
     private static func normalizedDegrees(_ degrees: Double) -> Double {
         var value = degrees.truncatingRemainder(dividingBy: 360)
-
-        if value < 0 {
-            value += 360
-        }
-
+        if value < 0 { value += 360 }
         return value
     }
 }
@@ -1119,15 +1274,23 @@ private struct EffectShopCard: View {
     let effect: EffectType
     let isOwned: Bool
     let isInMenu: Bool
-    let onTap: () -> Void
+    let displayPrice: String
+    let isBusy: Bool
+    let onPrimary: () -> Void
+    let onTrial: (() -> Void)?
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text(effect.emoji)
-                .font(.system(size: 34))
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(spacing: 10) {
+            HStack {
+                Text(effect.emoji)
+                    .font(.system(size: 34))
 
-            Spacer(minLength: 4)
+                Spacer()
+
+                Text(isOwned ? displayPrice : "付費")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white.opacity(0.62))
+            }
 
             Text(effect.displayName)
                 .font(.system(size: 17, weight: .black))
@@ -1135,53 +1298,73 @@ private struct EffectShopCard: View {
                 .multilineTextAlignment(.center)
 
             Text(effect.description)
-                .font(.system(size: 11))
+                .font(.system(size: 10))
                 .foregroundColor(.white.opacity(0.5))
                 .multilineTextAlignment(.center)
-                .lineLimit(2)
+                .lineLimit(3)
+                .frame(minHeight: 38)
 
-            Button(action: onTap) {
-                Text(buttonTitle)
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(buttonBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 9))
+            Spacer(minLength: 2)
+
+            Button(action: onPrimary) {
+                HStack(spacing: 6) {
+                    if isBusy {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.75)
+                    }
+
+                    Text(primaryTitle)
+                        .font(.system(size: 12, weight: .bold))
+                }
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .background(primaryBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+            }
+            .disabled(isBusy)
+
+            if let onTrial, !isOwned {
+                Button(action: onTrial) {
+                    Text("試用 10 秒")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(Color(hex: 0x00F5FF))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(0.065))
+                        .clipShape(RoundedRectangle(cornerRadius: 9))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 9)
+                                .stroke(Color(hex: 0x00F5FF).opacity(0.35), lineWidth: 1)
+                        )
+                }
             }
         }
         .padding(14)
-        .frame(height: 210)
+        .frame(height: isOwned ? 226 : 262)
         .background(
             RoundedRectangle(cornerRadius: 18)
                 .fill(Color.white.opacity(0.065))
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(
-                            Color.white.opacity(0.08),
-                            lineWidth: 1
-                        )
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
                 )
         )
     }
 
-    private var buttonTitle: String {
+    private var primaryTitle: String {
         if !isOwned {
-            return "NT$\(effect.price)"
+            return displayPrice
         }
 
-        return isInMenu
-            ? "從選單移除"
-            : "加入選單"
+        return isInMenu ? "從選單移除" : "加入選單"
     }
 
-    private var buttonBackground: LinearGradient {
+    private var primaryBackground: LinearGradient {
         if !isOwned {
             return LinearGradient(
-                colors: [
-                    Color(hex: 0xBF5FFF),
-                    Color(hex: 0x00F5FF)
-                ],
+                colors: [Color(hex: 0xBF5FFF), Color(hex: 0x00F5FF)],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -1189,10 +1372,7 @@ private struct EffectShopCard: View {
 
         if isInMenu {
             return LinearGradient(
-                colors: [
-                    Color.red.opacity(0.55),
-                    Color.red.opacity(0.35)
-                ],
+                colors: [Color.red.opacity(0.55), Color.red.opacity(0.35)],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -1216,6 +1396,7 @@ struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
     let videoGravity: AVLayerVideoGravity
     let isLandscape: Bool
+    let onFocus: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
         let view = CameraPreviewUIView()
@@ -1223,6 +1404,7 @@ struct CameraPreviewView: UIViewRepresentable {
         view.attachSession(session)
         view.setVideoGravity(videoGravity)
         view.setIsLandscape(isLandscape)
+        view.setFocusHandler(onFocus)
         return view
     }
 
@@ -1233,6 +1415,7 @@ struct CameraPreviewView: UIViewRepresentable {
         uiView.attachSession(session)
         uiView.setVideoGravity(videoGravity)
         uiView.setIsLandscape(isLandscape)
+        uiView.setFocusHandler(onFocus)
         uiView.setNeedsLayout()
     }
 
@@ -1240,6 +1423,7 @@ struct CameraPreviewView: UIViewRepresentable {
         _ uiView: CameraPreviewUIView,
         coordinator: ()
     ) {
+        uiView.setFocusHandler(nil)
         uiView.detachSession()
     }
 }
@@ -1248,6 +1432,17 @@ final class CameraPreviewUIView: UIView {
 
     private var isLandscape = false
     private var lastAppliedPreviewAngle: CGFloat = -1
+
+    private var onFocus: ((CGPoint) -> Void)?
+
+    private let focusIndicatorView = UIView(
+        frame: CGRect(
+            x: 0,
+            y: 0,
+            width: 72,
+            height: 72
+        )
+    )
 
     override static var layerClass: AnyClass {
         AVCaptureVideoPreviewLayer.self
@@ -1261,6 +1456,102 @@ final class CameraPreviewUIView: UIView {
         }
 
         return layer
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configureFocusInteraction()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureFocusInteraction()
+    }
+
+    private func configureFocusInteraction() {
+        isUserInteractionEnabled = true
+
+        let tapGesture = UITapGestureRecognizer(
+            target: self,
+            action: #selector(handleFocusTap(_:))
+        )
+
+        tapGesture.numberOfTapsRequired = 1
+        addGestureRecognizer(tapGesture)
+
+        focusIndicatorView.isUserInteractionEnabled = false
+        focusIndicatorView.backgroundColor = .clear
+        focusIndicatorView.layer.borderWidth = 1.5
+        focusIndicatorView.layer.borderColor =
+            UIColor.systemYellow.cgColor
+        focusIndicatorView.layer.cornerRadius = 5
+        focusIndicatorView.alpha = 0
+
+        addSubview(focusIndicatorView)
+    }
+
+    func setFocusHandler(
+        _ handler: ((CGPoint) -> Void)?
+    ) {
+        onFocus = handler
+    }
+
+    @objc
+    private func handleFocusTap(
+        _ recognizer: UITapGestureRecognizer
+    ) {
+        guard recognizer.state == .ended else {
+            return
+        }
+
+        let layerPoint = recognizer.location(in: self)
+
+        guard bounds.contains(layerPoint) else {
+            return
+        }
+
+        let devicePoint =
+            previewLayer.captureDevicePointConverted(
+                fromLayerPoint: layerPoint
+            )
+
+        showFocusIndicator(at: layerPoint)
+        onFocus?(devicePoint)
+    }
+
+    private func showFocusIndicator(
+        at point: CGPoint
+    ) {
+        focusIndicatorView.layer.removeAllAnimations()
+
+        focusIndicatorView.center = point
+        focusIndicatorView.alpha = 1
+        focusIndicatorView.transform = CGAffineTransform(
+            scaleX: 1.3,
+            y: 1.3
+        )
+
+        UIView.animate(
+            withDuration: 0.18,
+            delay: 0,
+            options: [
+                .curveEaseOut,
+                .beginFromCurrentState
+            ]
+        ) {
+            self.focusIndicatorView.transform = .identity
+        } completion: { _ in
+            UIView.animate(
+                withDuration: 0.25,
+                delay: 0.65,
+                options: [
+                    .curveEaseOut,
+                    .beginFromCurrentState
+                ]
+            ) {
+                self.focusIndicatorView.alpha = 0
+            }
+        }
     }
 
     func attachSession(_ session: AVCaptureSession) {

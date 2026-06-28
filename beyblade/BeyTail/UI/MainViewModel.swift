@@ -31,6 +31,12 @@ final class MainViewModel: ObservableObject {
 
     @Published private(set) var isRecording = false
     @Published private(set) var fps: Int = 0
+
+    // BEYTAIL_FEEDBACK_PATCH 2026.06.28-1
+    @Published private(set) var detectedBeybladeCount = 0
+    @Published private(set) var hasCompletedFirstInference = false
+    @Published private(set) var recordingElapsedSeconds = 0
+
     @Published private(set) var hardwareLabel = "MOCK"
     @Published private(set) var hardwareColor = Color(white: 0.6)
     @Published private(set) var cameraVideoRotationAngle: CGFloat = 0
@@ -141,6 +147,7 @@ final class MainViewModel: ObservableObject {
     private let minEventInterval: TimeInterval = 0.45
 
     private var hintTask: Task<Void, Never>?
+    private var recordingTimerTask: Task<Void, Never>?
 
     private var isStartingCameraPreview = false
     private var hasRequestedInitialCameraPreview = false
@@ -413,6 +420,9 @@ final class MainViewModel: ObservableObject {
         hintTask?.cancel()
         hintTask = nil
 
+        stopRecordingTimer(resetElapsed: true)
+        resetDetectionStatus()
+
         cameraManager.onFrame = nil
         cameraManager.stop()
 
@@ -442,6 +452,9 @@ final class MainViewModel: ObservableObject {
     // MARK: - Inference Result
 
     private func applyTrackedResults(_ tracked: [DetectionResult]) {
+        hasCompletedFirstInference = true
+        detectedBeybladeCount = tracked.count
+
         guard !tracked.isEmpty else {
             fps = Int(inferenceEngine.currentFps)
             trailOverlayView.debugBoundingBoxes = []
@@ -458,9 +471,8 @@ final class MainViewModel: ObservableObject {
             mapDetectionToOverlaySpace($0)
         }
 
-        trailOverlayView.debugBoundingBoxes = mappedResults.map {
-            ($0.displayRect, $0.trackId)
-        }
+        // 上線版不顯示辨識框；mappedResults 仍保留給軌跡特效使用。
+        trailOverlayView.debugBoundingBoxes = []
 
         logDetectedObjects(
             rawDetections: tracked,
@@ -1166,6 +1178,7 @@ final class MainViewModel: ObservableObject {
         guard success else {
             print("[RECORD] start failed")
 
+            stopRecordingTimer(resetElapsed: true)
             recordingManager.forceReset()
             appMode = .cameraPreview
             finishEvent()
@@ -1174,6 +1187,7 @@ final class MainViewModel: ObservableObject {
 
         print("[RECORD] recording started")
 
+        startRecordingTimer()
         appMode = .recording
         finishEvent()
     }
@@ -1192,6 +1206,8 @@ final class MainViewModel: ObservableObject {
         ) else {
             return
         }
+
+        stopRecordingTimer(resetElapsed: false)
 
         Task { @MainActor [weak self] in
             guard let self else {
@@ -1214,6 +1230,7 @@ final class MainViewModel: ObservableObject {
 
         print("[RECORD] stopped:", url?.path ?? "nil")
 
+        stopRecordingTimer(resetElapsed: false)
         recordingManager.forceReset()
 
         if appMode == .recording ||
@@ -1485,6 +1502,7 @@ final class MainViewModel: ObservableObject {
             tracker.reset()
             trailEffectEngine.clear()
             trailOverlayView.debugBoundingBoxes = []
+            resetDetectionStatus()
         }
 
         effectMenuVisible = false
@@ -1584,6 +1602,49 @@ final class MainViewModel: ObservableObject {
 
         await Task.yield()
         await sleepMilliseconds(180)
+    }
+
+    // MARK: - Recognition / Recording Timer Helpers
+
+    private func resetDetectionStatus() {
+        detectedBeybladeCount = 0
+        hasCompletedFirstInference = false
+    }
+
+    private func startRecordingTimer() {
+        stopRecordingTimer(resetElapsed: true)
+
+        let startedAt = Date()
+
+        recordingTimerTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else {
+                    return
+                }
+
+                self.recordingElapsedSeconds = max(
+                    0,
+                    Int(Date().timeIntervalSince(startedAt))
+                )
+
+                do {
+                    try await Task.sleep(
+                        nanoseconds: 200_000_000
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopRecordingTimer(resetElapsed: Bool) {
+        recordingTimerTask?.cancel()
+        recordingTimerTask = nil
+
+        if resetElapsed {
+            recordingElapsedSeconds = 0
+        }
     }
 
     // MARK: - UI Helpers

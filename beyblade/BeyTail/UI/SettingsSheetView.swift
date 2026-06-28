@@ -147,7 +147,13 @@ struct SettingsSheetView: View {
 
             Toggle("", isOn: $is60FPSMode)
                 .labelsHidden()
-                .tint(Color(hex: 0x00E5FF))
+                .tint(
+                    Color(
+                        red: 0.0,
+                        green: 229.0 / 255.0,
+                        blue: 1.0
+                    )
+                )
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 17)
@@ -207,7 +213,12 @@ struct SettingsSheetView: View {
                     .frame(width: 38, height: 38)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(hex: 0x00E5FF))
+                            .fill(Color(
+                                red: 0.0,
+                                green: 229.0 / 255.0,
+                                blue: 1.0
+                            )
+                        )
                     )
                     .rotationEffect(iconRotation)
 
