@@ -2,6 +2,17 @@ import SwiftUI
 @preconcurrency import AVFoundation
 import UIKit
 
+private struct RecognitionStatusSizePreferenceKey: PreferenceKey {
+    static let defaultValue: CGSize = .zero
+
+    static func reduce(
+        value: inout CGSize,
+        nextValue: () -> CGSize
+    ) {
+        value = nextValue()
+    }
+}
+
 struct ContentView: View {
 
     @Environment(\.scenePhase) private var scenePhase
@@ -25,6 +36,14 @@ struct ContentView: View {
     @State private var showSettingsSheet = false
 
     @State private var iconRotation: Angle = .zero
+
+    // MARK: - Recognition status orientation transition
+    @State private var recognitionStatusRotation: Angle = .zero
+    @State private var recognitionStatusTargetRotation: Angle = .zero
+    @State private var recognitionStatusOpacity: Double = 1.0
+    @State private var recognitionStatusSize: CGSize = .zero
+    @State private var hasInitializedRecognitionStatusOrientation = false
+    @State private var recognitionStatusTransitionTask: Task<Void, Never>?
     @State private var effectDragLocation: CGPoint?
 
     @State private var showEffectLibraryPage = false
@@ -69,15 +88,55 @@ struct ContentView: View {
     private var recognitionStatusLayer: some View {
         GeometryReader { geometry in
             let statusHeight: CGFloat = 30
+            let edgeSpacing: CGFloat = 10
+
+            let isLandscapeStatus = isEffectMenuQuarterTurn(
+                recognitionStatusRotation.degrees
+            )
+
+            /*
+             rotationEffect 不會改變 SwiftUI 的排版尺寸。
+
+             橫置時，提示膠囊旋轉 90 度，因此畫面上的寬度會等於
+             旋轉前的高度。使用量測結果可以讓提示框的視覺邊緣
+             與直立座標系的右側邊界維持 10 pt 距離。
+             */
+            let measuredWidth = max(
+                recognitionStatusSize.width,
+                statusHeight
+            )
+            let measuredHeight = max(
+                recognitionStatusSize.height,
+                statusHeight
+            )
+
+            let visualWidth = isLandscapeStatus
+                ? measuredHeight
+                : measuredWidth
+
+            // 直立時維持原本位於 Control Bar 上方的位置。
+            let portraitX = geometry.size.width / 2
+            let portraitY = geometry.size.height
+                - controlBarHeight
+                - edgeSpacing
+                - statusHeight / 2
+
+            // 橫置時的「上方」使用直立座標系的右側邊界。
+            let landscapeX = geometry.size.width
+                - edgeSpacing
+                - visualWidth / 2
+            let landscapeY = geometry.size.height / 2
 
             recognitionStatusBar
                 .frame(height: statusHeight)
+                .opacity(recognitionStatusOpacity)
                 .position(
-                    x: geometry.size.width / 2,
-                    y: geometry.size.height
-                        - controlBarHeight
-                        - 10
-                        - statusHeight / 2
+                    x: isLandscapeStatus
+                        ? landscapeX
+                        : portraitX,
+                    y: isLandscapeStatus
+                        ? landscapeY
+                        : portraitY
                 )
         }
         .ignoresSafeArea()
@@ -136,7 +195,21 @@ struct ContentView: View {
                         .stroke(Color.white.opacity(0.1), lineWidth: 1)
                 )
         )
-        .rotationEffect(iconRotation)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .preference(
+                        key: RecognitionStatusSizePreferenceKey.self,
+                        value: proxy.size
+                    )
+            }
+        }
+        .onPreferenceChange(
+            RecognitionStatusSizePreferenceKey.self
+        ) { newSize in
+            recognitionStatusSize = newSize
+        }
+        .rotationEffect(recognitionStatusRotation)
     }
 
     private var recognitionStatusText: String {
@@ -243,7 +316,8 @@ struct ContentView: View {
                         QuickEffectMenuView(
                             selectedEffect: $vm.selectedEffect,
                             isVisible: $vm.effectMenuVisible,
-                            dragLocation: effectDragLocation
+                            dragLocation: effectDragLocation,
+                            rotation: Angle.degrees(rotationDegrees)
                         )
                         .frame(
                             width: effectMenuWidth,
@@ -453,6 +527,10 @@ struct ContentView: View {
                 vm.cameraManager.updateVideoRotation()
                 vm.start()
             }
+            .onDisappear {
+                recognitionStatusTransitionTask?.cancel()
+                recognitionStatusTransitionTask = nil
+            }
             .onChange(of: scenePhase) { newPhase in
                 switch newPhase {
                 case .active:
@@ -518,15 +596,85 @@ struct ContentView: View {
             return
         }
 
-        guard targetRotation != iconRotation else {
+        // 其他控制項維持原本的旋轉動畫。
+        if !isSameRotation(iconRotation, targetRotation) {
+            withAnimation(
+                .easeInOut(duration: uiAnimationDuration)
+            ) {
+                iconRotation = targetRotation
+            }
+        }
+
+        // 辨識提示使用「淡出 -> 換位與旋轉 -> 淡入」。
+        transitionRecognitionStatus(to: targetRotation)
+    }
+
+    private func transitionRecognitionStatus(
+        to targetRotation: Angle
+    ) {
+        if !hasInitializedRecognitionStatusOrientation {
+            recognitionStatusRotation = targetRotation
+            recognitionStatusTargetRotation = targetRotation
+            recognitionStatusOpacity = 1.0
+            hasInitializedRecognitionStatusOrientation = true
             return
         }
 
-        withAnimation(
-            .easeInOut(duration: uiAnimationDuration)
-        ) {
-            iconRotation = targetRotation
+        guard !isSameRotation(
+            recognitionStatusTargetRotation,
+            targetRotation
+        ) else {
+            return
         }
+
+        recognitionStatusTargetRotation = targetRotation
+        recognitionStatusTransitionTask?.cancel()
+
+        let fadeDuration = uiAnimationDuration
+
+        recognitionStatusTransitionTask = Task { @MainActor in
+            // 先在舊位置淡出。
+            withAnimation(
+                .easeOut(duration: fadeDuration)
+            ) {
+                recognitionStatusOpacity = 0
+            }
+
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(
+                        fadeDuration * 1_000_000_000
+                    )
+                )
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            // 完全透明後，切換位置及文字方向。
+            recognitionStatusRotation = targetRotation
+
+            // 在新位置淡入。
+            withAnimation(
+                .easeIn(duration: fadeDuration)
+            ) {
+                recognitionStatusOpacity = 1
+            }
+        }
+    }
+
+    private func isSameRotation(
+        _ lhs: Angle,
+        _ rhs: Angle
+    ) -> Bool {
+        let lhsValue = normalizedEffectMenuDegrees(lhs.degrees)
+        let rhsValue = normalizedEffectMenuDegrees(rhs.degrees)
+        let difference = abs(lhsValue - rhsValue)
+
+        return difference < 0.5 || abs(difference - 360) < 0.5
     }
 
     private func closeSettingsSheet() {

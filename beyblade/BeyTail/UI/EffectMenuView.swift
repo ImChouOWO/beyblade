@@ -26,6 +26,9 @@ struct QuickEffectMenuView: View {
     /// ContentView 傳入的全螢幕 global 手指位置。
     var dragLocation: CGPoint? = nil
 
+    /// ContentView 套用到快速選單的視覺旋轉角度。
+    var rotation: Angle = .zero
+
     @AppStorage("effectMenuIDs")
     private var effectMenuIDsRaw: String = ""
 
@@ -298,6 +301,26 @@ struct QuickEffectMenuView: View {
             ?? .lightning
     }
 
+    private var normalizedRotationDegrees: Double {
+        var degrees = rotation.degrees
+            .truncatingRemainder(dividingBy: 360)
+
+        if degrees < 0 {
+            degrees += 360
+        }
+
+        return degrees
+    }
+
+    private func squaredDistance(
+        from point: CGPoint,
+        to frame: CGRect
+    ) -> CGFloat {
+        let dx = frame.midX - point.x
+        let dy = frame.midY - point.y
+        return dx * dx + dy * dy
+    }
+
     private func updateSelectionByDragLocation(
         _ location: CGPoint?
     ) {
@@ -311,44 +334,50 @@ struct QuickEffectMenuView: View {
             return
         }
 
-        let visibleMenuFrame =
-            menuFrame.insetBy(
-                dx: 0,
-                dy: -4
-            )
+        let visibleMenuFrame = menuFrame.insetBy(
+            dx: -4,
+            dy: -4
+        )
 
         let visibleRows = rowFrames.filter {
             $0.value.intersects(visibleMenuFrame)
         }
 
-        let candidates =
-            visibleRows.isEmpty
+        let candidates = visibleRows.isEmpty
             ? rowFrames
             : visibleRows
 
-        let targetY: CGFloat
+        let targetPoint: CGPoint
 
         if menuFrame.isEmpty {
-            targetY = location.y
+            targetPoint = location
         } else {
-            targetY = min(
-                max(
-                    location.y,
-                    menuFrame.minY + 1
+            targetPoint = CGPoint(
+                x: min(
+                    max(location.x, menuFrame.minX + 1),
+                    menuFrame.maxX - 1
                 ),
-                menuFrame.maxY - 1
+                y: min(
+                    max(location.y, menuFrame.minY + 1),
+                    menuFrame.maxY - 1
+                )
             )
         }
 
-        let nearestEffect =
-            candidates.min {
-                lhs,
-                rhs in
+        let nearestEffect = candidates.min {
+            lhs,
+            rhs in
 
-                abs(lhs.value.midY - targetY)
-                    <
-                    abs(rhs.value.midY - targetY)
-            }?.key
+            squaredDistance(
+                from: targetPoint,
+                to: lhs.value
+            )
+            <
+            squaredDistance(
+                from: targetPoint,
+                to: rhs.value
+            )
+        }?.key
 
         guard let nearestEffect,
               menuEffects.contains(nearestEffect) else {
@@ -372,13 +401,56 @@ struct QuickEffectMenuView: View {
             return
         }
 
-        if location.y <= menuFrame.minY + autoScrollEdgeSize {
-            autoScrollDirection = .up
-            return
-        }
+        let degrees = normalizedRotationDegrees
+        let isZero =
+            abs(degrees - 0) < 0.5 ||
+            abs(degrees - 360) < 0.5
+        let isNinety = abs(degrees - 90) < 0.5
+        let isOneEighty = abs(degrees - 180) < 0.5
+        let isTwoSeventy = abs(degrees - 270) < 0.5
 
-        if location.y >= menuFrame.maxY - autoScrollEdgeSize {
-            autoScrollDirection = .down
+        if isNinety {
+            if location.x >= menuFrame.maxX - autoScrollEdgeSize {
+                autoScrollDirection = .up
+                return
+            }
+
+            if location.x <= menuFrame.minX + autoScrollEdgeSize {
+                autoScrollDirection = .down
+                return
+            }
+        } else if isTwoSeventy {
+            if location.x <= menuFrame.minX + autoScrollEdgeSize {
+                autoScrollDirection = .up
+                return
+            }
+
+            if location.x >= menuFrame.maxX - autoScrollEdgeSize {
+                autoScrollDirection = .down
+                return
+            }
+        } else if isOneEighty {
+            if location.y >= menuFrame.maxY - autoScrollEdgeSize {
+                autoScrollDirection = .up
+                return
+            }
+
+            if location.y <= menuFrame.minY + autoScrollEdgeSize {
+                autoScrollDirection = .down
+                return
+            }
+        } else if isZero {
+            if location.y <= menuFrame.minY + autoScrollEdgeSize {
+                autoScrollDirection = .up
+                return
+            }
+
+            if location.y >= menuFrame.maxY - autoScrollEdgeSize {
+                autoScrollDirection = .down
+                return
+            }
+        } else {
+            autoScrollDirection = nil
             return
         }
 
