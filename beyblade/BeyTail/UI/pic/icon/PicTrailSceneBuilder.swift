@@ -1,14 +1,116 @@
 import UIKit
 import simd
 
+//
+//  PicTrailSceneBuilder.swift
+//
+//  iOS 端特效幾何產生器（已對齊 Android GLEffect 視覺）。
+//
+//  設計重點
+//  ───────────────────────────────────────────────────────────────────────
+//  • 對外進入點 `build(effect:trackData:debugBoundingBoxes:viewportSize:now:)`
+//    與既有版本完全相同，PicTrailMetalRenderCore / 錄影 / 離線三條路徑都不需改動。
+//  • Android 每個特效是獨立 GL program + 有狀態粒子池；本檔在 builder 內維護一個
+//    跨幀粒子池（builder 實例存活於 render core 整個生命週期），還原火星 / 碎片 /
+//    金幣 / 葉片等真實速度、重力、衰減物理。
+//  • Android 拖尾顏色一律取陀螺偵測色（pts.last().color）再依特效提飽和 / 提亮；
+//    本檔比照辦理（含 Money）。
+//  • DeathRay 等需要 additive 過載的特效，在現有 alpha-over 管線上以「白芯高 alpha
+//    堆疊 + 提亮」模擬過載，避免侵入 render core 的 pipeline 狀態。
+//
+//  座標慣例轉換
+//  ───────────────────────────────────────────────────────────────────────
+//  • Android：NDC（-1..1）、y 向上、head = pts.last。
+//  • iOS：像素座標、y 向下、head = samples.last（alpha 高）。
+//  本檔一律在 iOS 像素空間運算；凡 Android 以 NDC 表示的尺寸（如 0.03f 半寬）皆乘以
+//  參考短邊換算成像素，使粗細與 Android 視覺一致。
+//
+
 final class PicTrailSceneBuilder {
 
-    private struct Sample {
-        var position: SIMD2<Float>
-        var alpha: Float
+    // MARK: - 取樣點
+
+    fileprivate struct Sample {
+        var position: SIMD2<Float>   // 像素座標，y 向下
+        var alpha: Float             // life：head≈1，tail≈0
         var color: UIColor
         var timestamp: TimeInterval
     }
+
+    // MARK: - 跨幀粒子池
+
+    /// 通用粒子：涵蓋火星 / 碎片 / 金幣 / 葉片 / 火球 / 霧氣 / 火環 / 墨滴等。
+    /// 速度單位由 ndcVelocity 決定：true=NDC/幀（Wave），false=像素/幀（其餘）。
+    fileprivate final class Particle {
+        var active = false
+        var x: Float = 0, y: Float = 0        // NDC（-1..1, y 向上），與 Android 一致
+        var vx: Float = 0, vy: Float = 0
+        var ndcVelocity = false                // 速度單位旗標
+        var size: Float = 0                    // 像素（sprite 直徑或長邊 / 多邊形 basePx）
+        var aspect: Float = 1                  // 長寬比（葉片 lenPx×widPx）
+        var angle: Float = 0
+        var spin: Float = 0                    // angle 每幀增量（angVel）
+        var flip: Float = 0                    // 立體翻面相位（金幣）
+        var flipVel: Float = 0
+        var alpha: Float = 0
+        var decay: Float = 0.06
+        var grow: Float = 0                    // 每幀尺寸倍率增量
+        var gravity: Float = 0                 // 像素/幀²（往畫面下 = NDC y 變小）
+        var drag: Float = 0                    // 每幀速度衰減比例
+        var r: Float = 1, g: Float = 1, b: Float = 1
+        var style: PicSpriteStyle = .softCircle
+        var life: Float = 0                    // 已存活幀數
+        var maxLife: Float = 0                 // >0 時以 life/maxLife 控制（InkWash drop）
+        var seed: Float = 0
+        // 多邊形（Ice shard / Crimson fireball）：頂點偏移（像素，未旋轉），vcount 0=非多邊形
+        var vcount = 0
+        var ox = [Float](repeating: 0, count: 6)
+        var oy = [Float](repeating: 0, count: 6)
+        // streak（Money/Blade spark）：以速度方向拉長
+        var streak = false
+        var streakHalfPx: Float = 2
+        // orbital（DeathRay 漩渦）：繞核心極座標收斂
+        var orbital = false
+        var cx: Float = 0, cy: Float = 0      // 核心 NDC
+        var orbRadiusPx: Float = 0            // 距核心半徑（像素）
+        var orbSpawnRadiusPx: Float = 1
+        var orbAngVel: Float = 0
+        var orbInVelPx: Float = 0
+    }
+
+    fileprivate final class Ripple {
+        var active = false
+        var x: Float = 0, y: Float = 0
+        var radius: Float = 0
+        var maxRadius: Float = 0
+        var alpha: Float = 0
+        var grow: Float = 5          // 像素/幀
+        var r: Float = 1, g: Float = 1, b: Float = 1
+        var style: PicSpriteStyle = .ring
+    }
+
+    private var particles: [Particle]
+    private var ripples: [Ripple]
+
+    /// 每條 track 上一幀的頭部位置（節流 spawn 用），key = trackID。
+    private var lastHeadPosition: [Int: SIMD2<Float>] = [:]
+
+    /// 上一幀時間戳，用來推導 dtScale（60fps 時 ≈ 0.5）。
+    private var lastFrameTime: TimeInterval = 0
+
+    /// 連續性累加器（用於以「每秒 N 顆」方式穩定 spawn）。
+    private var spawnAccumulators: [String: Float] = [:]
+
+    /// 目前視窗半寬高（粒子 NDC↔像素換算用），每幀於 build 開頭更新。
+    private var vwHalf: Float = 1
+    private var vhHalf: Float = 1
+
+    init(particleCapacity: Int = 1024, rippleCapacity: Int = 48) {
+        particles = (0..<particleCapacity).map { _ in Particle() }
+        ripples = (0..<rippleCapacity).map { _ in Ripple() }
+    }
+
+    // MARK: - 進入點（簽名與舊版完全相同）
 
     func build(
         effect: EffectType,
@@ -23,1095 +125,95 @@ final class PicTrailSceneBuilder {
             return geometry
         }
 
-        for trackID in trackData.keys.sorted() {
-            guard let points = trackData[trackID], points.count >= 2 else {
-                continue
-            }
+        let width = Float(viewportSize.width)
+        let height = Float(viewportSize.height)
+        let minDim = min(width, height)
+        vwHalf = max(width * 0.5, 1)
+        vhHalf = max(height * 0.5, 1)
 
-            let samples = makeSamples(points, viewportSize: viewportSize)
+        // dtScale：以 60fps 為基準時 ≈ 0.5；首幀或長間隔時夾在合理範圍。
+        let rawDelta = lastFrameTime > 0 ? Float(now - lastFrameTime) : (1.0 / 60.0)
+        let dtScale = clamp(rawDelta / (1.0 / 30.0), 0.2, 2.0)
+        lastFrameTime = now
+
+        let timeF = Float(now.truncatingRemainder(dividingBy: 4_096))
+
+        // 預先把所有 track 轉成像素空間取樣點。
+        var sampleByTrack: [Int: [Sample]] = [:]
+        for (trackID, points) in trackData where points.count >= 2 {
+            sampleByTrack[trackID] = makeSamples(points, width: width, height: height)
+        }
+
+        // ── 先更新並繪製既有跨幀粒子 / 漣漪（在拖尾下層或上層依特效而定） ──
+        // 多數特效粒子畫在拖尾「之後」（火星、碎片飛在尾跡前方）。
+        // 少數（haze / 年輪 / 漆塊）需墊底，於各 build* 內以順序控制。
+
+        // ── 逐 track 產生本幀幾何並 spawn 新粒子 ──
+        for trackID in sampleByTrack.keys.sorted() {
+            guard let samples = sampleByTrack[trackID], samples.count >= 2 else { continue }
 
             switch effect {
             case .lightning:
-                buildLightning(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
+                buildLightning(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                               minDim: minDim, geometry: &geometry)
             case .fire:
-                buildFire(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
+                buildFire(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                          minDim: minDim, geometry: &geometry)
             case .stardust:
-                buildStardust(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
+                buildStardust(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                              minDim: minDim, geometry: &geometry)
             case .wave:
-                buildWave(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .thunder:
-                buildMoney(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .vortex:
-                buildBlade(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .dark:
-                buildIce(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .crimson:
-                buildCrimson(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .deathRay:
-                buildDeathRay(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .emerald:
-                buildEmerald(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .inkWash:
-                buildInkWash(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
-
-            case .spray:
-                buildSprayPaint(
-                    samples,
-                    trackID: trackID,
-                    now: now,
-                    geometry: &geometry
-                )
+                buildWave(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                          minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .thunder:   // → Money 金錢衝擊
+                buildMoney(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                           minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .vortex:    // → Blade 爆刃亂舞
+                buildBlade(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                           minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .dark:      // → IceShatter 狂暴冰裂
+                buildIce(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                         minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .crimson:   // → CrimsonLotus 紅蓮破滅
+                buildCrimson(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                             minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .deathRay:  // → DeathRay 破壞死光
+                buildDeathRay(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                              minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .emerald:   // → Emerald 翡翠破壞
+                buildEmerald(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                             minDim: minDim, width: width, height: height, geometry: &geometry)
+            case .inkWash:   // → InkWash 水墨橫空
+                buildInkWash(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                             minDim: minDim, geometry: &geometry)
+            case .spray:     // → SprayPaint 噴漆塗鴉
+                buildSprayPaint(samples, trackID: trackID, now: timeF, dtScale: dtScale,
+                                minDim: minDim, width: width, height: height, geometry: &geometry)
             }
         }
 
-        appendDebugBoxes(
-            debugBoundingBoxes,
-            viewportSize: viewportSize,
-            geometry: &geometry
-        )
+        // ── 統一推進並輸出跨幀粒子 / 漣漪 ──
+        updateParticles(dtScale: dtScale, width: width, height: height)
+        updateRipples(dtScale: dtScale)
+        appendParticleSprites(into: &geometry)
+        appendRippleSprites(into: &geometry, width: width, height: height)
+
+        appendDebugBoxes(debugBoundingBoxes, width: width, height: height, geometry: &geometry)
 
         return geometry
     }
 
-    // MARK: - Effect builders
-
-    private func buildLightning(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let yellow = rgba(UIColor(hex: 0xFFFF55))
-        let white = SIMD4<Float>(1, 1, 0.92, 1)
-
-        appendRibbon(
-            samples,
-            width: 30,
-            baseColor: yellow,
-            usePointColor: false,
-            style: .lightning,
-            alphaScale: 0.22,
-            wobble: 7,
-            phase: Float(now * 18) + Float(trackID),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 20,
-            baseColor: yellow,
-            usePointColor: false,
-            style: .lightning,
-            alphaScale: 0.78,
-            wobble: 4,
-            phase: Float(now * 22) + Float(trackID) * 0.7,
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 25,
-            baseColor: white,
-            usePointColor: false,
-            style: .lightning,
-            alphaScale: 0.95,
-            wobble: 2,
-            phase: Float(now * 25),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in stride(from: 1, to: samples.count, by: 3) {
-            let sample = samples[index]
-            let seed = random01(trackID, index)
-            let age = 1 - sample.alpha
-            let angle = seed * .pi * 2
-            let drift = age * 32
-            let center = sample.position + unit(angle) * drift
-
-            appendSprite(
-                center: center,
-                size: SIMD2(12 + seed * 11, 12 + seed * 11),
-                color: withAlpha(white, sample.alpha * 0.85),
-                style: .spark,
-                rotation: angle + Float(now) * 2,
-                seed: seed,
-                age: age,
-                geometry: &geometry
-            )
-        }
-    }
-
-    private func buildFire(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let red = rgba(UIColor(hex: 0xFF2A12))
-        let orange = rgba(UIColor(hex: 0xFF9A24))
-        let pale = rgba(UIColor(hex: 0xFFF1A8))
-
-        appendRibbon(
-            samples,
-            width: 34,
-            baseColor: red,
-            usePointColor: false,
-            style: .fire,
-            alphaScale: 0.26,
-            wobble: 6,
-            phase: Float(now * 7),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 15,
-            baseColor: orange,
-            usePointColor: false,
-            style: .fire,
-            alphaScale: 0.72,
-            wobble: 4,
-            phase: Float(now * 10) + 1.7,
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 4,
-            baseColor: pale,
-            usePointColor: false,
-            style: .fire,
-            alphaScale: 0.8,
-            wobble: 2,
-            phase: Float(now * 12),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in stride(from: 1, to: samples.count, by: 2) {
-            let sample = samples[index]
-            let seed = random01(trackID * 13, index)
-            let age = 1 - sample.alpha
-            let center = sample.position + SIMD2(
-                (seed - 0.5) * 26 * age,
-                -age * (22 + seed * 38)
-            )
-
-            appendSprite(
-                center: center,
-                size: SIMD2(13 + seed * 15, 18 + seed * 22),
-                color: withAlpha(
-                    mix(red, orange, t: seed),
-                    sample.alpha * 0.72
-                ),
-                style: .fireball,
-                rotation: (seed - 0.5) * 0.8,
-                seed: seed,
-                age: age,
-                geometry: &geometry
-            )
-        }
-    }
-
-    private func buildStardust(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        appendRibbon(
-            samples,
-            width: 20,
-            baseColor: SIMD4(1, 1, 1, 1),
-            usePointColor: true,
-            style: .stardust,
-            alphaScale: 0.30,
-            wobble: 2,
-            phase: Float(now * 5),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 16,
-            baseColor: SIMD4(1, 1, 1, 1),
-            usePointColor: true,
-            style: .stardust,
-            alphaScale: 0.88,
-            wobble: 1,
-            phase: Float(now * 8),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            guard index % 2 == 0 else { continue }
-
-            let sample = samples[index]
-            let seed = random01(trackID * 23, index)
-            let age = 1 - sample.alpha
-            let pointColor = rgba(sample.color)
-            let angle = seed * .pi * 2
-            let center = sample.position + unit(angle) * (8 + age * 30)
-
-            appendSprite(
-                center: center,
-                size: SIMD2(repeating: 7 + seed * 13),
-                color: withAlpha(
-                    mix(pointColor, SIMD4(1, 1, 1, 1), t: 0.55),
-                    sample.alpha * 0.9
-                ),
-                style: .star,
-                rotation: Float(now) * 1.8 + angle,
-                seed: seed,
-                age: age,
-                geometry: &geometry
-            )
-        }
-    }
-
-    private func buildWave(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let blue = rgba(UIColor(hex: 0x168CFF))
-        let cyan = rgba(UIColor(hex: 0x8CEBFF))
-        let white = SIMD4<Float>(1, 1, 1, 1)
-
-        appendRibbon(
-            samples,
-            width: 40,
-            baseColor: blue,
-            usePointColor: true,
-            style: .wave,
-            alphaScale: 0.32,
-            wobble: 8,
-            phase: Float(now * 6),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 13,
-            baseColor: cyan,
-            usePointColor: false,
-            style: .wave,
-            alphaScale: 0.66,
-            wobble: 5,
-            phase: Float(now * 8) + 2.1,
-            offset: -2,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 3,
-            baseColor: white,
-            usePointColor: false,
-            style: .wave,
-            alphaScale: 0.68,
-            wobble: 3,
-            phase: Float(now * 10),
-            offset: -5,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 31, index)
-            let age = 1 - sample.alpha
-
-            if index % 2 == 0 {
-                let angle = seed * .pi * 2
-                let center = sample.position + unit(angle) * (8 + age * 26)
-
-                appendSprite(
-                    center: center,
-                    size: SIMD2(repeating: 5 + seed * 9),
-                    color: withAlpha(
-                        mix(cyan, white, t: 0.35),
-                        sample.alpha * 0.72
-                    ),
-                    style: .bubble,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-
-            if index % 8 == 0 {
-                appendSprite(
-                    center: sample.position,
-                    size: SIMD2(repeating: 24 + age * 88),
-                    color: withAlpha(cyan, sample.alpha * 0.38),
-                    style: .ring,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildMoney(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let deepGold = rgba(UIColor(hex: 0xB86B00))
-        let gold = rgba(UIColor(hex: 0xFFD34E))
-        let whiteGold = rgba(UIColor(hex: 0xFFF7C4))
-
-        appendRibbon(
-            samples,
-            width: 29,
-            baseColor: deepGold,
-            usePointColor: false,
-            style: .money,
-            alphaScale: 0.25,
-            wobble: 3,
-            phase: Float(now * 5),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 10,
-            baseColor: gold,
-            usePointColor: false,
-            style: .money,
-            alphaScale: 0.82,
-            wobble: 2,
-            phase: Float(now * 8),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 2.5,
-            baseColor: whiteGold,
-            usePointColor: false,
-            style: .money,
-            alphaScale: 0.92,
-            wobble: 1,
-            phase: Float(now * 12),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 41, index)
-            let age = 1 - sample.alpha
-
-            if index % 3 == 0 {
-                let angle = seed * .pi * 2
-                let center = sample.position + SIMD2(
-                    cos(angle) * (12 + age * 42),
-                    sin(angle) * (12 + age * 28) + age * 18
-                )
-
-                appendSprite(
-                    center: center,
-                    size: SIMD2(16 + seed * 13, 10 + seed * 9),
-                    color: withAlpha(gold, sample.alpha * 0.9),
-                    style: .coin,
-                    rotation: angle + Float(now) * (1.5 + seed),
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-
-            if index % 9 == 0 {
-                appendSprite(
-                    center: sample.position,
-                    size: SIMD2(repeating: 28 + age * 96),
-                    color: withAlpha(gold, sample.alpha * 0.30),
-                    style: .ring,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildBlade(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let steel = rgba(UIColor(hex: 0xD8E2EA))
-        let blueSteel = rgba(UIColor(hex: 0x77C8FF))
-        let white = SIMD4<Float>(1, 1, 1, 1)
-
-        appendRibbon(
-            samples,
-            width: 31,
-            baseColor: blueSteel,
-            usePointColor: true,
-            style: .blade,
-            alphaScale: 0.22,
-            wobble: 2.5,
-            phase: Float(now * 9),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 9,
-            baseColor: steel,
-            usePointColor: false,
-            style: .blade,
-            alphaScale: 0.84,
-            wobble: 1.4,
-            phase: Float(now * 14),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 2,
-            baseColor: white,
-            usePointColor: false,
-            style: .blade,
-            alphaScale: 0.95,
-            wobble: 0.5,
-            phase: Float(now * 18),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 53, index)
-            let age = 1 - sample.alpha
-            let angle = seed * .pi * 2
-            let center = sample.position + unit(angle) * (10 + age * 48)
-
-            if index % 3 == 0 {
-                appendSprite(
-                    center: center,
-                    size: SIMD2(22 + seed * 28, 5 + seed * 4),
-                    color: withAlpha(steel, sample.alpha * 0.86),
-                    style: .blade,
-                    rotation: angle + Float(now) * 0.8,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            } else if index % 2 == 0 {
-                appendSprite(
-                    center: center,
-                    size: SIMD2(repeating: 6 + seed * 10),
-                    color: withAlpha(white, sample.alpha * 0.8),
-                    style: .spark,
-                    rotation: angle,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildIce(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let ice = rgba(UIColor(hex: 0x9DEBFF))
-        let blue = rgba(UIColor(hex: 0x4EAAFF))
-        let white = SIMD4<Float>(1, 1, 1, 1)
-
-        appendRibbon(
-            samples,
-            width: 37,
-            baseColor: blue,
-            usePointColor: false,
-            style: .ice,
-            alphaScale: 0.22,
-            wobble: 3,
-            phase: Float(now * 5),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 13,
-            baseColor: ice,
-            usePointColor: false,
-            style: .ice,
-            alphaScale: 0.74,
-            wobble: 2,
-            phase: Float(now * 7),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 3,
-            baseColor: white,
-            usePointColor: false,
-            style: .ice,
-            alphaScale: 0.82,
-            wobble: 1,
-            phase: Float(now * 9),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 61, index)
-            let age = 1 - sample.alpha
-            let angle = seed * .pi * 2
-            let center = sample.position + unit(angle) * (12 + age * 55)
-
-            if index % 3 == 0 {
-                appendSprite(
-                    center: center,
-                    size: SIMD2(9 + seed * 14, 18 + seed * 25),
-                    color: withAlpha(
-                        mix(ice, white, t: seed * 0.55),
-                        sample.alpha * 0.84
-                    ),
-                    style: .shard,
-                    rotation: angle + age * 2.4,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-
-            if index % 8 == 0 {
-                appendSprite(
-                    center: sample.position + SIMD2(0, -age * 10),
-                    size: SIMD2(repeating: 34 + age * 65),
-                    color: withAlpha(ice, sample.alpha * 0.18),
-                    style: .haze,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildCrimson(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let crimson = rgba(UIColor(hex: 0xC9082E))
-        let orange = rgba(UIColor(hex: 0xFF5A18))
-        let yellow = rgba(UIColor(hex: 0xFFE36B))
-
-        appendRibbon(
-            samples,
-            width: 45,
-            baseColor: crimson,
-            usePointColor: false,
-            style: .crimson,
-            alphaScale: 0.28,
-            wobble: 8,
-            phase: Float(now * 7),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 18,
-            baseColor: orange,
-            usePointColor: false,
-            style: .crimson,
-            alphaScale: 0.78,
-            wobble: 5,
-            phase: Float(now * 10) + 1.1,
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 4,
-            baseColor: yellow,
-            usePointColor: false,
-            style: .crimson,
-            alphaScale: 0.9,
-            wobble: 2,
-            phase: Float(now * 13),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 71, index)
-            let age = 1 - sample.alpha
-
-            if index % 2 == 0 {
-                let center = sample.position + SIMD2(
-                    (seed - 0.5) * 42 * age,
-                    -age * (30 + seed * 52)
-                )
-
-                appendSprite(
-                    center: center,
-                    size: SIMD2(16 + seed * 22, 22 + seed * 30),
-                    color: withAlpha(
-                        mix(crimson, orange, t: 0.45 + seed * 0.5),
-                        sample.alpha * 0.88
-                    ),
-                    style: .fireball,
-                    rotation: (seed - 0.5) * 0.8,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-
-            if index % 7 == 0 {
-                appendSprite(
-                    center: sample.position,
-                    size: SIMD2(repeating: 50 + age * 80),
-                    color: withAlpha(crimson, sample.alpha * 0.15),
-                    style: .haze,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildDeathRay(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let violet = rgba(UIColor(hex: 0x8A37FF))
-        let magenta = rgba(UIColor(hex: 0xFF4DE3))
-        let white = SIMD4<Float>(1, 1, 1, 1)
-
-        appendRibbon(
-            samples,
-            width: 54,
-            baseColor: violet,
-            usePointColor: false,
-            style: .deathRay,
-            alphaScale: 0.20,
-            wobble: 2,
-            phase: Float(now * 4),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 22,
-            baseColor: magenta,
-            usePointColor: false,
-            style: .deathRay,
-            alphaScale: 0.72,
-            wobble: 1.2,
-            phase: Float(now * 8),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 5,
-            baseColor: white,
-            usePointColor: false,
-            style: .deathRay,
-            alphaScale: 0.98,
-            wobble: 0.4,
-            phase: Float(now * 13),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        if let head = samples.last {
-            let basePhase = Float(now.truncatingRemainder(dividingBy: 1.0))
-
-            for ringIndex in 0..<3 {
-                let phase = (basePhase + Float(ringIndex) / 3)
-                    .truncatingRemainder(dividingBy: 1)
-                let size = 26 + phase * 110
-
-                appendSprite(
-                    center: head.position,
-                    size: SIMD2(repeating: size),
-                    color: withAlpha(
-                        mix(violet, magenta, t: Float(ringIndex) / 2),
-                        (1 - phase) * 0.52
-                    ),
-                    style: .ring,
-                    rotation: Float(now) + Float(ringIndex),
-                    seed: Float(ringIndex) * 0.31,
-                    age: phase,
-                    geometry: &geometry
-                )
-            }
-        }
-
-        for index in stride(from: 0, to: samples.count, by: 5) {
-            let sample = samples[index]
-            let seed = random01(trackID * 83, index)
-            let age = 1 - sample.alpha
-
-            appendSprite(
-                center: sample.position + unit(seed * .pi * 2) * (age * 25),
-                size: SIMD2(repeating: 42 + age * 72),
-                color: withAlpha(violet, sample.alpha * 0.14),
-                style: .haze,
-                rotation: 0,
-                seed: seed,
-                age: age,
-                geometry: &geometry
-            )
-        }
-    }
-
-    private func buildEmerald(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let darkGreen = rgba(UIColor(hex: 0x0A6F42))
-        let emerald = rgba(UIColor(hex: 0x24D77A))
-        let lime = rgba(UIColor(hex: 0xB7FF77))
-
-        appendRibbon(
-            samples,
-            width: 32,
-            baseColor: darkGreen,
-            usePointColor: false,
-            style: .emerald,
-            alphaScale: 0.26,
-            wobble: 5,
-            phase: Float(now * 4),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 10,
-            baseColor: emerald,
-            usePointColor: false,
-            style: .emerald,
-            alphaScale: 0.78,
-            wobble: 3,
-            phase: Float(now * 6),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 2,
-            baseColor: lime,
-            usePointColor: false,
-            style: .emerald,
-            alphaScale: 0.9,
-            wobble: 1.5,
-            phase: Float(now * 9),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 97, index)
-            let age = 1 - sample.alpha
-
-            if index % 3 == 0 {
-                let angle = seed * .pi * 2
-                let center = sample.position + unit(angle) * (10 + age * 42)
-
-                appendSprite(
-                    center: center,
-                    size: SIMD2(12 + seed * 14, 22 + seed * 22),
-                    color: withAlpha(
-                        mix(emerald, lime, t: seed * 0.45),
-                        sample.alpha * 0.88
-                    ),
-                    style: .leaf,
-                    rotation: angle + age * 2,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-
-            if index % 10 == 0 {
-                appendSprite(
-                    center: sample.position,
-                    size: SIMD2(repeating: 20 + age * 76),
-                    color: withAlpha(emerald, sample.alpha * 0.28),
-                    style: .ring,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    private func buildInkWash(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        let ink = SIMD4<Float>(0.025, 0.025, 0.035, 1)
-        let gray = SIMD4<Float>(0.36, 0.37, 0.40, 1)
-
-        appendRibbon(
-            samples,
-            width: 43,
-            baseColor: ink,
-            usePointColor: false,
-            style: .inkWash,
-            alphaScale: 0.68,
-            wobble: 10,
-            phase: Float(now * 1.2) + Float(trackID),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 16,
-            baseColor: gray,
-            usePointColor: false,
-            style: .inkWash,
-            alphaScale: 0.45,
-            wobble: 7,
-            phase: Float(now * 1.5) + 2.4,
-            offset: -7,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 7,
-            baseColor: ink,
-            usePointColor: false,
-            style: .inkWash,
-            alphaScale: 0.88,
-            wobble: 4,
-            phase: Float(now * 1.8) + 4.1,
-            offset: 8,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            guard index % 3 == 0 else { continue }
-
-            let sample = samples[index]
-            let seed = random01(trackID * 101, index)
-            let age = 1 - sample.alpha
-            let center = sample.position + SIMD2(
-                (seed - 0.5) * 44 * age,
-                age * (8 + seed * 30)
-            )
-
-            appendSprite(
-                center: center,
-                size: SIMD2(repeating: 12 + seed * 24 + age * 18),
-                color: withAlpha(
-                    mix(ink, gray, t: seed * 0.25),
-                    sample.alpha * 0.72
-                ),
-                style: .inkDrop,
-                rotation: seed * .pi * 2,
-                seed: seed,
-                age: age,
-                geometry: &geometry
-            )
-        }
-    }
-
-    private func buildSprayPaint(
-        _ samples: [Sample],
-        trackID: Int,
-        now: TimeInterval,
-        geometry: inout PicFrameGeometry
-    ) {
-        appendRibbon(
-            samples,
-            width: 39,
-            baseColor: SIMD4(1, 1, 1, 1),
-            usePointColor: true,
-            style: .sprayPaint,
-            alphaScale: 0.38,
-            wobble: 8,
-            phase: Float(now * 4),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        appendRibbon(
-            samples,
-            width: 11,
-            baseColor: SIMD4(1, 1, 1, 1),
-            usePointColor: true,
-            style: .sprayPaint,
-            alphaScale: 0.82,
-            wobble: 4,
-            phase: Float(now * 7),
-            offset: 0,
-            geometry: &geometry
-        )
-
-        for index in samples.indices {
-            let sample = samples[index]
-            let seed = random01(trackID * 113, index)
-            let age = 1 - sample.alpha
-            let source = rgba(sample.color)
-            let vivid = vividColor(source, seed: seed)
-            let angle = seed * .pi * 2
-            let center = sample.position + unit(angle) * (8 + age * 46)
-
-            if index % 3 == 0 {
-                appendSprite(
-                    center: center,
-                    size: SIMD2(repeating: 18 + seed * 28),
-                    color: withAlpha(vivid, sample.alpha * 0.82),
-                    style: .splat,
-                    rotation: angle,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            } else if index % 2 == 0 {
-                appendSprite(
-                    center: center,
-                    size: SIMD2(repeating: 5 + seed * 9),
-                    color: withAlpha(vivid, sample.alpha * 0.58),
-                    style: .softCircle,
-                    rotation: 0,
-                    seed: seed,
-                    age: age,
-                    geometry: &geometry
-                )
-            }
-        }
-    }
-
-    // MARK: - Geometry
+    // MARK: - 取樣（像素空間）
 
     private func makeSamples(
         _ points: [(TrailPoint, Float)],
-        viewportSize: CGSize
+        width: Float,
+        height: Float
     ) -> [Sample] {
-        let width = Float(viewportSize.width)
-        let height = Float(viewportSize.height)
-
-        return points.map { point, alpha in
+        points.map { point, alpha in
             Sample(
-                position: SIMD2(
-                    Float(point.center.x) * width,
-                    Float(point.center.y) * height
-                ),
+                position: SIMD2(Float(point.center.x) * width,
+                                Float(point.center.y) * height),
                 alpha: clamp(alpha, 0, 1),
                 color: point.color,
                 timestamp: point.timestamp
@@ -1119,280 +221,1361 @@ final class PicTrailSceneBuilder {
         }
     }
 
-    private func appendRibbon(
-        _ samples: [Sample],
-        width: Float,
-        baseColor: SIMD4<Float>,
-        usePointColor: Bool,
+    /// 取陀螺主色（head）。Android 一律以 pts.last().color 當基底。
+    private func headColor(_ samples: [Sample]) -> SIMD4<Float> {
+        rgba(samples.last?.color ?? .white)
+    }
+}
+
+
+// MARK: - 共用幾何基礎設施
+extension PicTrailSceneBuilder {
+
+    /// NDC 半寬 → 像素半寬。px = ndc * (minDim / 2)。
+    func ndcToPixels(_ ndc: Float, minDim: Float) -> Float { ndc * minDim * 0.5 }
+
+    // 粒子座標以 NDC 存放（沿用 Android 物理），輸出時轉像素。
+    func ndcXToPixel(_ nx: Float) -> Float { (nx + 1) * vwHalf }
+    func ndcYToPixel(_ ny: Float) -> Float { (1 - ny) * vhHalf }
+    func pixelToNDCx(_ px: Float) -> Float { px / vwHalf - 1 }
+    func pixelToNDCy(_ py: Float) -> Float { 1 - py / vhHalf }
+
+    /// 對取樣點做 ×factor 線性重採樣（蛇形 / 藤蔓 / 刀身平滑曲線）。
+    fileprivate func resample(_ samples: [Sample], factor: Int, cap: Int) -> (pos: [SIMD2<Float>], alpha: [Float]) {
+        let n = samples.count
+        guard n >= 2 else { return (samples.map { $0.position }, samples.map { $0.alpha }) }
+        let m = min(n * factor, cap)
+        guard m >= 2 else { return (samples.map { $0.position }, samples.map { $0.alpha }) }
+        var pos: [SIMD2<Float>] = []; pos.reserveCapacity(m)
+        var alp: [Float] = []; alp.reserveCapacity(m)
+        for j in 0..<m {
+            let f = Float(j) / Float(m - 1) * Float(n - 1)
+            let i0 = min(Int(f), n - 2)
+            let fr = f - Float(i0)
+            pos.append(samples[i0].position + (samples[i0 + 1].position - samples[i0].position) * fr)
+            alp.append(samples[i0].alpha + (samples[i0 + 1].alpha - samples[i0].alpha) * fr)
+        }
+        return (pos, alp)
+    }
+
+    /// 平均法線（等同 Android avgNormal / segNormal，像素空間）。
+    func averagedNormal(_ positions: [SIMD2<Float>], index: Int) -> SIMD2<Float> {
+        let tangent: SIMD2<Float>
+        if index == 0 { tangent = positions[1] - positions[0] }
+        else if index == positions.count - 1 { tangent = positions[index] - positions[index - 1] }
+        else { tangent = positions[index + 1] - positions[index - 1] }
+        let length = max(simd_length(tangent), 0.0001)
+        let u = tangent / length
+        return SIMD2(-u.y, u.x)
+    }
+
+    // MARK: Ribbon 層
+
+    /// 通用 ribbon 層。uv.x = 中心距離∈[-1,1]，uv.y = 沿尾跡參數∈[0,1]。
+    func appendRibbon(
+        positions: [SIMD2<Float>],
+        alphas: [Float],
+        halfWidthPx: Float,
+        color: SIMD4<Float>,
         style: PicRibbonStyle,
         alphaScale: Float,
-        wobble: Float,
-        phase: Float,
-        offset: Float,
-        geometry: inout PicFrameGeometry
+        widthTailBias: Float = 0.34,
+        widthHeadBias: Float = 0.66,
+        centerlineOffset: ((Int, Float, SIMD2<Float>) -> SIMD2<Float>)? = nil,
+        trailReversed: Bool = false,
+        seedBase: Float = 0,
+        into geometry: inout PicFrameGeometry
     ) {
-        guard samples.count >= 2 else { return }
-
-        let start = geometry.ribbonVertices.count
-        let positions = samples.map(\.position)
-        var cumulative = [Float](repeating: 0, count: samples.count)
-
-        for index in 1..<positions.count {
-            cumulative[index] = cumulative[index - 1]
-                + simd_length(positions[index] - positions[index - 1])
+        let count = positions.count
+        guard count >= 2 else { return }
+        var cumulative = [Float](repeating: 0, count: count)
+        for i in 1..<count {
+            cumulative[i] = cumulative[i - 1] + simd_length(positions[i] - positions[i - 1])
         }
-
         let totalLength = max(cumulative.last ?? 1, 1)
-
-        for index in samples.indices {
-            let normal = averagedNormal(positions, index: index)
-            let alpha = samples[index].alpha
-            let trailT = cumulative[index] / totalLength
-            let animated = sin(
-                Float(index) * 1.73
-                    + trailT * 11.4
-                    + phase
-            )
-            let displaced = positions[index]
-                + normal * (offset + animated * wobble * (0.35 + alpha * 0.65))
-
-            let halfWidth = width * 0.5 * (0.34 + alpha * 0.66)
-            var color = usePointColor
-                ? rgba(samples[index].color)
-                : baseColor
-            color.w *= alpha * alphaScale
-
+        let start = geometry.ribbonVertices.count
+        for i in 0..<count {
+            let normal = averagedNormal(positions, index: i)
+            let alpha = alphas[i]
+            var center = positions[i]
+            if let off = centerlineOffset { center += off(i, alpha, normal) }
+            let halfWidth = halfWidthPx * (widthTailBias + widthHeadBias * alpha)
+            var c = color
+            c.w *= alpha * alphaScale
+            let trailT = trailReversed
+                ? (totalLength - cumulative[i]) / totalLength
+                : cumulative[i] / totalLength
+            let seed = seedBase + Float(i) * 0.013
             geometry.ribbonVertices.append(
-                PicRibbonVertex(
-                    position: displaced - normal * halfWidth,
-                    color: color,
-                    uv: SIMD2(-1, trailT),
-                    style: style.rawValue,
-                    seed: phase * 0.071 + Float(index) * 0.013
-                )
-            )
-
+                PicRibbonVertex(position: center - normal * halfWidth, color: c,
+                                uv: SIMD2(-1, trailT), style: style.rawValue, seed: seed))
             geometry.ribbonVertices.append(
-                PicRibbonVertex(
-                    position: displaced + normal * halfWidth,
-                    color: color,
-                    uv: SIMD2(1, trailT),
-                    style: style.rawValue,
-                    seed: phase * 0.071 + Float(index) * 0.013
-                )
-            )
+                PicRibbonVertex(position: center + normal * halfWidth, color: c,
+                                uv: SIMD2(1, trailT), style: style.rawValue, seed: seed))
         }
-
         geometry.ribbonRanges.append(
-            PicDrawRange(
-                start: start,
-                count: geometry.ribbonVertices.count - start
-            )
-        )
+            PicDrawRange(start: start, count: geometry.ribbonVertices.count - start))
     }
 
-    private func appendSprite(
-        center: SIMD2<Float>,
-        size: SIMD2<Float>,
-        color: SIMD4<Float>,
-        style: PicSpriteStyle,
-        rotation: Float,
-        seed: Float,
-        age: Float,
-        geometry: inout PicFrameGeometry
+    // MARK: Sprite
+
+    func appendSprite(
+        center: SIMD2<Float>, size: SIMD2<Float>, color: SIMD4<Float>,
+        style: PicSpriteStyle, rotation: Float, seed: Float, age: Float,
+        into geometry: inout PicFrameGeometry
     ) {
         let corners: [SIMD2<Float>] = [
-            SIMD2(-1, -1),
-            SIMD2(1, -1),
-            SIMD2(-1, 1),
-            SIMD2(-1, 1),
-            SIMD2(1, -1),
-            SIMD2(1, 1)
+            SIMD2(-1, -1), SIMD2(1, -1), SIMD2(-1, 1),
+            SIMD2(-1, 1),  SIMD2(1, -1), SIMD2(1, 1)
         ]
-
         for corner in corners {
             geometry.spriteVertices.append(
-                PicSpriteVertex(
-                    center: center,
-                    corner: corner,
-                    size: size,
-                    color: color,
-                    rotation: rotation,
-                    style: style.rawValue,
-                    seed: seed,
-                    age: age
-                )
-            )
+                PicSpriteVertex(center: center, corner: corner, size: size, color: color,
+                                rotation: rotation, style: style.rawValue, seed: seed, age: age))
         }
     }
 
-    private func appendDebugBoxes(
-        _ boxes: [(CGRect, Int)],
-        viewportSize: CGSize,
-        geometry: inout PicFrameGeometry
-    ) {
-        let width = Float(viewportSize.width)
-        let height = Float(viewportSize.height)
-        let green = SIMD4<Float>(0.1, 1, 0.2, 1)
+    // MARK: 跨幀粒子池
 
-        for (rect, trackID) in boxes {
-            let minX = Float(rect.minX) * width
-            let minY = Float(rect.minY) * height
-            let maxX = Float(rect.maxX) * width
-            let maxY = Float(rect.maxY) * height
+    fileprivate func spawnParticle(_ configure: (Particle) -> Void) {
+        for p in particles where !p.active {
+            p.active = true
+            p.vx = 0; p.vy = 0; p.ndcVelocity = false; p.size = 0; p.aspect = 1
+            p.angle = 0; p.spin = 0; p.flip = 0; p.flipVel = 0
+            p.alpha = 1; p.decay = 0.06
+            p.grow = 0; p.gravity = 0; p.drag = 0
+            p.r = 1; p.g = 1; p.b = 1; p.style = .softCircle
+            p.life = 0; p.maxLife = 0; p.seed = 0
+            p.vcount = 0; p.streak = false; p.streakHalfPx = 2
+            p.orbital = false; p.cx = 0; p.cy = 0; p.orbRadiusPx = 0
+            p.orbSpawnRadiusPx = 1; p.orbAngVel = 0; p.orbInVelPx = 0
+            configure(p)
+            return
+        }
+    }
 
-            let points = [
-                SIMD2(minX, minY),
-                SIMD2(maxX, minY),
-                SIMD2(maxX, maxY),
-                SIMD2(minX, maxY),
-                SIMD2(minX, minY)
-            ]
+    fileprivate func spawnRipple(_ configure: (Ripple) -> Void) {
+        for r in ripples where !r.active {
+            r.active = true
+            r.radius = 0; r.maxRadius = 0; r.alpha = 1; r.grow = 5
+            r.r = 1; r.g = 1; r.b = 1; r.style = .ring
+            configure(r)
+            return
+        }
+    }
 
-            let samples = points.map {
-                Sample(
-                    position: $0,
-                    alpha: 1,
-                    color: .green,
-                    timestamp: 0
-                )
+    func updateParticles(dtScale dt: Float, width: Float, height: Float) {
+        for p in particles where p.active {
+            if p.orbital {
+                // DeathRay 漩渦：繞核心旋轉 + 半徑收斂（對齊 .kt drawVortexPoints）
+                p.angle += p.orbAngVel * dt
+                p.orbRadiusPx -= p.orbInVelPx * dt
+                if p.orbRadiusPx <= min(width, height) * 0.010 { p.active = false; continue }
+                p.x = p.cx + cos(p.angle) * p.orbRadiusPx / vwHalf
+                p.y = p.cy + sin(p.angle) * p.orbRadiusPx / vhHalf
+                continue
             }
-
-            appendRibbon(
-                samples,
-                width: 2,
-                baseColor: green,
-                usePointColor: false,
-                style: .generic,
-                alphaScale: 0.95,
-                wobble: 0,
-                phase: Float(trackID),
-                offset: 0,
-                geometry: &geometry
-            )
+            // 速度單位分流：Wave 用 NDC/幀（直接加），其餘 px/幀（除半寬高）。
+            if p.ndcVelocity {
+                p.x += p.vx * dt
+                p.y += p.vy * dt
+            } else {
+                p.x += p.vx * dt / vwHalf
+                p.y += p.vy * dt / vhHalf
+            }
+            if p.drag != 0 { let fr = 1 - p.drag * dt; p.vx *= fr; p.vy *= fr }
+            if p.gravity != 0 { p.vy -= p.gravity * dt }
+            if p.grow != 0 { p.size *= 1 + p.grow * dt }
+            if p.spin != 0 { p.angle += p.spin * dt }
+            if p.flipVel != 0 { p.flip += p.flipVel * dt }
+            if p.maxLife > 0 {
+                p.life += dt
+                if p.life >= p.maxLife { p.active = false }
+            } else {
+                p.alpha -= p.decay * dt
+                if p.alpha <= 0 { p.active = false }
+            }
         }
     }
 
-    // MARK: - Math and color
-
-    private func averagedNormal(
-        _ positions: [SIMD2<Float>],
-        index: Int
-    ) -> SIMD2<Float> {
-        let tangent: SIMD2<Float>
-
-        if index == 0 {
-            tangent = positions[1] - positions[0]
-        } else if index == positions.count - 1 {
-            tangent = positions[index] - positions[index - 1]
-        } else {
-            tangent = positions[index + 1] - positions[index - 1]
+    func updateRipples(dtScale dt: Float) {
+        for r in ripples where r.active {
+            if r.maxRadius > 0 {
+                r.radius += (r.maxRadius - r.radius) * 0.22 * dt
+                r.alpha -= 0.06 * dt
+                if r.alpha <= 0 || r.maxRadius - r.radius < 1 { r.active = false }
+            } else {
+                r.radius += r.grow * dt
+                r.alpha -= 0.04 * dt
+                if r.alpha <= 0 { r.active = false }
+            }
         }
-
-        let length = max(simd_length(tangent), 0.0001)
-        let unitTangent = tangent / length
-        return SIMD2(-unitTangent.y, unitTangent.x)
     }
 
-    private func unit(_ angle: Float) -> SIMD2<Float> {
-        SIMD2(cos(angle), sin(angle))
+    func appendParticleSprites(into geometry: inout PicFrameGeometry) {
+        for p in particles where p.active {
+            var alpha: Float
+            var drawSize = p.size
+            if p.orbital {
+                // .kt：t=(1-radius/spawnRadius)；越接近核心越亮、略縮小
+                let t = clamp(1 - p.orbRadiusPx / max(p.orbSpawnRadiusPx, 1e-3), 0, 1)
+                alpha = (0.3 + 0.7 * t) * 0.9
+                drawSize = p.size * (1 - 0.4 * t)
+            } else if p.maxLife > 0 {
+                alpha = (1 - p.life / p.maxLife) * 0.9
+            } else {
+                alpha = clamp(p.alpha, 0, 1)
+            }
+            guard alpha > 0.004 else { continue }
+            let cx = ndcXToPixel(p.x), cy = ndcYToPixel(p.y)
+            let color = SIMD4(p.r, p.g, p.b, alpha)
+
+            if p.vcount >= 3 {
+                appendPolygon(cx: cx, cy: cy, p: p, color: color, into: &geometry)
+            } else if p.streak {
+                appendStreak(cx: cx, cy: cy, p: p, color: color, into: &geometry)
+            } else {
+                let w: Float
+                let h: Float
+                if p.style == .coin {
+                    let flipS = 0.18 + 0.82 * abs(cos(p.flip))
+                    w = drawSize * flipS; h = drawSize
+                } else {
+                    w = drawSize; h = drawSize * p.aspect
+                }
+                appendSprite(
+                    center: SIMD2(cx, cy),
+                    size: SIMD2(w, h),
+                    color: color,
+                    style: p.style, rotation: p.angle, seed: p.seed,
+                    age: p.maxLife > 0 ? (p.life / p.maxLife) : (1 - p.alpha),
+                    into: &geometry)
+            }
+        }
     }
 
-    private func random01(_ a: Int, _ b: Int) -> Float {
-        var value = UInt32(truncatingIfNeeded: a)
-            &* 747_796_405
-            &+ UInt32(truncatingIfNeeded: b)
-            &* 2_891_336_453
-            &+ 2_772_803_943
+    /// 多邊形粒子：以 ribbon 三角輸出？不行——ribbon 是三角帶。改用 sprite buffer 直接堆三角。
+    /// 用 spriteVertices 放置三角扇（每個三角 3 頂點），style 設為 .softCircle 並讓 corner 落在頂點，
+    /// 但 sprite shader 以 corner 當 local 座標算 mask，不適合任意多邊形。
+    /// 因此多邊形改走 ribbon buffer 的「實心三角」路徑：用一個極小 helper 直接 append 三角到 sprite。
+    fileprivate func appendPolygon(cx: Float, cy: Float, p: Particle,
+                                   color: SIMD4<Float>, into geometry: inout PicFrameGeometry) {
+        let ca = cos(p.angle), sa = sin(p.angle)
+        func vert(_ j: Int) -> SIMD2<Float> {
+            let rx = p.ox[j] * ca - p.oy[j] * sa
+            let ry = p.ox[j] * sa + p.oy[j] * ca
+            return SIMD2(cx + rx, cy + ry)
+        }
+        let v0 = vert(0)
+        // 三角扇 (0, j, j+1)，以 solidTriangle sprite 樣式輸出（mask 恆為 1）。
+        for j in 1..<(p.vcount - 1) {
+            let va = vert(j), vb = vert(j + 1)
+            appendSolidTri(v0, va, vb, color: color, into: &geometry)
+        }
+    }
 
+    /// streak：沿速度方向拉成細長四邊形（兩個三角）。
+    fileprivate func appendStreak(cx: Float, cy: Float, p: Particle,
+                                  color: SIMD4<Float>, into geometry: inout PicFrameGeometry) {
+        let speed = max(sqrt(p.vx * p.vx + p.vy * p.vy), 1e-3)
+        // 速度在像素空間方向（NDC vy 向上 → 像素 y 向下要反號）
+        let dirX = p.vx / speed
+        let dirY = -p.vy / speed
+        let lenPx = speed * 2.6 + 3
+        let hw = p.streakHalfPx
+        let ex = cx + dirX * lenPx, ey = cy + dirY * lenPx
+        let nx = -dirY * hw, ny = dirX * hw
+        let tailColor = SIMD4(color.x, color.y, color.z, color.w * 0.30)
+        appendSolidTriC(SIMD2(cx - nx, cy - ny), color,
+                        SIMD2(cx + nx, cy + ny), color,
+                        SIMD2(ex - nx, ey - ny), tailColor, into: &geometry)
+        appendSolidTriC(SIMD2(cx + nx, cy + ny), color,
+                        SIMD2(ex + nx, ey + ny), tailColor,
+                        SIMD2(ex - nx, ey - ny), tailColor, into: &geometry)
+    }
+
+    /// 實心三角（單色）→ sprite buffer，style=.solidTri（shader mask 恆 1）。
+    fileprivate func appendSolidTri(_ a: SIMD2<Float>, _ b: SIMD2<Float>, _ c: SIMD2<Float>,
+                                    color: SIMD4<Float>, into geometry: inout PicFrameGeometry) {
+        appendSolidTriC(a, color, b, color, c, color, into: &geometry)
+    }
+
+    /// 實心三角（逐頂點色，供 streak 漸層）。
+    fileprivate func appendSolidTriC(_ a: SIMD2<Float>, _ ca: SIMD4<Float>,
+                                     _ b: SIMD2<Float>, _ cb: SIMD4<Float>,
+                                     _ c: SIMD2<Float>, _ cc: SIMD4<Float>,
+                                     into geometry: inout PicFrameGeometry) {
+        let s = PicSpriteStyle.solidTri.rawValue
+        // corner 不參與形狀（shader solidTri mask=1），但仍需給值；size 設 1 避免 0。
+        geometry.spriteVertices.append(PicSpriteVertex(center: a, corner: SIMD2(0, 0),
+            size: SIMD2(1, 1), color: ca, rotation: 0, style: s, seed: 0, age: 0))
+        geometry.spriteVertices.append(PicSpriteVertex(center: b, corner: SIMD2(0, 0),
+            size: SIMD2(1, 1), color: cb, rotation: 0, style: s, seed: 0, age: 0))
+        geometry.spriteVertices.append(PicSpriteVertex(center: c, corner: SIMD2(0, 0),
+            size: SIMD2(1, 1), color: cc, rotation: 0, style: s, seed: 0, age: 0))
+    }
+
+    func appendRippleSprites(into geometry: inout PicFrameGeometry, width: Float, height: Float) {
+        for r in ripples where r.active {
+            let diameter = r.radius * 2 / 0.72   // ring mask 落在 0.72 半徑
+            appendSprite(
+                center: SIMD2(ndcXToPixel(r.x), ndcYToPixel(r.y)),
+                size: SIMD2(diameter, diameter),
+                color: SIMD4(r.r, r.g, r.b, clamp(r.alpha, 0, 1)),
+                style: r.style, rotation: 0, seed: 0,
+                age: clamp(r.radius / max(r.maxRadius, r.radius + 1), 0, 1),
+                into: &geometry)
+        }
+    }
+}
+
+// MARK: - 數學 / 色彩工具
+extension PicTrailSceneBuilder {
+
+    func unit(_ angle: Float) -> SIMD2<Float> { SIMD2(cos(angle), sin(angle)) }
+
+    func clamp(_ v: Float, _ lo: Float, _ hi: Float) -> Float { min(max(v, lo), hi) }
+
+    /// 確定性 hash（對應 Android per-(track,index) 亂數，讓拖尾本身的點分佈穩定）。
+    func random01(_ a: Int, _ b: Int) -> Float {
+        var value = UInt32(truncatingIfNeeded: a) &* 747_796_405
+            &+ UInt32(truncatingIfNeeded: b) &* 2_891_336_453 &+ 2_772_803_943
         value = (value ^ (value >> 16)) &* 2_246_822_519
         value = (value ^ (value >> 13)) &* 3_266_489_917
         value ^= value >> 16
-
         return Float(value & 0x00FF_FFFF) / Float(0x0100_0000)
     }
 
-    private func rgba(_ color: UIColor) -> SIMD4<Float> {
-        var red: CGFloat = 1
-        var green: CGFloat = 1
-        var blue: CGFloat = 1
-        var alpha: CGFloat = 1
+    /// 粒子物理用的真隨機（對應 Android Math.random()）。
+    func rnd() -> Float { Float.random(in: 0..<1) }
 
-        if !color.getRed(
-            &red,
-            green: &green,
-            blue: &blue,
-            alpha: &alpha
-        ) {
-            var white: CGFloat = 1
-            color.getWhite(&white, alpha: &alpha)
-            red = white
-            green = white
-            blue = white
+    func rgba(_ color: UIColor) -> SIMD4<Float> {
+        var r: CGFloat = 1, g: CGFloat = 1, b: CGFloat = 1, a: CGFloat = 1
+        if !color.getRed(&r, green: &g, blue: &b, alpha: &a) {
+            var w: CGFloat = 1
+            color.getWhite(&w, alpha: &a); r = w; g = w; b = w
+        }
+        return SIMD4(Float(r), Float(g), Float(b), Float(a))
+    }
+
+    func withAlpha(_ c: SIMD4<Float>, _ a: Float) -> SIMD4<Float> {
+        var o = c; o.w = clamp(a, 0, 1); return o
+    }
+
+    func mix(_ a: SIMD4<Float>, _ b: SIMD4<Float>, _ t: Float) -> SIMD4<Float> {
+        let amt = clamp(t, 0, 1); return a + (b - a) * amt
+    }
+
+
+    /// 提飽和 + 提亮（對應 Android saturate()：HSV S≥0.85, V=1）。
+    func saturated(_ c: SIMD4<Float>) -> SIMD4<Float> {
+        var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+        UIColor(red: CGFloat(c.x), green: CGFloat(c.y), blue: CGFloat(c.z), alpha: 1)
+            .getHue(&h, saturation: &s, brightness: &v, alpha: &a)
+        s = max(s, 0.85); v = 1
+        let out = UIColor(hue: h, saturation: s, brightness: v, alpha: 1)
+        var rr = rgba(out); rr.w = c.w; return rr
+    }
+
+    /// 色相位移（對應 Android hueShift，給雙股刀身第二股用）。
+    func hueShifted(_ c: SIMD4<Float>, _ deg: Float) -> SIMD4<Float> {
+        var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+        UIColor(red: CGFloat(c.x), green: CGFloat(c.y), blue: CGFloat(c.z), alpha: 1)
+            .getHue(&h, saturation: &s, brightness: &v, alpha: &a)
+        h = CGFloat((Float(h) * 360 + deg + 360).truncatingRemainder(dividingBy: 360) / 360)
+        let out = UIColor(hue: h, saturation: max(s, 0.85), brightness: 1, alpha: 1)
+        var rr = rgba(out); rr.w = c.w; return rr
+    }
+
+    /// 鮮豔化（對應 SprayPaint vivid()：lum 為軸拉飽和 ×1.7、再正規化）。
+    func vivid(_ c: SIMD4<Float>, lightJitter: Float = 0) -> SIMD4<Float> {
+        var r = c.x, g = c.y, b = c.z
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b
+        let sat: Float = 1.35
+        r = lum + (r - lum) * sat
+        g = lum + (g - lum) * sat
+        b = lum + (b - lum) * sat
+        let m = max(r, max(g, b))
+        if m > 1e-4 { let s = min(1 / m, 1.5); r *= s; g *= s; b *= s }
+        let lj = 1 + lightJitter
+        return SIMD4(clamp(r * lj, 0, 1), clamp(g * lj, 0, 1), clamp(b * lj, 0, 1), c.w)
+    }
+
+    func lift(_ c: SIMD4<Float>, _ t: Float) -> SIMD4<Float> {
+        // 往白提亮 t（對應 Android cr*0.x + 0.y 之類）
+        SIMD4(c.x + (1 - c.x) * t, c.y + (1 - c.y) * t, c.z + (1 - c.z) * t, c.w)
+    }
+
+    func darken(_ c: SIMD4<Float>, _ k: Float) -> SIMD4<Float> {
+        SIMD4(c.x * k, c.y * k, c.z * k, c.w)
+    }
+
+    // MARK: Debug bounding boxes（沿用原行為）
+
+    func appendDebugBoxes(
+        _ boxes: [(CGRect, Int)], width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        let green = SIMD4<Float>(0.1, 1, 0.2, 1)
+        for (rect, trackID) in boxes {
+            let minX = Float(rect.minX) * width, minY = Float(rect.minY) * height
+            let maxX = Float(rect.maxX) * width, maxY = Float(rect.maxY) * height
+            let pts = [SIMD2(minX, minY), SIMD2(maxX, minY), SIMD2(maxX, maxY),
+                       SIMD2(minX, maxY), SIMD2(minX, minY)]
+            appendRibbon(positions: pts, alphas: [1, 1, 1, 1, 1],
+                         halfWidthPx: 2, color: green, style: .generic, alphaScale: 0.95,
+                         widthTailBias: 1, widthHeadBias: 0, seedBase: Float(trackID),
+                         into: &geometry)
+        }
+    }
+}
+
+// MARK: - 特效：通用 spawn 節流輔助
+extension PicTrailSceneBuilder {
+
+    /// 取頭部與前一點，回傳 (head像素, prev像素, 位移量NDC, 速度moveNorm)。
+    /// moveNorm 已正規化到 30fps 基準（= moveLen / dtScale）。
+    fileprivate func headMotion(_ s: [Sample], dtScale: Float) -> (head: SIMD2<Float>, prev: SIMD2<Float>, moveNDC: Float, moveNorm: Float) {
+        let head = s[s.count - 1].position
+        let prev = s[s.count - 2].position
+        let dNDCx = pixelToNDCx(head.x) - pixelToNDCx(prev.x)
+        let dNDCy = pixelToNDCy(head.y) - pixelToNDCy(prev.y)
+        let moveLen = sqrt(dNDCx * dNDCx + dNDCy * dNDCy)
+        return (head, prev, moveLen, moveLen / max(dtScale, 0.0001))
+    }
+
+    /// 節流：距離上次 spawn 頭部超過 threshold(NDC) 才回傳 true 並更新。
+    fileprivate func throttle(_ trackID: Int, head: SIMD2<Float>, threshold: Float) -> Bool {
+        let hNDC = SIMD2(pixelToNDCx(head.x), pixelToNDCy(head.y))
+        if let last = lastHeadPosition[trackID] {
+            let d = simd_length(hNDC - last)
+            if d <= threshold { return false }
+        }
+        lastHeadPosition[trackID] = hNDC
+        return true
+    }
+}
+
+// MARK: - 滔天浪潮 Wave
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildWave(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        let base = headColor(samples)                 // 陀螺色驅動水體
+        let positions = samples.map { $0.position }
+        let alphas = samples.map { $0.alpha }
+
+        // 流體本體：寬 glow + 主帶 + 白沫核（對齊 Android 三層）
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.031, minDim: minDim) * 2,
+                     color: base, style: .wave, alphaScale: 0.40,
+                     trailReversed: true, seedBase: Float(trackID), into: &geometry)
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.031, minDim: minDim),
+                     color: base, style: .wave, alphaScale: 0.78,
+                     trailReversed: true, seedBase: Float(trackID) * 0.7, into: &geometry)
+
+        // ── 側噴 + 微泡 + 漣漪（NDC/幀 速度，完全對齊 WaveGLEffect.kt）──
+        guard samples.count >= 2 else { return }
+        // .kt：dx,dy 為 NDC 差；perpX=-dy/len, perpY=dx/len（NDC 空間，y 向上）
+        let headNDC = SIMD2(pixelToNDCx(samples[samples.count - 1].position.x),
+                            pixelToNDCy(samples[samples.count - 1].position.y))
+        let prevNDC = SIMD2(pixelToNDCx(samples[samples.count - 2].position.x),
+                            pixelToNDCy(samples[samples.count - 2].position.y))
+        let dxN = headNDC.x - prevNDC.x, dyN = headNDC.y - prevNDC.y
+        let moveLen = max(sqrt(dxN * dxN + dyN * dyN), 1e-5)
+        let perpX = -dyN / moveLen, perpY = dxN / moveLen
+        let moveNorm = moveLen / max(dtScale, 1e-4)
+
+        if waveThrottle(trackID, headNDC: headNDC, threshold: 0.008) && rnd() > 0.3 {
+            if moveNorm > 0.015 && rnd() > 0.5 {
+                spawnRipple { r in
+                    r.x = headNDC.x; r.y = headNDC.y
+                    r.maxRadius = 0; r.radius = 0; r.grow = 5; r.alpha = 0.85
+                    r.r = 0.749; r.g = 0.906; r.b = 1; r.style = .ring
+                }
+            }
+            for k in 0..<3 {
+                let sideSign: Float = (k % 2 == 0) ? 1 : -1
+                let strength = clamp(moveNorm * 1.5, 0.02, 0.045)
+                spawnParticle { p in
+                    p.x = headNDC.x; p.y = headNDC.y
+                    p.ndcVelocity = true
+                    p.vx = perpX * sideSign * strength + (rnd() - 0.5) * 0.018
+                    p.vy = perpY * sideSign * strength + (rnd() - 0.5) * 0.018 - 0.012
+                    p.gravity = -0.001   // update: vy -= gravity → vy += 0.001（.kt）
+                    p.size = rnd() * 8 + 6
+                    p.decay = 0.06; p.style = .softCircle
+                    let blue = rnd() > 0.3
+                    p.r = blue ? 0.749 : 1; p.g = blue ? 0.906 : 1; p.b = 1
+                }
+            }
+            if samples.count > 4 && rnd() > 0.6 {
+                let b = samples[samples.count / 3].position
+                spawnParticle { p in
+                    p.x = pixelToNDCx(b.x) + (rnd() - 0.5) * 0.02
+                    p.y = pixelToNDCy(b.y) + (rnd() - 0.5) * 0.02
+                    p.ndcVelocity = true
+                    p.vx = (rnd() - 0.5) * 0.006
+                    p.vy = -(rnd() * 0.012 + 0.005)
+                    p.size = rnd() * 4 + 2
+                    p.decay = 0.06; p.style = .softCircle
+                    p.r = 0.749; p.g = 0.906; p.b = 1; p.alpha = 0.6
+                }
+            }
+        }
+    }
+
+    /// Wave 專用節流（以 NDC 頭部位置判定，對齊 .kt lastPos 邏輯）。
+    private func waveThrottle(_ trackID: Int, headNDC: SIMD2<Float>, threshold: Float) -> Bool {
+        if let last = lastHeadPosition[trackID] {
+            let d = simd_length(headNDC - last)
+            if d <= threshold { return false }
+        }
+        lastHeadPosition[trackID] = headNDC
+        return true
+    }
+}
+
+// MARK: - 紅蓮破滅 CrimsonLotus
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildCrimson(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        let base = headColor(samples)
+        guard samples.count >= 3 else {
+            // 點太少時仍畫單層，避免空窗
+            appendRibbon(positions: samples.map { $0.position }, alphas: samples.map { $0.alpha },
+                         halfWidthPx: ndcToPixels(0.034, minDim: minDim), color: base,
+                         style: .crimson, alphaScale: 0.7, trailReversed: true, into: &geometry)
+            return
         }
 
-        return SIMD4(
-            Float(red),
-            Float(green),
-            Float(blue),
-            Float(alpha)
-        )
-    }
+        // ×3 重採樣的蛇形雙股火舌（對齊 .kt）
+        let rs = resample(samples, factor: 3, cap: 64)
+        let pos = rs.pos, alp = rs.alpha
+        let m = pos.count
+        let TWIST_FREQ: Float = 2.4, SERPENT_AMP = ndcToPixels(0.024, minDim: minDim)
+        let WRIGGLE_SPEED: Float = 8.5
+        let tongueHW = ndcToPixels(0.034, minDim: minDim)
 
-    private func withAlpha(
-        _ color: SIMD4<Float>,
-        _ alpha: Float
-    ) -> SIMD4<Float> {
-        var output = color
-        output.w = clamp(alpha, 0, 1)
-        return output
-    }
-
-    private func mix(
-        _ lhs: SIMD4<Float>,
-        _ rhs: SIMD4<Float>,
-        t: Float
-    ) -> SIMD4<Float> {
-        let amount = clamp(t, 0, 1)
-        return lhs + (rhs - lhs) * amount
-    }
-
-    private func vividColor(
-        _ color: SIMD4<Float>,
-        seed: Float
-    ) -> SIMD4<Float> {
-        let maxComponent = max(color.x, max(color.y, color.z))
-        let minComponent = min(color.x, min(color.y, color.z))
-        let saturation = maxComponent - minComponent
-
-        if saturation < 0.12 {
-            let palette: [SIMD4<Float>] = [
-                SIMD4(1.00, 0.16, 0.48, color.w),
-                SIMD4(0.20, 0.86, 1.00, color.w),
-                SIMD4(1.00, 0.82, 0.12, color.w),
-                SIMD4(0.42, 1.00, 0.32, color.w)
-            ]
-            let index = min(
-                Int(seed * Float(palette.count)),
-                palette.count - 1
-            )
-            return palette[index]
+        for strand in 0..<2 {
+            let phase = Float(strand) * Float.pi
+            let wMult: Float = strand == 0 ? 1 : 0.62
+            let aMult: Float = strand == 0 ? 1 : 0.7
+            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+                let u = Float(j) / Float(m - 1)
+                let wave = sin(u * TWIST_FREQ * 2 * Float.pi + phase - now * WRIGGLE_SPEED)
+                return normal * (wave * SERPENT_AMP * (1 - u))
+            }
+            appendRibbon(positions: pos, alphas: alp,
+                         halfWidthPx: tongueHW * wMult,
+                         color: base, style: .crimson, alphaScale: aMult,
+                         widthTailBias: 0.30, widthHeadBias: 0.70,
+                         centerlineOffset: offset, trailReversed: true,
+                         seedBase: Float(trackID) + phase, into: &geometry)
         }
 
-        let boost: Float = 1.18
-        return SIMD4(
-            clamp(color.x * boost, 0, 1),
-            clamp(color.y * boost, 0, 1),
-            clamp(color.z * boost, 0, 1),
-            color.w
-        )
+        // ── 餘燼火星（對齊 .kt：rand<0.55*dt）──
+        if samples.count >= 4 && rnd() < 0.55 * dtScale {
+            let idx = min(Int(rnd() * Float(samples.count) * 0.6), samples.count - 1)
+            let e = samples[idx].position
+            spawnEmber(at: e, base: base)
+        }
+
+        // ── 火球（對齊 .kt：small rand>0.4、big 3×）──
+        let mo = headMotion(samples, dtScale: dtScale)
+        if throttle(trackID, head: mo.head, threshold: 0.006) {
+            if mo.moveNorm > 0.010 && rnd() > 0.4 {
+                spawnFireball(at: mo.head, minDim: minDim, big: false, base: base)
+            }
+            if mo.moveNorm > 0.016 {
+                for _ in 0..<3 { spawnFireball(at: mo.head, minDim: minDim, big: true, base: base) }
+            }
+        }
     }
 
-    private func clamp(
-        _ value: Float,
-        _ lower: Float,
-        _ upper: Float
-    ) -> Float {
-        min(max(value, lower), upper)
+    private func spawnEmber(at headPx: SIMD2<Float>, base: SIMD4<Float>) {
+        spawnParticle { [self] p in
+            p.x = pixelToNDCx(headPx.x) + (rnd() - 0.5) * 0.02
+            p.y = pixelToNDCy(headPx.y) + (rnd() - 0.5) * 0.02
+            p.vx = (rnd() - 0.5) * 3
+            p.vy = 1.5 + rnd() * 2.5            // 熱氣上飄（NDC y up）
+            p.size = 2 + rnd() * 2.5
+            p.decay = 0.045 + rnd() * 0.04
+            p.style = .softCircle
+            let pick = Int(rnd() * 5)
+            let c: SIMD4<Float>
+            switch pick {
+            case 0, 1: c = base
+            case 2, 3: c = lift(base, 0.6)
+            default:   c = darken(base, 0.7)
+            }
+            p.r = c.x; p.g = c.y; p.b = c.z
+        }
+    }
+
+    private func spawnFireball(at headPx: SIMD2<Float>, minDim: Float, big: Bool, base: SIMD4<Float>) {
+        spawnParticle { [self] p in
+            let angle = rnd() * 2 * Float.pi
+            let speed: Float = big ? 8 + rnd() * 8 : 4 + rnd() * 5
+            p.x = pixelToNDCx(headPx.x) + (rnd() - 0.5) * 0.015
+            p.y = pixelToNDCy(headPx.y) + (rnd() - 0.5) * 0.015
+            p.vx = cos(angle) * speed
+            p.vy = sin(angle) * speed
+            p.drag = 0.06
+            p.grow = big ? 0.17 : 0.12
+            p.decay = 0.08 + rnd() * 0.04
+            p.size = big ? minDim * (0.012 + rnd() * 0.008) : minDim * (0.006 + rnd() * 0.004)
+            p.style = .fireball
+            let pick = Int(rnd() * 3)
+            let c: SIMD4<Float>
+            switch pick {
+            case 0: c = darken(base, 0.60)
+            case 1: c = base
+            default: c = lift(base, 0.5)
+            }
+            p.r = c.x; p.g = c.y; p.b = c.z
+        }
+    }
+}
+
+// MARK: - 爆刃亂舞 Blade
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildBlade(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        guard samples.count >= 3 else { return }
+        let base = saturated(headColor(samples))
+        // 依影片：雙股同為陀螺色，第二股僅略提亮做出層次，不做色相位移。
+        let twin = lift(base, 0.2)
+
+        // 雙股 willow-leaf helix（×3 重採樣）
+        let rs = resample(samples, factor: 3, cap: 64)
+        let pos = rs.pos, alp = rs.alpha
+        let m = pos.count
+        let HELIX_TURNS: Float = 2.2
+        let HELIX_AMP = ndcToPixels(0.016, minDim: minDim)
+        let strandHW = ndcToPixels(0.012, minDim: minDim)
+
+        for strand in 0..<2 {
+            let c = strand == 0 ? base : twin
+            let phase0 = Float(strand) * Float.pi
+            // 葉形包絡：envelope=sin(πu)，半寬隨 envelope；helix 沿法線偏移
+            // 自訂 alpha（梯度 + sqrt 引擎淡出）與半寬，需用低階逐點寫入。
+            var positions: [SIMD2<Float>] = []
+            var alphas: [Float] = []
+            var halfWidths: [Float] = []
+            var colors: [SIMD4<Float>] = []
+            positions.reserveCapacity(m); alphas.reserveCapacity(m)
+            halfWidths.reserveCapacity(m); colors.reserveCapacity(m)
+            for j in 0..<m {
+                let u = Float(j) / Float(m - 1)
+                let env = sin(Float.pi * u)
+                let off = sin(u * HELIX_TURNS * 2 * Float.pi + phase0) * HELIX_AMP * env
+                let normal = averagedNormal(pos, index: j)
+                positions.append(pos[j] + normal * off)
+                halfWidths.append(strandHW * env)
+                // 梯度 alpha
+                let aT: Float = u < 0.3 ? u / 0.3 * 0.5
+                    : (u < 0.8 ? 0.5 + (u - 0.3) / 0.5 * 0.45 : 0.95 + (u - 0.8) / 0.2 * 0.05)
+                alphas.append(aT * sqrt(max(alp[j], 0)))
+                // 本體→白刃口（前 25%）
+                let wMix = clamp((u - 0.75) / 0.25, 0, 1)
+                colors.append(lift(c, wMix))
+            }
+            appendBladeStrand(positions: positions, alphas: alphas, halfWidths: halfWidths,
+                              colors: colors, seedBase: Float(trackID) + phase0, into: &geometry)
+        }
+
+        // ── 火花 / 刀光 / 劍氣（跨幀粒子）──
+        let mo = headMotion(samples, dtScale: dtScale)
+        if throttle(trackID, head: mo.head, threshold: 0.005) {
+            if mo.moveNorm > 0.009 { emitBladeBody(samples, minDim: minDim) }
+            if mo.moveNorm > 0.013 {
+                let dx = pixelToNDCx(mo.head.x) - pixelToNDCx(mo.prev.x)
+                let dy = pixelToNDCy(mo.head.y) - pixelToNDCy(mo.prev.y)
+                let vxPx = dx * vwHalf / max(dtScale, 1e-4)
+                let vyPx = dy * vhHalf / max(dtScale, 1e-4)
+                if rnd() > 0.3 { spawnBladeSpark(at: mo.head, vxPx: vxPx, vyPx: vyPx) }
+                if rnd() > 0.5 { spawnBladeSpark(at: mo.head, vxPx: vxPx, vyPx: vyPx) }
+                if rnd() > 0.55 {
+                    let ang = atan2(dy, dx)
+                    spawnSwordQi(at: mo.head, angle: ang, moveNorm: mo.moveNorm, minDim: minDim,
+                                 base: base)
+                }
+            }
+        }
+    }
+
+    /// 葉形雙股需要逐點半寬與顏色，獨立寫入 ribbon。
+    private func appendBladeStrand(
+        positions: [SIMD2<Float>], alphas: [Float], halfWidths: [Float],
+        colors: [SIMD4<Float>], seedBase: Float, into geometry: inout PicFrameGeometry
+    ) {
+        let count = positions.count
+        guard count >= 2 else { return }
+        var cumulative = [Float](repeating: 0, count: count)
+        for i in 1..<count { cumulative[i] = cumulative[i - 1] + simd_length(positions[i] - positions[i - 1]) }
+        let total = max(cumulative.last ?? 1, 1)
+        let start = geometry.ribbonVertices.count
+        for i in 0..<count {
+            let normal = averagedNormal(positions, index: i)
+            var c = colors[i]; c.w *= alphas[i]
+            let hw = halfWidths[i]
+            let trailT = cumulative[i] / total
+            let seed = seedBase + Float(i) * 0.013
+            geometry.ribbonVertices.append(
+                PicRibbonVertex(position: positions[i] - normal * hw, color: c,
+                                uv: SIMD2(-1, trailT), style: PicRibbonStyle.blade.rawValue, seed: seed))
+            geometry.ribbonVertices.append(
+                PicRibbonVertex(position: positions[i] + normal * hw, color: c,
+                                uv: SIMD2(1, trailT), style: PicRibbonStyle.blade.rawValue, seed: seed))
+        }
+        geometry.ribbonRanges.append(PicDrawRange(start: start, count: geometry.ribbonVertices.count - start))
+    }
+
+    private func emitBladeBody(_ samples: [Sample], minDim: Float) {
+        let n = samples.count
+        guard n >= 3 else { return }
+        let idx = 1 + min(Int(rnd() * Float(n - 2)), n - 3)
+        let b = samples[idx].position
+        let tpP = samples[idx - 1].position, tpN = samples[idx + 1].position
+        let dir = tpN - tpP
+        let len = max(simd_length(dir), 1e-3)
+        let perpPx = SIMD2(-dir.y, dir.x) / len
+        let perpNDC = simd_normalize(SIMD2(perpPx.x, -perpPx.y))
+        var count = rnd() > 0.5 ? 2 : 1
+        while count > 0 {
+            count -= 1
+            let side: Float = rnd() > 0.5 ? 1 : -1
+            let burst = rnd() * 5 + 3
+            spawnParticle { [self] p in
+                p.x = pixelToNDCx(b.x); p.y = pixelToNDCy(b.y)
+                p.vx = perpNDC.x * side * burst + (rnd() - 0.5) * 3
+                p.vy = perpNDC.y * side * burst + (rnd() - 0.5) * 3
+                p.drag = 0.08; p.decay = 0.12; p.size = 6
+                p.style = .spark
+                if rnd() > 0.4 { p.r = 0.88; p.g = 0.95; p.b = 1.0 }
+                else { p.r = 1.0; p.g = 0.94; p.b = 0.54 }
+            }
+        }
+        if rnd() > 0.45 {
+            spawnParticle { [self] p in
+                p.x = pixelToNDCx(b.x) + (rnd() - 0.5) * 0.015
+                p.y = pixelToNDCy(b.y) + (rnd() - 0.5) * 0.015
+                p.angle = rnd() * Float.pi
+                p.size = minDim * (0.008 + rnd() * 0.008)
+                p.style = .spark; p.maxLife = 6; p.life = 0
+                p.r = 0.95; p.g = 0.98; p.b = 1.0
+            }
+        }
+    }
+
+    private func spawnBladeSpark(at headPx: SIMD2<Float>, vxPx: Float, vyPx: Float) {
+        spawnParticle { [self] p in
+            p.x = pixelToNDCx(headPx.x); p.y = pixelToNDCy(headPx.y)
+            p.vx = vxPx * 0.4 + (rnd() - 0.5) * 10
+            p.vy = -(vyPx * 0.4 + (rnd() - 0.5) * 10)   // 像素 y 向下→NDC y 向上要反號
+            p.drag = 0.08; p.decay = 0.12
+            p.streak = true; p.streakHalfPx = 1.5 + rnd() * 1.5
+            if rnd() > 0.4 { p.r = 0.88; p.g = 0.95; p.b = 1.0 }
+            else { p.r = 1.0; p.g = 0.94; p.b = 0.54 }
+        }
+    }
+
+    private func spawnSwordQi(at headPx: SIMD2<Float>, angle: Float, moveNorm: Float,
+                              minDim: Float, base: SIMD4<Float>) {
+        // 以放大火環近似 crescent（ring sprite），顏色取陀螺色提亮
+        spawnRipple { [self] r in
+            let speedPx = 10 + rnd() * 6 + moveNorm * minDim * 0.15
+            r.x = pixelToNDCx(headPx.x); r.y = pixelToNDCy(headPx.y)
+            r.maxRadius = 0
+            r.radius = minDim * (0.035 + rnd() * 0.020)
+            r.grow = speedPx * 0.12
+            r.alpha = 0.95
+            let lit = lift(base, 0.25)
+            r.r = lit.x; r.g = lit.y; r.b = lit.z
+            r.style = .ring
+        }
+    }
+}
+
+// MARK: - 狂暴冰裂 IceShatter
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildIce(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        let base = headColor(samples)
+        let positions = samples.map { $0.position }
+        let alphas = samples.map { $0.alpha }
+        // 冰刃拖尾：銳利刃口（單層，shader case 7 ice 處理鏡面流光）
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.028, minDim: minDim),
+                     color: base, style: .ice, alphaScale: 0.95,
+                     widthTailBias: 0.22, widthHeadBias: 0.78,
+                     trailReversed: false, seedBase: Float(trackID), into: &geometry)
+
+        guard samples.count >= 2 else { return }
+        // ── 碎片暴衝（只在移動時，量克制）──
+        let mo = headMotion(samples, dtScale: dtScale)
+        if throttle(trackID, head: mo.head, threshold: 0.007) && mo.moveNorm > 0.008 {
+            let chance: Float = mo.moveNorm > 0.018 ? 0.85 : 0.5
+            if rnd() < chance { spawnIceShards(samples, moveNorm: mo.moveNorm, minDim: minDim, base: base, width: width, height: height) }
+        }
+        // ── 冰霜結霜（稀疏，且僅在移動時）+ 中心白霧（很淡，偶爾）──
+        if samples.count >= 3 && mo.moveNorm > 0.006 {
+            if rnd() < 0.6 * dtScale {
+                let idx = min(Int(rnd() * Float(samples.count)), samples.count - 1)
+                let f = samples[idx].position
+                spawnParticle { [self] p in
+                    p.x = pixelToNDCx(f.x) + (rnd() - 0.5) * 0.04
+                    p.y = pixelToNDCy(f.y) + (rnd() - 0.5) * 0.04
+                    p.size = minDim * (0.004 + rnd() * 0.005)
+                    p.alpha = 0.6 + rnd() * 0.3; p.decay = 0.02 + rnd() * 0.015
+                    p.style = .star
+                    if rnd() > 0.3 {
+                        p.r = 0.73 * 0.6 + base.x * 0.4
+                        p.g = 0.90 * 0.6 + base.y * 0.4
+                        p.b = 1.0
+                    } else { p.r = 1; p.g = 1; p.b = 1 }
+                }
+            }
+            if rnd() < 0.3 * dtScale {
+                let h = samples[samples.count - 1].position
+                spawnParticle { [self] p in
+                    p.x = pixelToNDCx(h.x) + (rnd() - 0.5) * 0.03
+                    p.y = pixelToNDCy(h.y) + (rnd() - 0.5) * 0.03
+                    p.vx = (rnd() - 0.5) * 1.0
+                    p.vy = 0.6 + rnd() * 1.0
+                    p.size = minDim * (0.04 + rnd() * 0.03)
+                    p.grow = 0.014; p.alpha = 0.12; p.decay = 0.006
+                    p.style = .haze
+                    p.r = 1; p.g = 1; p.b = 1
+                }
+            }
+        }
+    }
+
+    private func spawnIceShards(_ samples: [Sample], moveNorm: Float, minDim: Float, base: SIMD4<Float>,
+                                width: Float, height: Float) {
+        let n = samples.count
+        let idx = min(max(Int(rnd() * Float(n - 1)), 0), n - 2)
+        let e = samples[idx].position, t = samples[idx + 1].position
+        // .kt：segAngle = atan2((ty-ey)*vh, (tx-ex)*vw)，像素空間（注意 iOS y 向下）
+        let exN = pixelToNDCx(e.x), eyN = pixelToNDCy(e.y)
+        let txN = pixelToNDCx(t.x), tyN = pixelToNDCy(t.y)
+        let segAngle = atan2((tyN - eyN) * height, (txN - exN) * width)
+        let speedPx = moveNorm * minDim * 0.5
+        let halfPi = Float.pi / 2
+        var spawned = 0
+        let burst = 6   // 對齊 .kt
+        for _ in 0..<burst {
+            let side: Float = rnd() > 0.5 ? 1 : -1
+            let pAngle = segAngle + side * halfPi + (rnd() - 0.5) * 0.8
+            let expSpeed = rnd() * 6 + speedPx * 0.4
+            let isBig = rnd() > 0.4
+            let basePx = isBig ? minDim * (0.013 + rnd() * 0.008)
+                               : minDim * (0.005 + rnd() * 0.003)
+            let vc = 3 + min(Int(rnd() * 3), 2)   // 3–5
+            spawnParticle { [self] p in
+                p.x = exN; p.y = eyN
+                p.vx = cos(pAngle) * expSpeed
+                p.vy = sin(pAngle) * expSpeed + 1.2
+                p.angle = rnd() * 2 * Float.pi
+                p.spin = (rnd() - 0.5) * 1.2
+                p.gravity = 0.65; p.decay = 0.12 + rnd() * 0.05
+                // 多邊形頂點
+                p.vcount = vc
+                for j in 0..<vc {
+                    let ang = 2 * Float.pi * Float(j) / Float(vc)
+                    let rad = basePx * (rnd() * 0.9 + 0.3)
+                    p.ox[j] = cos(ang) * rad
+                    p.oy[j] = sin(ang) * rad
+                }
+                if rnd() > 0.3 {
+                    p.r = 0.73 * 0.7 + base.x * 0.3
+                    p.g = 0.90 * 0.7 + base.y * 0.3
+                    p.b = 1.0
+                } else { p.r = 1; p.g = 1; p.b = 1 }
+            }
+            spawned += 1
+            if spawned >= burst { break }
+        }
+    }
+}
+
+// MARK: - 金錢衝擊 Money（依影片：固定金色 $ 錢幣，不跟陀螺色）
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildMoney(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        // 依影片：Money 為固定金色 $ 錢幣 + 金色拖尾，不跟陀螺色。
+        let gold = SIMD4<Float>(1.0, 0.84, 0.30, 1)
+        let positions = samples.map { $0.position }
+        let alphas = samples.map { $0.alpha }
+        // 金色尾流（shader case 5 money 給金屬光澤），固定金色
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.020, minDim: minDim),
+                     color: gold, style: .money, alphaScale: 0.90,
+                     widthTailBias: 0.3, widthHeadBias: 0.7, seedBase: Float(trackID),
+                     into: &geometry)
+
+        guard samples.count >= 2 else { return }
+        let mo = headMotion(samples, dtScale: dtScale)
+        let dx = pixelToNDCx(mo.head.x) - pixelToNDCx(mo.prev.x)
+        let dy = pixelToNDCy(mo.head.y) - pixelToNDCy(mo.prev.y)
+        let moveAngle = atan2(dy, dx)
+        if throttle(trackID, head: mo.head, threshold: 0.006) {
+            if mo.moveNorm > 0.008 {
+                let cnt = 1 + min(Int(mo.moveNorm * 70), 2)
+                let speed = minDim * (0.006 + mo.moveNorm * 0.35)
+                for _ in 0..<cnt {
+                    spawnCoin(at: mo.head, angle: moveAngle + Float.pi + (rnd() - 0.5) * 0.6,
+                              speedPx: speed * (0.7 + rnd() * 0.4), minDim: minDim)
+                }
+                if rnd() > 0.4 { spawnGoldSpark(at: mo.head, angle: moveAngle + Float.pi, cone: 0.4, count: 1) }
+            }
+            if mo.moveNorm > 0.018 {
+                let back = moveAngle + Float.pi
+                let burst = 3 + Int(rnd() * 3)
+                for _ in 0..<burst {
+                    spawnCoin(at: mo.head, angle: back + (rnd() - 0.5) * 1.4,
+                              speedPx: minDim * (0.008 + rnd() * 0.012), minDim: minDim)
+                }
+                spawnRipple { [self] r in
+                    r.x = pixelToNDCx(mo.head.x); r.y = pixelToNDCy(mo.head.y)
+                    r.radius = minDim * 0.010
+                    r.maxRadius = min(minDim * (0.035 + mo.moveNorm * 0.4), minDim * 0.065)
+                    r.alpha = 0.7
+                    r.r = 1.0; r.g = 0.88; r.b = 0.4; r.style = .ring   // 金色衝擊環
+                }
+                spawnGoldSpark(at: mo.head, angle: back, cone: 0.7, count: 3)
+            }
+        }
+    }
+
+    private func spawnCoin(at headPx: SIMD2<Float>, angle: Float, speedPx: Float, minDim: Float) {
+        spawnParticle { [self] p in
+            p.x = pixelToNDCx(headPx.x); p.y = pixelToNDCy(headPx.y)
+            p.vx = cos(angle) * speedPx
+            p.vy = sin(angle) * speedPx + minDim * 0.006
+            p.angle = rnd() * 2 * Float.pi
+            p.spin = (rnd() - 0.5) * 0.5            // angVel
+            p.flip = rnd() * 2 * Float.pi
+            p.flipVel = 0.25 + rnd() * 0.4          // 立體翻面
+            p.gravity = 0.6; p.drag = 0.02
+            p.decay = 0.045 + rnd() * 0.035
+            p.size = minDim * (0.020 + rnd() * 0.016)   // 直徑（draw 時 *0.5 取半徑）
+            p.style = .coin
+            // 對齊 .kt：金色為主，少數亮金 / 深銅
+            switch Int(rnd() * 4) {
+            case 0: p.r = 1.0; p.g = 0.90; p.b = 0.35   // 亮金
+            case 3: p.r = 0.85; p.g = 0.60; p.b = 0.10  // 深銅
+            default: p.r = 1.0; p.g = 0.82; p.b = 0.12  // 金（GOLD）
+            }
+        }
+    }
+
+    private func spawnGoldSpark(at headPx: SIMD2<Float>, angle: Float, cone: Float, count: Int) {
+        var spawned = 0
+        for _ in 0..<count {
+            spawnParticle { [self] p in
+                let pAngle = angle + (rnd() - 0.5) * 2 * cone
+                let speedPx = 8 + rnd() * 20
+                p.x = pixelToNDCx(headPx.x); p.y = pixelToNDCy(headPx.y)
+                p.vx = cos(pAngle) * speedPx
+                p.vy = sin(pAngle) * speedPx
+                p.drag = 0.08; p.decay = 0.07 + rnd() * 0.06
+                p.streak = true                       // 拉長條狀（對齊 .kt streak）
+                p.streakHalfPx = 1.4 + rnd() * 1.8
+                if rnd() > 0.4 { p.r = 1; p.g = 0.95; p.b = 0.6 } else { p.r = 1; p.g = 1; p.b = 1 }
+            }
+            spawned += 1
+            if spawned >= count { break }
+        }
+    }
+}
+
+// MARK: - 破壞死光 DeathRay（additive 過載以白芯高 alpha 堆疊模擬）
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildDeathRay(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        guard samples.count >= 3 else { return }
+        // 依影片：DeathRay 以白熱光為主，陀螺色僅作極輕外暈染色。
+        let tint = headColor(samples)
+        let faintTint = mix(SIMD4(1, 1, 1, 1), tint, 0.22)   // 幾乎白、帶一點陀螺色
+
+        // ② 厚重白光柱（×3 重採樣）
+        let rs = resample(samples, factor: 3, cap: 64)
+        let pos = rs.pos, alp = rs.alpha
+        // 兩層：外暈（淡白、寬）+ 白芯（窄、高 alpha）模擬 additive 過載
+        appendRibbon(positions: pos, alphas: alp,
+                     halfWidthPx: ndcToPixels(0.055, minDim: minDim),
+                     color: faintTint, style: .deathRay, alphaScale: 0.55,
+                     widthTailBias: 0.72, widthHeadBias: 0.28,
+                     trailReversed: true, seedBase: Float(trackID), into: &geometry)
+        appendRibbon(positions: pos, alphas: alp,
+                     halfWidthPx: ndcToPixels(0.030, minDim: minDim),
+                     color: SIMD4(1, 1, 1, 1), style: .deathRay, alphaScale: 0.95,
+                     widthTailBias: 0.72, widthHeadBias: 0.28,
+                     trailReversed: true, seedBase: Float(trackID) + 1, into: &geometry)
+
+        let head = samples[samples.count - 1].position
+        // ① 核心電光球（每幀即時）：白熱外暈 + 白核 + 過載閃光
+        let jx = (rnd() - 0.5) * minDim * 0.010
+        let jy = (rnd() - 0.5) * minDim * 0.010
+        let flick = 0.7 + rnd() * 0.6
+        appendSprite(center: SIMD2(head.x + jx, head.y + jy),
+                     size: SIMD2(minDim * 0.075 * flick, minDim * 0.075 * flick),
+                     color: withAlpha(faintTint, 0.9), style: .haze, rotation: 0,
+                     seed: Float(trackID), age: 0, into: &geometry)
+        appendSprite(center: SIMD2(head.x + jx, head.y + jy),
+                     size: SIMD2(minDim * 0.030 * flick, minDim * 0.030 * flick),
+                     color: SIMD4(1, 1, 1, 1), style: .softCircle, rotation: 0,
+                     seed: 0, age: 0, into: &geometry)
+        if rnd() < 0.5 {
+            appendSprite(center: head,
+                         size: SIMD2(minDim * 0.11 * flick, minDim * 0.11 * flick),
+                         color: SIMD4(1, 1, 1, 0.8), style: .haze, rotation: 0,
+                         seed: 0, age: 0, into: &geometry)
+        }
+
+        // ① 向心微粒漩渦（跨幀，被吸入核心）
+        let hx = pixelToNDCx(head.x), hy = pixelToNDCy(head.y)
+        var spawns = 4 * dtScale
+        while spawns > 0 {
+            if spawns < 1 && rnd() > spawns { break }
+            spawnDeathVortex(cx: hx, cy: hy, minDim: minDim, tint: faintTint)
+            spawns -= 1
+        }
+
+        // ④ 熱浪（沿軌跡隨機，墊在光柱下層感）
+        if rnd() < 0.9 * dtScale {
+            let idx = min(Int(rnd() * Float(samples.count)), samples.count - 1)
+            let b = samples[idx].position
+            spawnParticle { [self] p in
+                p.x = pixelToNDCx(b.x) + (rnd() - 0.5) * 0.05
+                p.y = pixelToNDCy(b.y) + (rnd() - 0.5) * 0.05
+                p.size = minDim * (0.04 + rnd() * 0.03)
+                p.grow = 0.012; p.alpha = 0.10; p.decay = 0.002
+                p.style = .haze
+                p.r = 0.80; p.g = 0.90; p.b = 1.0
+            }
+        }
+    }
+
+    /// 向心微粒漩渦：極座標繞核心收斂（完全對齊 .kt updateVortex/drawVortexPoints）。
+    private func spawnDeathVortex(cx: Float, cy: Float, minDim: Float, tint: SIMD4<Float>) {
+        spawnParticle { [self] p in
+            p.orbital = true
+            p.cx = cx; p.cy = cy
+            p.angle = rnd() * 2 * Float.pi
+            p.orbSpawnRadiusPx = minDim * (0.07 + rnd() * 0.06)
+            p.orbRadiusPx = p.orbSpawnRadiusPx
+            p.orbAngVel = 0.16 + rnd() * 0.12        // 同向 → 一致漩渦
+            p.orbInVelPx = minDim * (0.009 + rnd() * 0.006)
+            p.size = 3 + rnd() * 3
+            p.style = .softCircle
+            if rnd() < 0.35 { p.r = 1; p.g = 1; p.b = 1 }
+            else { p.r = tint.x; p.g = tint.y; p.b = tint.z }
+        }
+    }
+}
+
+// MARK: - 翡翠破壞 Emerald
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildEmerald(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        guard samples.count >= 3 else { return }
+        let base = headColor(samples)
+
+        // ③ 神木年輪（最底層，淡同心圓 ring sprite）
+        let head = samples[samples.count - 1].position
+        let pulse = 0.92 + 0.08 * sin(now * 1.5)
+        for ring in 0..<4 {
+            let rad = minDim * (0.045 + Float(ring) * 0.038) * pulse
+            let a: Float = 0.16 * (1 - Float(ring) / 4 * 0.5)
+            appendSprite(center: head,
+                         size: SIMD2(rad * 2 / 0.72, rad * 2 / 0.72),
+                         color: SIMD4(base.x, base.y, base.z, a),
+                         style: .ring, rotation: now * 0.2 * (ring % 2 == 0 ? 1 : -1),
+                         seed: Float(ring), age: 0.2, into: &geometry)
+        }
+
+        // ① 藤蔓拖尾（×3 重採樣 + 蜿蜒），shader case 10 emerald 給葉脈
+        let rs = resample(samples, factor: 3, cap: 64)
+        let pos = rs.pos, alp = rs.alpha
+        let m = pos.count
+        let VINE_AMP = ndcToPixels(0.018, minDim: minDim)
+        let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+            let u = Float(j) / Float(m - 1)
+            let wave = sin(u * 2.0 * 2 * Float.pi - now * 4.0)
+            return normal * (wave * VINE_AMP * (1 - u))
+        }
+        appendRibbon(positions: pos, alphas: alp,
+                     halfWidthPx: ndcToPixels(0.030, minDim: minDim),
+                     color: base, style: .emerald, alphaScale: 1.0,
+                     widthTailBias: 0.35, widthHeadBias: 0.65,
+                     centerlineOffset: offset, trailReversed: true,
+                     seedBase: Float(trackID), into: &geometry)
+
+        // ④ 風中翻滾葉片（跨幀）
+        guard samples.count >= 4 else { return }
+        let mo = headMotion(samples, dtScale: dtScale)
+        let dx = pixelToNDCx(mo.head.x) - pixelToNDCx(mo.prev.x)
+        let dy = pixelToNDCy(mo.head.y) - pixelToNDCy(mo.prev.y)
+        let dirAngle = atan2(dy, dx)
+        if rnd() < 0.5 * dtScale {
+            let idx = min(Int(rnd() * Float(samples.count) * 0.7), samples.count - 1)
+            let l = samples[idx].position
+            spawnParticle { [self] p in
+                let back = dirAngle + Float.pi + (rnd() - 0.5) * 1.0
+                let speed = minDim * (0.004 + rnd() * 0.006)
+                p.x = pixelToNDCx(l.x) + (rnd() - 0.5) * 0.03
+                p.y = pixelToNDCy(l.y) + (rnd() - 0.5) * 0.03
+                p.vx = cos(back) * speed
+                p.vy = sin(back) * speed
+                p.angle = rnd() * 2 * Float.pi
+                p.spin = (0.12 + rnd() * 0.18) * (rnd() < 0.5 ? 1 : -1)
+                p.drag = 0.02; p.decay = 0.025 + rnd() * 0.02
+                p.size = minDim * (0.018 + rnd() * 0.016)   // lenPx
+                p.aspect = 0.45 + rnd() * 0.25              // widPx/lenPx
+                p.style = .leaf
+                let withered = rnd() < 0.45
+                let c = withered ? darken(base, 0.45) : base
+                p.r = c.x; p.g = c.y; p.b = c.z
+            }
+        }
+    }
+}
+
+// MARK: - 水墨橫空 InkWash
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildInkWash(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, geometry: inout PicFrameGeometry
+    ) {
+        guard samples.count >= 3 else { return }
+        let base = headColor(samples)
+        let rs = resample(samples, factor: 3, cap: 64)
+        let pos = rs.pos, alp = rs.alpha
+        let m = pos.count
+        let INK_HW = ndcToPixels(0.040, minDim: minDim)
+        let INK_AMP = ndcToPixels(0.022, minDim: minDim)
+
+        // 3 束：strand0 主墨帶（壓上），strand1/2 極細破空弧線（墊底）→ 由後往前畫
+        for strand in stride(from: 2, through: 0, by: -1) {
+            let isMain = strand == 0
+            let hwBase = isMain ? INK_HW : INK_HW * 0.16
+            let sideSign: Float = strand % 2 == 1 ? 1 : -1
+            let ampMult: Float = isMain ? 0.30 : 1
+            let phase = Float(strand) * 1.7
+            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+                let u = Float(j) / Float(m - 1)
+                let wave = sin(u * 1.6 * 2 * Float.pi + phase - now * 3.0)
+                let off = wave * INK_AMP * ampMult * (1 - 0.4 * u)
+                    + sideSign * hwBase * (isMain ? 0 : 2.2)
+                return normal * off
+            }
+            appendRibbon(positions: pos, alphas: alp,
+                         halfWidthPx: hwBase,
+                         color: base, style: .inkWash, alphaScale: isMain ? 1.0 : 0.45,
+                         widthTailBias: 0.30, widthHeadBias: 0.70,
+                         centerlineOffset: offset, trailReversed: true,
+                         seedBase: Float(trackID) + phase, into: &geometry)
+        }
+
+        // 墨滴飛濺（跨幀，dissolve 以 inkDrop sprite + 縮短壽命近似）
+        if rnd() < 0.25 * dtScale {
+            let idx = min(Int(rnd() * Float(samples.count) * 0.7), samples.count - 1)
+            let t = samples[idx].position
+            spawnParticle { [self] p in
+                let angle = rnd() * 2 * Float.pi
+                let speed = minDim * (0.002 + rnd() * 0.004)
+                p.x = pixelToNDCx(t.x) + (rnd() - 0.5) * 0.02
+                p.y = pixelToNDCy(t.y) + (rnd() - 0.5) * 0.02
+                p.vx = cos(angle) * speed
+                p.vy = sin(angle) * speed
+                p.drag = 0.04; p.grow = 0.015 + rnd() * 0.02
+                p.size = minDim * (0.006 + rnd() * 0.010)   // sizePx（GL_POINTS 直徑）
+                p.maxLife = 18 + rnd() * 16                 // .kt life（幀），age/life 控制溶散
+                p.style = .inkDrop
+                let c = darken(base, 0.6)
+                p.r = c.x; p.g = c.y; p.b = c.z
+            }
+        }
+    }
+}
+
+// MARK: - 噴漆塗鴉 SprayPaint
+extension PicTrailSceneBuilder {
+
+    fileprivate func buildSprayPaint(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, width: Float, height: Float, geometry: inout PicFrameGeometry
+    ) {
+        guard samples.count >= 3 else { return }
+        let vividColor = vivid(headColor(samples))
+        let positions = samples.map { $0.position }
+        let alphas = samples.map { $0.alpha }
+
+        // 噴漆拖尾（shader case 12 spray paint 給顆粒），鮮豔平塗——這是主視覺
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.034, minDim: minDim),
+                     color: vividColor, style: .sprayPaint, alphaScale: 0.96,
+                     widthTailBias: 0.45, widthHeadBias: 0.55, seedBase: Float(trackID),
+                     into: &geometry)
+
+        // 對齊 .kt splat 生成條件；依需求5「不鋪滿畫面」，保留 .kt 的 splat 但不啟用每幀 mist。
+        guard samples.count >= 2 else { return }
+        let mo = headMotion(samples, dtScale: dtScale)
+        let dx = pixelToNDCx(mo.head.x) - pixelToNDCx(mo.prev.x)
+        let dy = pixelToNDCy(mo.head.y) - pixelToNDCy(mo.prev.y)
+        let moveAngle = atan2(dy, dx)
+        if throttle(trackID, head: mo.head, threshold: 0.006) {
+            if mo.moveNorm > 0.010 && rnd() > 0.45 {
+                let side: Float = rnd() > 0.5 ? 1 : -1
+                spawnSplat(at: mo.head, angle: moveAngle + side * 1.4, minDim: minDim,
+                           samples: samples, big: false)
+            }
+            if mo.moveNorm > 0.018 {
+                let back = moveAngle + Float.pi
+                for _ in 0..<2 {
+                    spawnSplat(at: mo.head, angle: back + (rnd() - 0.5) * 1.2, minDim: minDim,
+                               samples: samples, big: true)
+                }
+            }
+        }
+    }
+
+    private func spawnSplat(at headPx: SIMD2<Float>, angle: Float, minDim: Float,
+                            samples: [Sample], big: Bool) {
+        spawnParticle { [self] p in
+            let speed = big ? minDim * (0.006 + rnd() * 0.010) : minDim * (0.004 + rnd() * 0.006)
+            p.x = pixelToNDCx(headPx.x) + (rnd() - 0.5) * 0.02
+            p.y = pixelToNDCy(headPx.y) + (rnd() - 0.5) * 0.02
+            p.vx = cos(angle) * speed
+            p.vy = sin(angle) * speed
+            p.drag = 0.18
+            p.grow = 0.12 + rnd() * 0.08
+            p.size = big ? minDim * (0.020 + rnd() * 0.020) : minDim * (0.010 + rnd() * 0.010)
+            p.decay = big ? 0.025 + rnd() * 0.02 : 0.04 + rnd() * 0.03
+            p.seed = rnd() * 2 * Float.pi
+            p.style = .splat
+            let c = vivid(headColor(samples), lightJitter: (rnd() - 0.5) * 0.2)
+            p.r = c.x; p.g = c.y; p.b = c.z
+        }
+    }
+}
+
+// MARK: - Lightning / Fire / Stardust（對齊 Android GenericGLEffect：glow + core 雙層，陀螺色）
+extension PicTrailSceneBuilder {
+
+    /// Generic 雙層：寬 glow（alphaScale 0.45）+ 窄 core（alphaScale 0.92），
+    /// 顏色 = colorOverride 或陀螺色。此處以特效既有 colorOverride 慣例給定。
+    private func appendGenericTrail(
+        _ samples: [Sample], style: PicRibbonStyle, color: SIMD4<Float>,
+        glowMult: Float, coreMult: Float, minDim: Float, seed: Float,
+        into geometry: inout PicFrameGeometry
+    ) {
+        let positions = samples.map { $0.position }
+        let alphas = samples.map { $0.alpha }
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.070 * glowMult, minDim: minDim),
+                     color: color, style: style, alphaScale: 0.45,
+                     widthTailBias: 0.3, widthHeadBias: 0.7, seedBase: seed, into: &geometry)
+        appendRibbon(positions: positions, alphas: alphas,
+                     halfWidthPx: ndcToPixels(0.022 * coreMult, minDim: minDim),
+                     color: color, style: style, alphaScale: 0.92,
+                     widthTailBias: 0.3, widthHeadBias: 0.7, seedBase: seed + 1, into: &geometry)
+    }
+
+    fileprivate func buildLightning(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, geometry: inout PicFrameGeometry
+    ) {
+        // 閃電：colorOverride 黃色（Android Generic 慣例）
+        let yellow = SIMD4<Float>(1.0, 1.0, 0.333, 1)
+        appendGenericTrail(samples, style: .lightning, color: yellow,
+                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
+                           into: &geometry)
+        // 沿尾跡火花（保留 iOS 既有點綴，移到粒子池讓它有殘留）
+        let head = samples[samples.count - 1].position
+        if rnd() < 0.6 * dtScale {
+            spawnParticle { [self] p in
+                let angle = rnd() * 2 * Float.pi
+                p.x = pixelToNDCx(head.x); p.y = pixelToNDCy(head.y)
+                p.vx = cos(angle) * 6; p.vy = sin(angle) * 6
+                p.drag = 0.1; p.decay = 0.15; p.size = 12 + rnd() * 11
+                p.spin = 2; p.style = .spark
+                p.r = 1; p.g = 1; p.b = 0.92
+            }
+        }
+    }
+
+    fileprivate func buildFire(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, geometry: inout PicFrameGeometry
+    ) {
+        // 火焰：colorOverride 紅橙（Android Generic 慣例），shader case 2 fire 給火舌
+        let red = SIMD4<Float>(1.0, 0.165, 0.07, 1)
+        appendGenericTrail(samples, style: .fire, color: red,
+                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
+                           into: &geometry)
+        let head = samples[samples.count - 1].position
+        if rnd() < 0.8 * dtScale {
+            spawnParticle { [self] p in
+                p.x = pixelToNDCx(head.x); p.y = pixelToNDCy(head.y)
+                p.vx = (rnd() - 0.5) * 4
+                p.vy = 1.5 + rnd() * 3            // 上飄
+                p.drag = 0.05; p.decay = 0.07
+                p.size = (13 + rnd() * 15) * 1.2
+                p.aspect = 1.4
+                p.style = .fireball
+                p.r = 1; p.g = 0.6; p.b = 0.14
+            }
+        }
+    }
+
+    fileprivate func buildStardust(
+        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
+        minDim: Float, geometry: inout PicFrameGeometry
+    ) {
+        // 星塵：取陀螺色（無 override），shader case 3 stardust 給閃爍
+        let base = headColor(samples)
+        appendGenericTrail(samples, style: .stardust, color: base,
+                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
+                           into: &geometry)
+        // 星點繞行
+        for index in stride(from: 0, to: samples.count, by: 2) {
+            let s = samples[index]
+            let seed = random01(trackID * 23, index)
+            let age = 1 - s.alpha
+            let angle = seed * 2 * Float.pi
+            let center = s.position + unit(angle) * (8 + age * 30)
+            let pc = rgba(s.color)
+            appendSprite(center: center,
+                         size: SIMD2(repeating: 7 + seed * 13),
+                         color: withAlpha(mix(pc, SIMD4(1, 1, 1, 1), 0.55), s.alpha * 0.9),
+                         style: .star, rotation: now * 1.8 + angle, seed: seed, age: age,
+                         into: &geometry)
+        }
     }
 }

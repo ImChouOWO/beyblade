@@ -103,180 +103,127 @@ fragment float4 picRibbonFragment(
         )
     );
 
-    float3 color = input.color.rgb;
+    // 基底一律為傳入的陀螺色，各 style 只疊「質感」與「往白高光」，不再乘固定調色盤。
+    float3 base = input.color.rgb;
+    float3 color = base;
     float alpha = input.color.a * edge;
     int style = int(round(input.style));
 
     switch (style) {
-        case 1: { // lightning
+        case 1: { // lightning — 亮色閃電（陀螺色 + 強白芯 + 斷續脈動）
             float pulse = 0.72
                 + 0.28 * sin(input.time * 23.0 + input.uv.y * 38.0);
             float broken = smoothstep(0.20, 0.58, n);
-            color = mix(color, float3(1.0), core * 0.78);
+            color = mix(base, float3(1.0), core * 0.85);
             alpha *= max(core * 0.95, broken * 0.50) * pulse;
             break;
         }
 
-        case 2: { // fire
-            float tongue = smoothstep(
-                0.15,
-                0.88,
-                n + (1.0 - side) * 0.30
+        case 2: { // fire — 火舌（陀螺色 + 沿時間捲動的舔動 + 白熱核）
+            float scroll = valueNoise(
+                float2(input.uv.y * 16.0 - input.time * 8.0, input.uv.x * 1.6)
             );
-            color = mix(
-                color * float3(0.95, 0.38, 0.10),
-                float3(1.0, 0.92, 0.36),
-                core * 0.72
-            );
+            float tongue = smoothstep(0.15, 0.88, mix(n, scroll, 0.6) + (1.0 - side) * 0.30);
+            color = mix(base, float3(1.0), core * 0.55);   // 核心提亮成熱白，色相維持陀螺色
             alpha *= tongue * (0.64 + core * 0.46);
             break;
         }
 
-        case 3: { // stardust
+        case 3: { // stardust — 星塵（陀螺色 + 閃爍 + 白芯）
             float twinkle = 0.58
                 + 0.42 * sin(input.time * 15.0 + input.seed * 91.0);
-            color = mix(color, float3(1.0), core * 0.62);
+            color = mix(base, float3(1.0), core * 0.62);
             alpha *= 0.62 + twinkle * 0.38;
             break;
         }
 
-        case 4: { // wave
+        case 4: { // wave — 流動水帶（陀螺色 + 波紋 + 白沫）
             float wave = 0.72
-                + 0.28 * sin(
-                    input.uv.y * 34.0
-                    - input.time * 9.0
-                    + input.uv.x * 5.0
-                );
+                + 0.28 * sin(input.uv.y * 34.0 - input.time * 9.0 + input.uv.x * 5.0);
             float foam = smoothstep(0.68, 0.96, n + core * 0.30);
-            color = mix(
-                color * float3(0.30, 0.68, 1.0),
-                float3(0.82, 0.97, 1.0),
-                foam * 0.78
-            );
+            // 白沫往白，其餘維持陀螺色（不再強制藍）
+            color = mix(base, float3(1.0), foam * 0.7 + core * 0.18);
             alpha *= wave * (0.52 + foam * 0.55);
             break;
         }
 
-        case 5: { // money
+        case 5: { // money — 由 Swift 傳入固定金色，shader 只加金屬高光（不二次染色）
             float glint = pow(
-                max(
-                    0.0,
-                    sin(input.uv.y * 42.0 - input.time * 11.0)
-                ),
+                max(0.0, sin(input.uv.y * 42.0 - input.time * 11.0)),
                 10.0
             );
-            color = mix(
-                color * float3(0.90, 0.55, 0.08),
-                float3(1.0, 0.97, 0.58),
-                core * 0.55 + glint * 0.62
-            );
+            color = mix(base, float3(1.0, 0.97, 0.66), core * 0.45 + glint * 0.6);
             alpha *= 0.76 + glint * 0.36;
             break;
         }
 
-        case 6: { // blade
+        case 6: { // blade — 刀刃（陀螺色 + 斜面高光 + 白刃口）
             float bevel = smoothstep(0.78, 0.12, side);
             float glint = pow(
-                max(
-                    0.0,
-                    sin(input.uv.y * 55.0 + input.time * 8.0)
-                ),
+                max(0.0, sin(input.uv.y * 55.0 + input.time * 8.0)),
                 13.0
             );
-            color = mix(
-                color * float3(0.48, 0.73, 0.92),
-                float3(1.0),
-                bevel * 0.67 + glint
-            );
+            color = mix(base, float3(1.0), bevel * 0.55 + glint);
             alpha *= 0.63 + bevel * 0.48;
             break;
         }
 
-        case 7: { // ice
+        case 7: { // ice — 冰刃（陀螺色 + 結晶紋 + 白亮邊，不再強制藍）
             float crystal = smoothstep(
-                0.40,
-                0.86,
-                abs(
-                    sin(
-                        input.uv.y * 39.0
-                        + input.uv.x * 8.0
-                        + n * 4.0
-                    )
-                )
+                0.40, 0.86,
+                abs(sin(input.uv.y * 39.0 + input.uv.x * 8.0 + n * 4.0))
             );
-            color = mix(
-                color * float3(0.43, 0.76, 1.0),
-                float3(0.92, 1.0, 1.0),
-                core * 0.62 + crystal * 0.30
-            );
+            color = mix(base, float3(1.0), core * 0.5 + crystal * 0.32);
             alpha *= 0.58 + crystal * 0.48;
             break;
         }
 
-        case 8: { // crimson
-            float flame = smoothstep(0.22, 0.84, n + core * 0.36);
-            color = mix(
-                color * float3(0.72, 0.06, 0.08),
-                float3(1.0, 0.58, 0.12),
-                flame * 0.72 + core * 0.26
+        case 8: { // crimson — 火舌（陀螺色 + 捲動火紋 + 白熱核，不再強制紅）
+            float scroll = valueNoise(
+                float2(input.uv.y * 16.0 - input.time * 8.0, input.uv.x * 1.6)
             );
+            float flame = smoothstep(0.22, 0.84, mix(n, scroll, 0.6) + core * 0.36);
+            color = mix(base, float3(1.0), flame * 0.32 + core * 0.42);
             alpha *= 0.60 + flame * 0.52;
             break;
         }
 
-        case 9: { // death ray
+        case 9: { // death ray — 由 Swift 傳入近白色，shader 只加掃描白芯（不染紫）
             float scan = 0.78
                 + 0.22 * sin(input.uv.y * 70.0 - input.time * 18.0);
-            color = mix(
-                color * float3(0.65, 0.28, 1.0),
-                float3(1.0),
-                core * 0.92
-            );
+            color = mix(base, float3(1.0), core * 0.92);
             alpha *= scan * (0.50 + core * 0.70);
             break;
         }
 
-        case 10: { // emerald
+        case 10: { // emerald — 藤蔓帶（陀螺色 + 葉脈 + 亮芯，不再強制綠）
             float vein = pow(
-                max(
-                    0.0,
-                    sin(input.uv.y * 31.0 + input.uv.x * 5.0)
-                ),
+                max(0.0, sin(input.uv.y * 31.0 + input.uv.x * 5.0)),
                 8.0
             );
-            color = mix(
-                color * float3(0.18, 0.75, 0.40),
-                float3(0.72, 1.0, 0.46),
-                core * 0.56 + vein * 0.42
-            );
+            color = mix(base, float3(1.0), core * 0.4 + vein * 0.4);
             alpha *= 0.68 + vein * 0.32;
             break;
         }
 
-        case 11: { // ink wash
+        case 11: { // ink wash — 墨痕（陀螺色 + 飛白纖維 + 邊緣略乾，不再壓灰）
             float dry = smoothstep(0.26, 0.70, n + core * 0.18);
             float fibers = 0.60
-                + 0.40 * abs(
-                    sin(input.uv.y * 120.0 + input.seed * 27.0)
-                );
-            color = mix(
-                color,
-                float3(0.42),
-                (1.0 - core) * 0.18
-            );
+                + 0.40 * abs(sin(input.uv.y * 120.0 + input.seed * 27.0));
+            color = base;   // 墨色＝陀螺色本身
             alpha *= dry * fibers * (0.58 + core * 0.50);
             break;
         }
 
-        case 12: { // spray paint
+        case 12: { // spray paint — 噴漆（陀螺色 + 顆粒，僅略提亮）
             float porous = smoothstep(0.28, 0.72, n + core * 0.24);
-            color = min(color * 1.22, float3(1.0));
+            color = min(base * 1.12, float3(1.0));
             alpha *= porous * (0.56 + core * 0.46);
             break;
         }
 
         default: {
-            color = mix(color, float3(1.0), core * 0.30);
+            color = mix(base, float3(1.0), core * 0.30);
             alpha *= 0.72 + core * 0.30;
             break;
         }
@@ -385,24 +332,36 @@ fragment float4 picSpriteFragment(
             break;
         }
 
-        case 4: { // coin
-            float disc = 1.0 - smoothstep(0.78, 1.0, radius);
-            float rim = 1.0 - smoothstep(
-                0.06,
-                0.13,
-                abs(radius - 0.72)
-            );
-            float mark = 1.0 - smoothstep(
-                0.05,
-                0.16,
-                abs(p.x + 0.18 * sin(p.y * 8.0))
-            );
-            mask = disc;
-            color = mix(
-                color * float3(0.82, 0.50, 0.05),
-                float3(1.0, 0.94, 0.45),
-                clamp(rim + mark * 0.38, 0.0, 1.0)
-            );
+        case 4: { // coin — 金圓盤 + 深邊圈 + $ 字樣 + 左上高光（對齊 Android COIN_FRAG）
+            float r = radius;
+            mask = 1.0 - smoothstep(0.94, 1.0, r);
+            float3 gold = input.color.rgb;
+            float3 deep = gold * 0.55;
+            float3 col = mix(gold, deep, smoothstep(0.70, 0.95, r));
+            float rim = 1.0 - smoothstep(0.0, 0.05, abs(r - 0.80));
+            col = mix(col, deep, rim * 0.5);
+
+            const float PI = 3.14159265;
+            float2 g = p / 0.42;
+            // 上弧
+            float2 ptp = g - float2(0.0, 0.5);
+            float dt = abs(length(ptp) - 0.5);
+            float gt = abs(fmod(atan2(ptp.y, ptp.x) - (-0.6) + PI, 2.0 * PI) - PI);
+            float topArc = (1.0 - smoothstep(0.11, 0.18, dt)) * step(0.95, gt);
+            // 下弧
+            float2 pb = g - float2(0.0, -0.5);
+            float db = abs(length(pb) - 0.5);
+            float gb = abs(fmod(atan2(pb.y, pb.x) - (2.4) + PI, 2.0 * PI) - PI);
+            float botArc = (1.0 - smoothstep(0.11, 0.18, db)) * step(0.95, gb);
+            // 中央直槓
+            float bar = (1.0 - smoothstep(0.08, 0.13, abs(g.x)))
+                      * (1.0 - smoothstep(1.08, 1.24, abs(g.y)));
+            float dollar = clamp(topArc + botArc + bar, 0.0, 1.0);
+            col = mix(col, deep * 0.5, dollar);
+            // 左上高光（$ 處不打光）
+            float hl = smoothstep(0.62, 0.0, length(p - float2(-0.32, 0.32)));
+            col = mix(col, float3(1.0), hl * 0.5 * (1.0 - dollar));
+            color = col;
             break;
         }
 
@@ -451,7 +410,7 @@ fragment float4 picSpriteFragment(
                 0.11,
                 abs(p.x + 0.12 * sin(p.y * 5.0))
             );
-            color = mix(color, float3(0.80, 1.0, 0.52), vein * 0.48);
+            color = mix(color, float3(1.0), vein * 0.32);   // 葉脈往白，色相維持陀螺色
             break;
         }
 
@@ -488,6 +447,11 @@ fragment float4 picSpriteFragment(
                 radius
             );
             color = mix(color, float3(1.0), 0.66);
+            break;
+        }
+
+        case 13: { // solid triangle (多邊形 / streak)：實心，直接用頂點色
+            mask = 1.0;
             break;
         }
 

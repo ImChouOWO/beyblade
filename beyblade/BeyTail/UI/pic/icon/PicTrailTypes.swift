@@ -31,6 +31,7 @@ enum PicSpriteStyle: Float {
     case inkDrop = 10
     case splat = 11
     case star = 12
+    case solidTri = 13    // 多邊形 / streak 用：mask 恆 1，直接吃頂點色
 }
 
 struct PicUniforms {
