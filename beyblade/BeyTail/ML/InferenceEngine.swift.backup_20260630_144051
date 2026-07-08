@@ -29,10 +29,6 @@ final class InferenceEngine: @unchecked Sendable {
 
     private var activeFrameSize = CGSize(width: 1, height: 1)
 
-    private let dominantColorExtractor = DominantColorExtractor()
-    private var activeColorPixelBuffer: CVPixelBuffer?
-    private var activeColorOrientation: CGImagePropertyOrientation = .up
-
     private let confidenceThreshold: Float = 0.30
     private let nmsIoUThreshold: CGFloat = 0.35
     private let maxOutputDetections = 20
@@ -326,9 +322,6 @@ final class InferenceEngine: @unchecked Sendable {
                 height: frameHeight
             )
 
-            self.activeColorPixelBuffer = boxedPixelBuffer.value
-            self.activeColorOrientation = frameOrientation
-
             let handler = VNImageRequestHandler(
                 cvPixelBuffer: boxedPixelBuffer.value,
                 orientation: frameOrientation,
@@ -343,7 +336,6 @@ final class InferenceEngine: @unchecked Sendable {
                     error.localizedDescription
                 )
 
-                self.activeColorPixelBuffer = nil
                 self.isProcessing = false
 
                 DispatchQueue.main.async { [weak self] in
@@ -456,15 +448,9 @@ final class InferenceEngine: @unchecked Sendable {
                     )
                 }
 
-            let filtered = nonMaximumSuppression(
+            return nonMaximumSuppression(
                 detections,
                 iouThreshold: nmsIoUThreshold
-            )
-
-            return applyingDominantColors(
-                to: filtered,
-                pixelBuffer: pixelBuffer,
-                orientation: orientation
             )
         }
 
@@ -475,15 +461,9 @@ final class InferenceEngine: @unchecked Sendable {
                 sourceFrameSize: frameSize
             )
 
-            let filtered = nonMaximumSuppression(
+            return nonMaximumSuppression(
                 decoded,
                 iouThreshold: nmsIoUThreshold
-            )
-
-            return applyingDominantColors(
-                to: filtered,
-                pixelBuffer: pixelBuffer,
-                orientation: orientation
             )
         }
 
@@ -498,7 +478,6 @@ final class InferenceEngine: @unchecked Sendable {
     ) {
         defer {
             inferenceQueue.async { [weak self] in
-                self?.activeColorPixelBuffer = nil
                 self?.isProcessing = false
             }
         }
@@ -582,12 +561,8 @@ final class InferenceEngine: @unchecked Sendable {
             iouThreshold: nmsIoUThreshold
         )
 
-        let colored = applyingDominantColors(
-            to: filtered
-        )
-
-        DispatchQueue.main.async { [weak self, colored] in
-            self?.onResult?(colored)
+        DispatchQueue.main.async { [weak self, filtered] in
+            self?.onResult?(filtered)
         }
     }
 
@@ -639,12 +614,8 @@ final class InferenceEngine: @unchecked Sendable {
             iouThreshold: nmsIoUThreshold
         )
 
-        let colored = applyingDominantColors(
-            to: filtered
-        )
-
-        DispatchQueue.main.async { [weak self, colored] in
-            self?.onResult?(colored)
+        DispatchQueue.main.async { [weak self, filtered] in
+            self?.onResult?(filtered)
         }
     }
 
@@ -1026,45 +997,6 @@ final class InferenceEngine: @unchecked Sendable {
         upper: CGFloat
     ) -> CGFloat {
         min(max(value, lower), upper)
-    }
-
-    // MARK: - Dominant Color
-
-    private func applyingDominantColors(
-        to detections: [DetectionResult]
-    ) -> [DetectionResult] {
-        guard let pixelBuffer = activeColorPixelBuffer else {
-            return detections
-        }
-
-        return applyingDominantColors(
-            to: detections,
-            pixelBuffer: pixelBuffer,
-            orientation: activeColorOrientation
-        )
-    }
-
-    private func applyingDominantColors(
-        to detections: [DetectionResult],
-        pixelBuffer: CVPixelBuffer,
-        orientation: CGImagePropertyOrientation
-    ) -> [DetectionResult] {
-        detections.map { detection in
-            let detectedColor = dominantColorExtractor.extract(
-                from: pixelBuffer,
-                normalizedRect: detection.boundingBox,
-                orientation: orientation
-            ) ?? detection.dominantColor
-
-            return DetectionResult(
-                boundingBox: detection.boundingBox,
-                confidence: detection.confidence,
-                fps: detection.fps,
-                hardware: detection.hardware,
-                trackId: detection.trackId,
-                dominantColor: detectedColor
-            )
-        }
     }
 
     // MARK: - NMS

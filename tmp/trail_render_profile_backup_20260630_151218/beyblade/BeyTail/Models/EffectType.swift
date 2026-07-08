@@ -7,7 +7,7 @@ enum InferenceHardware: String {
     case mock = "MOCK"
 }
 
-enum EffectType: String, CaseIterable, Identifiable, Sendable {
+enum EffectType: String, CaseIterable, Identifiable {
     case lightning
     case fire
     case stardust
@@ -414,7 +414,43 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
     }
 
     var fadeDurationMs: Int64 {
-        return trailRenderProfile.lengthMs
+        switch self {
+        case .lightning:
+            return 400
+
+        case .fire:
+            return 600
+
+        case .stardust:
+            return 280
+
+        case .wave:
+            return 800
+
+        case .thunder:
+            return 650
+
+        case .vortex:
+            return 320
+
+        case .dark:
+            return 800
+
+        case .crimson:
+            return 780
+
+        case .deathRay:
+            return 520
+
+        case .emerald:
+            return 720
+
+        case .inkWash:
+            return 900
+
+        case .spray:
+            return 700
+        }
     }
 }
 

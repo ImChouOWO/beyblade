@@ -73,7 +73,7 @@ final class MainViewModel: ObservableObject {
     let tracker = BeybladeTracker()
     let trailEffectEngine = TrailEffectEngine()
     let recordingTrailEffectEngine = TrailEffectEngine()
-    let trailOverlayView = TrailOverlayView()
+    let trailOverlayView = TrailOverlayView(frame: .zero)
     let videoFrameSource = VideoFrameSource()
     let recordingManager = RecordingManager()
 
