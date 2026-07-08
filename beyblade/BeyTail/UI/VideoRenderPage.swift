@@ -94,7 +94,24 @@ struct VideoRenderPage: View {
             return [forcedTrialEffect]
         }
 
-        return EffectType.allCases
+        let allEffects = EffectType.allCases
+
+        let freeEffects = allEffects.filter {
+            $0.isDefaultOwned
+        }
+
+        let purchasedPaidEffects = allEffects.filter {
+            !$0.isDefaultOwned &&
+            purchaseStore.isPurchased($0)
+        }
+
+        let lockedEffects = allEffects.filter {
+            !purchaseStore.isPurchased($0)
+        }
+
+        return freeEffects
+            + purchasedPaidEffects
+            + lockedEffects
     }
 
     private var canStartProcessing: Bool {

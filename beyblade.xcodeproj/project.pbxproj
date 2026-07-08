@@ -6,8 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		ECACEEEF2FFDE6CE00327416 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = ECACEEEE2FFDE6CE00327416 /* StoreKit.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		EC2BCF1C2FD3F86B004986A9 /* beyblade.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = beyblade.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		ECACEEEE2FFDE6CE00327416 /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = System/Library/Frameworks/StoreKit.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -37,6 +42,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				ECACEEEF2FFDE6CE00327416 /* StoreKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -47,6 +53,7 @@
 			isa = PBXGroup;
 			children = (
 				EC2BCF1E2FD3F86B004986A9 /* beyblade */,
+				ECACEEED2FFDE6CE00327416 /* Frameworks */,
 				EC2BCF1D2FD3F86B004986A9 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -57,6 +64,14 @@
 				EC2BCF1C2FD3F86B004986A9 /* beyblade.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		ECACEEED2FFDE6CE00327416 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				ECACEEEE2FFDE6CE00327416 /* StoreKit.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -260,14 +275,13 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = U64ZR9F464;
+				DEVELOPMENT_TEAM = YLNT44UQ67;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = beyblade/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "";
-				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";
@@ -310,14 +324,13 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = U64ZR9F464;
+				DEVELOPMENT_TEAM = YLNT44UQ67;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = beyblade/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "";
-				INFOPLIST_KEY_LSApplicationCategoryType = "";
 				INFOPLIST_KEY_NSCameraUsageDescription = "需要使用相機辨識陀螺並顯示軌跡特效";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "需要使用麥克風錄製影片聲音";
 				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "需要儲存錄影結果到相簿";
