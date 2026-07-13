@@ -1485,97 +1485,161 @@ extension PicTrailSceneBuilder {
     }
 }
 
-// MARK: - Lightning / Fire / Stardust（對齊 Android GenericGLEffect：glow + core 雙層，陀螺色）
+// MARK: - Lightning / Fire / Stardust
+// 三個基礎特效只有軌跡，不產生任何獨立粒子。
+
 extension PicTrailSceneBuilder {
 
-    /// Generic 雙層：寬 glow（alphaScale 0.45）+ 窄 core（alphaScale 0.92），
-    /// 顏色 = colorOverride 或陀螺色。此處以特效既有 colorOverride 慣例給定。
     private func appendGenericTrail(
-        _ samples: [Sample], style: PicRibbonStyle, color: SIMD4<Float>,
-        glowMult: Float, coreMult: Float, minDim: Float, seed: Float,
+        _ samples: [Sample],
+        style: PicRibbonStyle,
+        color: SIMD4<Float>,
+        glowMult: Float,
+        coreMult: Float,
+        minDim: Float,
+        seed: Float,
         into geometry: inout PicFrameGeometry
     ) {
-        let positions = samples.map { $0.position }
-        let alphas = samples.map { $0.alpha }
-        appendRibbon(positions: positions, alphas: alphas,
-                     halfWidthPx: ndcToPixels(0.070 * glowMult, minDim: minDim),
-                     color: color, style: style, alphaScale: 0.45,
-                     widthTailBias: 0.3, widthHeadBias: 0.7, seedBase: seed, into: &geometry)
-        appendRibbon(positions: positions, alphas: alphas,
-                     halfWidthPx: ndcToPixels(0.022 * coreMult, minDim: minDim),
-                     color: color, style: style, alphaScale: 0.92,
-                     widthTailBias: 0.3, widthHeadBias: 0.7, seedBase: seed + 1, into: &geometry)
+        let positions = samples.map {
+            $0.position
+        }
+
+        let alphas = samples.map {
+            $0.alpha
+        }
+
+        // 外層 Glow
+        appendRibbon(
+            positions: positions,
+            alphas: alphas,
+            halfWidthPx: ndcToPixels(
+                0.070 * glowMult,
+                minDim: minDim
+            ),
+            color: color,
+            style: style,
+            alphaScale: 0.45,
+            widthTailBias: 0.3,
+            widthHeadBias: 0.7,
+            seedBase: seed,
+            into: &geometry
+        )
+
+        // 內層 Core
+        appendRibbon(
+            positions: positions,
+            alphas: alphas,
+            halfWidthPx: ndcToPixels(
+                0.022 * coreMult,
+                minDim: minDim
+            ),
+            color: color,
+            style: style,
+            alphaScale: 0.92,
+            widthTailBias: 0.3,
+            widthHeadBias: 0.7,
+            seedBase: seed + 1,
+            into: &geometry
+        )
     }
 
     fileprivate func buildLightning(
-        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
-        minDim: Float, geometry: inout PicFrameGeometry
+        _ samples: [Sample],
+        trackID: Int,
+        now: Float,
+        dtScale: Float,
+        minDim: Float,
+        geometry: inout PicFrameGeometry
     ) {
-        // 閃電：colorOverride 黃色（Android Generic 慣例）
-        let yellow = SIMD4<Float>(1.0, 1.0, 0.333, 1)
-        appendGenericTrail(samples, style: .lightning, color: yellow,
-                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
-                           into: &geometry)
-        // 沿尾跡火花（保留 iOS 既有點綴，移到粒子池讓它有殘留）
-        let head = samples[samples.count - 1].position
-        if rnd() < 0.6 * dtScale {
-            spawnParticle { [self] p in
-                let angle = rnd() * 2 * Float.pi
-                p.x = pixelToNDCx(head.x); p.y = pixelToNDCy(head.y)
-                p.vx = cos(angle) * 6; p.vy = sin(angle) * 6
-                p.drag = 0.1; p.decay = 0.15; p.size = 12 + rnd() * 11
-                p.spin = 2; p.style = .spark
-                p.r = 1; p.g = 1; p.b = 0.92
-            }
+        guard samples.count >= 2 else {
+            return
         }
+
+        let yellow = SIMD4<Float>(
+            1.0,
+            1.0,
+            0.333,
+            1.0
+        )
+
+        appendGenericTrail(
+            samples,
+            style: .lightning,
+            color: yellow,
+            glowMult: 1.0,
+            coreMult: 1.0,
+            minDim: minDim,
+            seed: Float(trackID),
+            into: &geometry
+        )
+
+        // 不生成閃電火花。
+        _ = now
+        _ = dtScale
     }
 
     fileprivate func buildFire(
-        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
-        minDim: Float, geometry: inout PicFrameGeometry
+        _ samples: [Sample],
+        trackID: Int,
+        now: Float,
+        dtScale: Float,
+        minDim: Float,
+        geometry: inout PicFrameGeometry
     ) {
-        // 火焰：colorOverride 紅橙（Android Generic 慣例），shader case 2 fire 給火舌
-        let red = SIMD4<Float>(1.0, 0.165, 0.07, 1)
-        appendGenericTrail(samples, style: .fire, color: red,
-                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
-                           into: &geometry)
-        let head = samples[samples.count - 1].position
-        if rnd() < 0.8 * dtScale {
-            spawnParticle { [self] p in
-                p.x = pixelToNDCx(head.x); p.y = pixelToNDCy(head.y)
-                p.vx = (rnd() - 0.5) * 4
-                p.vy = 1.5 + rnd() * 3            // 上飄
-                p.drag = 0.05; p.decay = 0.07
-                p.size = (13 + rnd() * 15) * 1.2
-                p.aspect = 1.4
-                p.style = .fireball
-                p.r = 1; p.g = 0.6; p.b = 0.14
-            }
+        guard samples.count >= 2 else {
+            return
         }
+
+        let red = SIMD4<Float>(
+            1.0,
+            0.165,
+            0.07,
+            1.0
+        )
+
+        appendGenericTrail(
+            samples,
+            style: .fire,
+            color: red,
+            glowMult: 1.0,
+            coreMult: 1.0,
+            minDim: minDim,
+            seed: Float(trackID),
+            into: &geometry
+        )
+
+        // 不生成火球粒子。
+        _ = now
+        _ = dtScale
     }
 
     fileprivate func buildStardust(
-        _ samples: [Sample], trackID: Int, now: Float, dtScale: Float,
-        minDim: Float, geometry: inout PicFrameGeometry
+        _ samples: [Sample],
+        trackID: Int,
+        now: Float,
+        dtScale: Float,
+        minDim: Float,
+        geometry: inout PicFrameGeometry
     ) {
-        // 星塵：取陀螺色（無 override），shader case 3 stardust 給閃爍
-        let base = headColor(samples)
-        appendGenericTrail(samples, style: .stardust, color: base,
-                           glowMult: 1, coreMult: 1, minDim: minDim, seed: Float(trackID),
-                           into: &geometry)
-        // 星點繞行
-        for index in stride(from: 0, to: samples.count, by: 2) {
-            let s = samples[index]
-            let seed = random01(trackID * 23, index)
-            let age = 1 - s.alpha
-            let angle = seed * 2 * Float.pi
-            let center = s.position + unit(angle) * (8 + age * 30)
-            let pc = rgba(s.color)
-            appendSprite(center: center,
-                         size: SIMD2(repeating: 7 + seed * 13),
-                         color: withAlpha(mix(pc, SIMD4(1, 1, 1, 1), 0.55), s.alpha * 0.9),
-                         style: .star, rotation: now * 1.8 + angle, seed: seed, age: age,
-                         into: &geometry)
+        guard samples.count >= 2 else {
+            return
         }
+
+        let baseColor = headColor(samples)
+
+        appendGenericTrail(
+            samples,
+            style: .stardust,
+            color: baseColor,
+            glowMult: 1.0,
+            coreMult: 1.0,
+            minDim: minDim,
+            seed: Float(trackID),
+            into: &geometry
+        )
+
+        // 不生成星形 Sprite。
+        _ = now
+        _ = dtScale
     }
 }
