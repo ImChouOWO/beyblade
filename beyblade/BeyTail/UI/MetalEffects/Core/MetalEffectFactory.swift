@@ -2,42 +2,57 @@ import Foundation
 
 enum MetalEffectFactory {
     static func makeEffect(
-        for type: EffectType
+        for effectType: EffectType
     ) -> MetalEffect {
-        switch type {
+        let renderer: MetalEffect
+
+        switch effectType {
         case .lightning,
              .fire,
              .stardust:
-            // 三個基礎特效只使用通用純軌跡 renderer。
-            return GenericMetalEffect()
+            // 三個基礎特效只使用純軌跡 renderer。
+            renderer = GenericMetalEffect()
 
         case .wave:
-            return WaveMetalEffect()
+            renderer = WaveMetalEffect()
 
         case .thunder:
-            return MoneyMetalEffect()
+            renderer = MoneyMetalEffect()
 
         case .vortex:
-            // 只有爆刃亂舞可以使用劍刃粒子。
-            return BladeMetalEffect()
+            // 只有爆刃亂舞使用 BladeMetalEffect。
+            renderer = BladeMetalEffect()
 
         case .dark:
-            return IceShatterMetalEffect()
+            renderer = IceShatterMetalEffect()
 
         case .crimson:
-            return CrimsonLotusMetalEffect()
+            renderer = CrimsonLotusMetalEffect()
 
         case .deathRay:
-            return DeathRayMetalEffect()
+            renderer = DeathRayMetalEffect()
 
         case .emerald:
-            return EmeraldMetalEffect()
+            renderer = EmeraldMetalEffect()
 
         case .inkWash:
-            return InkWashMetalEffect()
+            renderer = InkWashMetalEffect()
 
         case .spray:
-            return SprayPaintMetalEffect()
+            renderer = SprayPaintMetalEffect()
         }
+
+        #if DEBUG
+        print(
+            "[MetalEffectFactory]",
+            effectType.rawValue,
+            "->",
+            String(
+                describing: Swift.type(of: renderer)
+            )
+        )
+        #endif
+
+        return renderer
     }
 }
