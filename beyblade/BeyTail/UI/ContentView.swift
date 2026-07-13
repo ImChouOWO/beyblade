@@ -277,12 +277,23 @@ struct ContentView: View {
     private let maximumQuickEffectCount = 6
 
     private var configuredQuickEffectCount: Int {
-        let storedCount = effectMenuIDsRaw
-            .split(separator: ",")
+        let storedCount = EffectQuickMenuStore
+            .decode(effectMenuIDsRaw)
             .count
-        let fallbackCount = EffectType.defaultMenuEffects.count
-        let count = storedCount == 0 ? fallbackCount : storedCount
-        return min(max(count, 1), maximumQuickEffectCount)
+
+        let hasStoredConfiguration =
+            UserDefaults.standard.object(
+                forKey: EffectQuickMenuStore.storageKey
+            ) != nil
+
+        let count = hasStoredConfiguration
+            ? storedCount
+            : EffectType.defaultMenuEffects.count
+
+        return min(
+            max(count, 1),
+            maximumQuickEffectCount
+        )
     }
 
     private var effectMenuHeight: CGFloat {
@@ -463,7 +474,7 @@ struct ContentView: View {
                 .statusBarHidden(true)
             }
             .fullScreenCover(isPresented: $showEffectLibraryPage) {
-                EffectLibraryPage(
+                EditableEffectLibraryPage(
                     selectedEffect: $vm.selectedEffect,
                     isPresented: $showEffectLibraryPage,
                     rotation: iconRotation

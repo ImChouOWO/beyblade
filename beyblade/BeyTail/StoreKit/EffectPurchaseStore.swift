@@ -2,10 +2,8 @@ import Foundation
 import StoreKit
 import Combine
 
-// BEYTAIL_STOREKIT_PATCH 2026.06.23-2
 @MainActor
 final class EffectPurchaseStore: ObservableObject {
-
     static let shared = EffectPurchaseStore()
 
     @Published private(set) var productsByID: [String: Product] = [:]
@@ -18,12 +16,13 @@ final class EffectPurchaseStore: ObservableObject {
     private var transactionUpdatesTask: Task<Void, Never>?
 
     private init() {
-        transactionUpdatesTask = Task.detached(priority: .background) { [weak self] in
+        transactionUpdatesTask = Task.detached(
+            priority: .background
+        ) { [weak self] in
             for await result in Transaction.updates {
                 guard case .verified(let transaction) = result else {
                     continue
                 }
-
                 await transaction.finish()
                 await self?.refreshPurchasedProducts()
             }
@@ -40,88 +39,62 @@ final class EffectPurchaseStore: ObservableObject {
     }
 
     func loadProducts() async {
-        guard !isLoadingProducts else {
-            return
-        }
+        guard !isLoadingProducts else { return }
 
         isLoadingProducts = true
         lastErrorMessage = nil
-
-        defer {
-            isLoadingProducts = false
-        }
+        defer { isLoadingProducts = false }
 
         let requestedIDs = EffectType.allProductIDs
-
-        print("========== StoreKit Debug ==========")
-        print("[StoreKit] Requested count:", requestedIDs.count)
-
-        for id in requestedIDs.sorted() {
-            print("[StoreKit] Requested ID:", id)
-        }
 
         do {
             let products = try await Product.products(
                 for: Array(requestedIDs)
             )
-
-            print("[StoreKit] Loaded count:", products.count)
-
-            for product in products {
-                print(
-                    "[StoreKit] Loaded:",
-                    product.id,
-                    "| price:",
-                    product.displayPrice,
-                    "| raw price:",
-                    product.price
-                )
-            }
-
             productsByID = Dictionary(
                 uniqueKeysWithValues: products.map {
                     ($0.id, $0)
                 }
             )
 
-            let loadedIDs = Set(products.map(\.id))
-            let missingIDs = requestedIDs.subtracting(loadedIDs)
-
+            let missingIDs = requestedIDs.subtracting(
+                Set(products.map(\.id))
+            )
             if !missingIDs.isEmpty {
-                for id in missingIDs.sorted() {
-                    print("[StoreKit] Missing ID:", id)
-                }
-
                 lastErrorMessage =
                     "StoreKit 有 \(missingIDs.count) 個商品未載入"
             }
-
-            print("====================================")
         } catch {
             productsByID = [:]
-
             lastErrorMessage =
                 "無法載入商品：\(error.localizedDescription)"
-
-            print("[StoreKit] Error:", error)
         }
     }
+
     func refreshPurchasedProducts() async {
         var purchased = Set<String>()
 
         for await result in Transaction.currentEntitlements {
-            guard case .verified(let transaction) = result else {
+            guard case .verified(let transaction) = result,
+                  transaction.revocationDate == nil else {
                 continue
             }
-
-            guard transaction.revocationDate == nil else {
-                continue
-            }
-
             purchased.insert(transaction.productID)
         }
 
         purchasedProductIDs = purchased
+    }
+
+    var hasPurchasedPremiumPack: Bool {
+        purchasedProductIDs.contains(
+            EffectType.premiumPackProductID
+        )
+    }
+
+    var ownsPremiumPackContent: Bool {
+        EffectType.premiumPackEffects.allSatisfy {
+            isPurchased($0)
+        }
     }
 
     func isPurchased(_ effect: EffectType) -> Bool {
@@ -129,7 +102,8 @@ final class EffectPurchaseStore: ObservableObject {
             return true
         }
 
-        if purchasedProductIDs.contains(EffectType.premiumPackProductID) {
+        if hasPurchasedPremiumPack,
+           effect.isIncludedInPremiumPack {
             return true
         }
 
@@ -144,7 +118,6 @@ final class EffectPurchaseStore: ObservableObject {
         guard let productID = effect.productID else {
             return nil
         }
-
         return productsByID[productID]
     }
 
@@ -153,11 +126,9 @@ final class EffectPurchaseStore: ObservableObject {
     }
 
     func displayPrice(for effect: EffectType) -> String {
-        if effect.isDefaultOwned {
-            return "免費"
-        }
-
-        return product(for: effect)?.displayPrice ?? "載入價格中"
+        effect.isDefaultOwned
+        ? "免費"
+        : product(for: effect)?.displayPrice ?? "載入價格中"
     }
 
     var premiumPackDisplayPrice: String {
@@ -165,9 +136,7 @@ final class EffectPurchaseStore: ObservableObject {
     }
 
     func purchase(_ effect: EffectType) async -> Bool {
-        guard !effect.isDefaultOwned else {
-            return true
-        }
+        guard !effect.isDefaultOwned else { return true }
 
         guard let productID = effect.productID else {
             lastErrorMessage = "特效缺少 StoreKit 商品 ID"
@@ -191,7 +160,7 @@ final class EffectPurchaseStore: ObservableObject {
     }
 
     func purchasePremiumPack() async -> Bool {
-        if purchasedProductIDs.contains(EffectType.premiumPackProductID) {
+        if hasPurchasedPremiumPack {
             return true
         }
 
@@ -219,7 +188,8 @@ final class EffectPurchaseStore: ObservableObject {
             await refreshPurchasedProducts()
             return true
         } catch {
-            lastErrorMessage = "恢復購買失敗：\(error.localizedDescription)"
+            lastErrorMessage =
+                "恢復購買失敗：\(error.localizedDescription)"
             return false
         }
     }
@@ -234,7 +204,8 @@ final class EffectPurchaseStore: ObservableObject {
 
             switch result {
             case .success(let verificationResult):
-                guard case .verified(let transaction) = verificationResult else {
+                guard case .verified(let transaction) =
+                    verificationResult else {
                     lastErrorMessage = "交易驗證失敗"
                     return false
                 }
@@ -244,7 +215,8 @@ final class EffectPurchaseStore: ObservableObject {
                 return true
 
             case .pending:
-                lastErrorMessage = "交易等待核准，核准完成後會自動解鎖"
+                lastErrorMessage =
+                    "交易等待核准，核准完成後會自動解鎖"
                 return false
 
             case .userCancelled:
@@ -255,7 +227,8 @@ final class EffectPurchaseStore: ObservableObject {
                 return false
             }
         } catch {
-            lastErrorMessage = "購買失敗：\(error.localizedDescription)"
+            lastErrorMessage =
+                "購買失敗：\(error.localizedDescription)"
             return false
         }
     }

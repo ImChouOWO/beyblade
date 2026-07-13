@@ -20,9 +20,9 @@
       "internalID" : "792818BB",
       "localizations" : [
         {
-          "description" : "",
-          "displayName" : "",
-          "locale" : "en_US"
+          "description" : "水波流動軌跡",
+          "displayName" : "滔天浪潮",
+          "locale" : "zh_Hant"
         }
       ],
       "productID" : "com.ahher0893.beyblade.effect.wave",
@@ -35,9 +35,9 @@
       "internalID" : "6B024A82",
       "localizations" : [
         {
-          "description" : "",
-          "displayName" : "",
-          "locale" : "en_US"
+          "description" : "黃金噴錢衝擊",
+          "displayName" : "金錢衝擊",
+          "locale" : "zh_Hant"
         }
       ],
       "productID" : "com.ahher0893.beyblade.effect.money_impact",
@@ -150,14 +150,14 @@
       "type" : "NonConsumable"
     },
     {
-      "displayPrice" : "190",
+      "displayPrice" : "120",
       "familyShareable" : false,
       "internalID" : "39D41F60",
       "localizations" : [
         {
-          "description" : "解鎖多個付費特效",
-          "displayName" : "特效禮包",
-          "locale" : "en_US"
+          "description" : "解鎖滔天浪潮、金錢衝擊、爆刃亂舞及狂暴冰裂",
+          "displayName" : "限定特效包",
+          "locale" : "zh_Hant"
         }
       ],
       "productID" : "com.ahher0893.beyblade.effects.premium_pack",

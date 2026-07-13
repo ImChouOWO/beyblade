@@ -51,9 +51,6 @@
             ReferencedContainer = "container:beyblade.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
-      <StoreKitConfigurationFileReference
-         identifier = "../../beyblade/BeyTail/StoreKit/BeyTail.storekit">
-      </StoreKitConfigurationFileReference>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
