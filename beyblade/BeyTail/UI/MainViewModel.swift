@@ -8,6 +8,67 @@ private struct UncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
 }
 
+/// 相機可能以 30 / 60 FPS 持續送入影格，但主執行緒只需要處理最新影格。
+///
+/// 若前一個 MainActor 工作尚未完成，新影格會覆蓋尚未處理的舊影格，
+/// 避免錄影期間累積大量 Task，造成預覽與 Metal 特效延遲數秒。
+private final class LatestCameraFrameRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latestFrame: UncheckedSendableBox<CMSampleBuffer>?
+    private var deliveryScheduled = false
+
+    func submit(
+        _ frame: CMSampleBuffer,
+        deliver: @escaping @MainActor @Sendable (CMSampleBuffer) -> Void
+    ) {
+        lock.lock()
+        latestFrame = UncheckedSendableBox(value: frame)
+
+        let shouldSchedule = !deliveryScheduled
+        if shouldSchedule {
+            deliveryScheduled = true
+        }
+        lock.unlock()
+
+        guard shouldSchedule else {
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            while let frame = self.takeLatestFrame() {
+                deliver(frame.value)
+                await Task.yield()
+            }
+        }
+    }
+
+    func reset() {
+        lock.lock()
+        latestFrame = nil
+        deliveryScheduled = false
+        lock.unlock()
+    }
+
+    private func takeLatestFrame() -> UncheckedSendableBox<CMSampleBuffer>? {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        guard let frame = latestFrame else {
+            deliveryScheduled = false
+            return nil
+        }
+
+        latestFrame = nil
+        return frame
+    }
+}
+
 @MainActor
 final class MainViewModel: ObservableObject {
 
@@ -179,6 +240,12 @@ final class MainViewModel: ObservableObject {
 
     private var videoFrameCount = 0
 
+    private let cameraFrameRelay = LatestCameraFrameRelay()
+    private var lastValidDeviceOrientation: UIDeviceOrientation = .portrait
+
+    private var lastDetectionLogTime: CFTimeInterval = 0
+    private let detectionLogInterval: CFTimeInterval = 1.0
+
     private let enableBBoxDisplayMapping = true
 
     /*
@@ -265,6 +332,19 @@ final class MainViewModel: ObservableObject {
         )
 
         trailOverlayView.setNeedsDisplay()
+    }
+
+    func updateDeviceOrientation(_ orientation: UIDeviceOrientation) {
+        switch orientation {
+        case .portrait,
+             .portraitUpsideDown,
+             .landscapeLeft,
+             .landscapeRight:
+            lastValidDeviceOrientation = orientation
+
+        default:
+            break
+        }
     }
 
     // MARK: - Published State Sync
@@ -427,6 +507,7 @@ final class MainViewModel: ObservableObject {
         resetDetectionStatus()
 
         cameraManager.onFrame = nil
+        cameraFrameRelay.reset()
         cameraManager.stop()
 
         inferenceEngine.stop()
@@ -513,6 +594,15 @@ final class MainViewModel: ObservableObject {
         rawDetections: [DetectionResult],
         mappedDetections: [DisplayDetection]
     ) {
+        #if DEBUG
+        let now = CACurrentMediaTime()
+
+        guard now - lastDetectionLogTime >= detectionLogInterval else {
+            return
+        }
+
+        lastDetectionLogTime = now
+
         let canvasSize = currentCanvasSize()
 
         print(
@@ -545,6 +635,7 @@ final class MainViewModel: ObservableObject {
                 "mappedCenter:", mapped.displayCenter
             )
         }
+        #endif
     }
 
     private func colorForHardware(_ hardware: BeyTailInferenceHardware) -> Color {
@@ -1186,7 +1277,7 @@ final class MainViewModel: ObservableObject {
                 return
             }
 
-            let recordingOrientation = UIDevice.current.orientation
+            let recordingOrientation = self.lastValidDeviceOrientation
 
             print("[RECORD] call startRecording")
             self.recordingManager.startRecording(
@@ -1536,6 +1627,7 @@ final class MainViewModel: ObservableObject {
             tracker.reset()
             trailEffectEngine.clear()
             recordingTrailEffectEngine.clear()
+            trailOverlayView.resetTransientState()
             trailOverlayView.debugBoundingBoxes = []
             resetDetectionStatus()
         }
@@ -1579,15 +1671,11 @@ final class MainViewModel: ObservableObject {
         isStartingCameraPreview = true
         syncPublishedState()
 
-        cameraManager.onFrame = { [weak self] buffer in
-            let boxedBuffer = UncheckedSendableBox(value: buffer)
+        let frameRelay = cameraFrameRelay
 
-            Task { @MainActor [weak self, boxedBuffer] in
-                guard let self else {
-                    return
-                }
-
-                self.handleCameraFrame(boxedBuffer.value)
+        cameraManager.onFrame = { [weak self, frameRelay] buffer in
+            frameRelay.submit(buffer) { [weak self] latestBuffer in
+                self?.handleCameraFrame(latestBuffer)
             }
         }
 
@@ -1629,6 +1717,7 @@ final class MainViewModel: ObservableObject {
 
     private func stopCameraForExternalPicker() async {
         cameraManager.onFrame = nil
+        cameraFrameRelay.reset()
         videoFrameSource.stop()
 
         await cameraManager.stopForPickerAsync()

@@ -483,10 +483,13 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                     rotationAngle: -.pi / 2
                 )
 
-            case .landscapeRight:
+            case .landscapeLeft:
                 return CGAffineTransform(
                     rotationAngle: .pi
                 )
+
+            case .landscapeRight:
+                return .identity
 
             default:
                 return .identity
@@ -501,12 +504,12 @@ private final class RecordingWriterWorker: @unchecked Sendable {
 
         case .landscapeLeft:
             return CGAffineTransform(
-                rotationAngle: .pi / 2
+                rotationAngle: -.pi / 2
             )
 
         case .landscapeRight:
             return CGAffineTransform(
-                rotationAngle: -.pi / 2
+                rotationAngle: .pi / 2
             )
 
         default:

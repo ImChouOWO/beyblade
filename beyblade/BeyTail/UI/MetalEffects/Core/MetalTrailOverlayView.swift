@@ -241,6 +241,12 @@ final class MetalTrailOverlayView: MTKView {
 
     // MARK: - Effect switching
 
+    /// 清除目前特效內部的粒子、裂紋、閃光與上一個位置。
+    /// 錄影開始前呼叫，避免上一段預覽的粒子狀態殘留。
+    func resetTransientState() {
+        replaceActiveEffect(with: currentEffect)
+    }
+
     /// 完整替換目前的 renderer。
     ///
     /// 不從快取取回舊 renderer，因此：

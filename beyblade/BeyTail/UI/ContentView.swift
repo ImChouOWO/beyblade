@@ -36,6 +36,7 @@ struct ContentView: View {
     @State private var showSettingsSheet = false
 
     @State private var iconRotation: Angle = .zero
+    @State private var deviceOrientation: UIDeviceOrientation = .portrait
 
     // MARK: - Recognition status orientation transition
     @State private var recognitionStatusRotation: Angle = .zero
@@ -55,7 +56,6 @@ struct ContentView: View {
     @State private var effectButtonFrame: CGRect = .zero
     @State private var latestEffectDragLocation: CGPoint?
 
-    private let fixedIsLandscape = false
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspectFill
     private let controlBarHeight: CGFloat = 110
 
@@ -391,7 +391,6 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let isLandscape = fixedIsLandscape
             let videoGravity = fixedVideoGravity
 
             ZStack {
@@ -405,7 +404,7 @@ struct ContentView: View {
                         CameraPreviewView(
                             session: vm.cameraManager.session,
                             videoGravity: videoGravity,
-                            isLandscape: isLandscape,
+                            deviceOrientation: deviceOrientation,
                             onFocus: { devicePoint in
                                 vm.focusCamera(at: devicePoint)
                             }
@@ -606,6 +605,9 @@ struct ContentView: View {
         default:
             return
         }
+
+        deviceOrientation = orientation
+        vm.updateDeviceOrientation(orientation)
 
         // 其他控制項維持原本的旋轉動畫。
         if !isSameRotation(iconRotation, targetRotation) {
@@ -1685,7 +1687,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
     let session: AVCaptureSession
     let videoGravity: AVLayerVideoGravity
-    let isLandscape: Bool
+    let deviceOrientation: UIDeviceOrientation
     let onFocus: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> CameraPreviewUIView {
@@ -1693,7 +1695,7 @@ struct CameraPreviewView: UIViewRepresentable {
         view.backgroundColor = .black
         view.attachSession(session)
         view.setVideoGravity(videoGravity)
-        view.setIsLandscape(isLandscape)
+        view.setDeviceOrientation(deviceOrientation)
         view.setFocusHandler(onFocus)
         return view
     }
@@ -1704,7 +1706,7 @@ struct CameraPreviewView: UIViewRepresentable {
     ) {
         uiView.attachSession(session)
         uiView.setVideoGravity(videoGravity)
-        uiView.setIsLandscape(isLandscape)
+        uiView.setDeviceOrientation(deviceOrientation)
         uiView.setFocusHandler(onFocus)
         uiView.setNeedsLayout()
     }
@@ -1720,7 +1722,7 @@ struct CameraPreviewView: UIViewRepresentable {
 
 final class CameraPreviewUIView: UIView {
 
-    private var isLandscape = false
+    private var deviceOrientation: UIDeviceOrientation = .portrait
     private var lastAppliedPreviewAngle: CGFloat = -1
 
     private var onFocus: ((CGPoint) -> Void)?
@@ -1860,9 +1862,18 @@ final class CameraPreviewUIView: UIView {
         }
     }
 
-    func setIsLandscape(_ isLandscape: Bool) {
-        self.isLandscape = isLandscape
-        applyPreviewRotationIfNeeded(force: true)
+    func setDeviceOrientation(_ orientation: UIDeviceOrientation) {
+        switch orientation {
+        case .portrait,
+             .portraitUpsideDown,
+             .landscapeLeft,
+             .landscapeRight:
+            deviceOrientation = orientation
+            applyPreviewRotationIfNeeded(force: true)
+
+        default:
+            break
+        }
     }
 
     override func didMoveToWindow() {
@@ -1897,7 +1908,24 @@ final class CameraPreviewUIView: UIView {
     }
 
     private func fixedPreviewRotationAngle() -> CGFloat {
-        isLandscape ? 0 : 90
+        switch deviceOrientation {
+        case .portrait:
+            return 90
+
+        case .portraitUpsideDown:
+            return 270
+
+        case .landscapeLeft:
+            return 180
+
+        case .landscapeRight:
+            return 0
+
+        default:
+            return lastAppliedPreviewAngle >= 0
+                ? lastAppliedPreviewAngle
+                : 90
+        }
     }
 }
 

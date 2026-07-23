@@ -167,12 +167,6 @@ struct EditableEffectLibraryPage: View {
 
                     sectionTitle("已擁有")
 
-                    QuickEffectMenuRow(
-                        quickMenuStore: quickMenuStore,
-                        ownedEffects: ownedEffects,
-                        selectedEffect: $selectedEffect
-                    )
-
                     LazyVGrid(
                         columns: columns,
                         spacing: 14
@@ -201,10 +195,50 @@ struct EditableEffectLibraryPage: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 18)
-                .padding(.bottom, 32)
+                .padding(.bottom, 24)
             }
+
+            fixedQuickMenuPanel
         }
         .background(Color.black)
+    }
+
+    private var fixedQuickMenuPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("快捷選單設定")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white.opacity(0.55))
+
+                Spacer()
+
+                Text("\(quickMenuStore.effects.count)/\(EffectQuickMenuStore.maximumCount)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.42))
+            }
+
+            QuickEffectMenuRow(
+                quickMenuStore: quickMenuStore,
+                ownedEffects: ownedEffects,
+                selectedEffect: $selectedEffect
+            )
+
+            Text("點擊空白 slot 可新增；點擊右上角可移除")
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.38))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 24)
+        .background(
+            Color(hex: 0x07111F)
+                .opacity(0.98)
+                .overlay(alignment: .top) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.12))
+                        .frame(height: 1)
+                }
+        )
     }
 
     private var headerBar: some View {

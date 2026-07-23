@@ -97,7 +97,7 @@ enum TrailRenderProfiles {
     .spray: TrailRenderProfile(
       widthMultiplier: 2,
       lengthMs: 700,
-      particleSizeMultiplier: 2 ,
+      particleSizeMultiplier: 2 ,
       particleFrequencyMultiplier: 1.0
     ),
   ]
