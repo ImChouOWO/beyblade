@@ -3,29 +3,12 @@ import Metal
 import QuartzCore
 import UIKit
 
-@MainActor
-private final class MetalDisplayLinkProxy: NSObject {
-    weak var owner: MetalTrailOverlayView?
-
-    init(owner: MetalTrailOverlayView) {
-        self.owner = owner
-    }
-
-    @objc
-    func tick(_ link: CADisplayLink) {
-        owner?.handleDisplayLink(link)
-    }
-}
-
 /// 即時 Metal 特效疊加畫面。
 ///
-/// 重要規則：
-/// 1. 畫面只保留一個 MetalEffect renderer。
-/// 2. 切換特效時立即銷毀上一個 renderer。
-/// 3. 不再使用 EffectType -> MetalEffect 快取。
-/// 4. 每一幀強制清除上一幀畫面。
-/// 5. BladeMetalEffect 的粒子不會帶入其他特效。
-final class MetalTrailOverlayView: MTKView {
+/// 使用 MTKViewDelegate 原生顯示迴圈，避免自建 CADisplayLink
+/// 在 SwiftUI 重新掛載 UIView 後停留於 paused 狀態。
+@MainActor
+final class MetalTrailOverlayView: MTKView, MTKViewDelegate {
     var effectEngine: TrailEffectEngine?
 
     var currentEffect: EffectType = .lightning {
@@ -40,20 +23,13 @@ final class MetalTrailOverlayView: MTKView {
         }
     }
 
-    /// 保留 MainViewModel 目前使用的介面。
     var debugBoundingBoxes: [(CGRect, Int)] = []
 
     var resamplesTrailPoints = true
     var trailSampleSpacingPixels: CGFloat = 5
 
     private let renderContext: MetalRenderContext
-
-    /// 當前唯一存在的 renderer。
     private var activeEffect: MetalEffect
-
-    private var displayLink: CADisplayLink?
-    private var displayLinkProxy: MetalDisplayLinkProxy?
-
     private var lastFrameTimestamp: CFTimeInterval = 0
 
     convenience init() {
@@ -129,10 +105,6 @@ final class MetalTrailOverlayView: MTKView {
         configureMetalView()
     }
 
-    deinit {
-        displayLink?.invalidate()
-    }
-
     // MARK: - Configuration
 
     private func configureMetalView() {
@@ -151,61 +123,27 @@ final class MetalTrailOverlayView: MTKView {
         autoResizeDrawable = true
 
         isOpaque = false
+        isHidden = false
+        alpha = 1
         backgroundColor = .clear
         layer.isOpaque = false
 
         preferredFramesPerSecond = 30
+        enableSetNeedsDisplay = false
 
         /*
-         此 MTKView 由自己的 CADisplayLink 驅動，
-         避免 MTKView 再建立第二個顯示迴圈。
+         關鍵修正：
+         不再將 MTKView 設為 paused，也不再使用自建 CADisplayLink。
+         MTKView 會自行以 preferredFramesPerSecond 呼叫 draw(in:)。
          */
-        enableSetNeedsDisplay = false
-        isPaused = true
+        isPaused = false
+        delegate = self
 
         presentsWithTransaction = false
 
         activeEffect.prepareIfNeeded(
             context: renderContext
         )
-
-        installDisplayLink()
-    }
-
-    private func installDisplayLink() {
-        displayLink?.invalidate()
-
-        let proxy = MetalDisplayLinkProxy(
-            owner: self
-        )
-
-        let link = CADisplayLink(
-            target: proxy,
-            selector: #selector(
-                MetalDisplayLinkProxy.tick(_:)
-            )
-        )
-
-        if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange =
-                CAFrameRateRange(
-                    minimum: 30,
-                    maximum: 30,
-                    preferred: 30
-                )
-        } else {
-            link.preferredFramesPerSecond = 30
-        }
-
-        link.add(
-            to: .main,
-            forMode: .common
-        )
-
-        link.isPaused = window == nil
-
-        displayLinkProxy = proxy
-        displayLink = link
     }
 
     // MARK: - View lifecycle
@@ -222,10 +160,18 @@ final class MetalTrailOverlayView: MTKView {
             1
         )
 
-        displayLink?.isPaused =
-            window == nil
+        isHidden = false
+        alpha = 1
+        isPaused = window == nil
 
-        if window == nil {
+        if window != nil {
+            /*
+             SwiftUI 將既有 UIView 重新掛回畫面時，立即要求 drawable，
+             不必等待下一次狀態更新。
+             */
+            setNeedsLayout()
+            draw()
+        } else {
             lastFrameTimestamp = 0
         }
     }
@@ -239,30 +185,54 @@ final class MetalTrailOverlayView: MTKView {
         )
     }
 
-    // MARK: - Effect switching
+    // MARK: - MTKViewDelegate
 
-    /// 清除目前特效內部的粒子、裂紋、閃光與上一個位置。
-    /// 錄影開始前呼叫，避免上一段預覽的粒子狀態殘留。
-    func resetTransientState() {
-        replaceActiveEffect(with: currentEffect)
+    func mtkView(
+        _ view: MTKView,
+        drawableSizeWillChange size: CGSize
+    ) {
+        renderContext.update(
+            drawableSize: size,
+            deltaTime: 1.0 / 30.0
+        )
     }
 
-    /// 完整替換目前的 renderer。
-    ///
-    /// 不從快取取回舊 renderer，因此：
-    /// - sparks 不會保留
-    /// - cracks 不會保留
-    /// - glints 不會保留
-    /// - slash waves 不會保留
-    /// - lastPosition 不會保留
+    func draw(in view: MTKView) {
+        let now = CACurrentMediaTime()
+
+        let deltaTime: CFTimeInterval
+
+        if lastFrameTimestamp == 0 {
+            deltaTime = 1.0 / 30.0
+        } else {
+            deltaTime = max(
+                min(
+                    now - lastFrameTimestamp,
+                    0.1
+                ),
+                1.0 / 240.0
+            )
+        }
+
+        lastFrameTimestamp = now
+
+        renderFrame(
+            currentTime: now,
+            deltaTime: deltaTime
+        )
+    }
+
+    // MARK: - Effect switching
+
+    func resetTransientState() {
+        replaceActiveEffect(
+            with: currentEffect
+        )
+    }
+
     private func replaceActiveEffect(
         with effectType: EffectType
     ) {
-        /*
-         先停止上一個 renderer 的狀態。
-         即使某個子類別沒有實作 reset，
-         後面仍會直接丟棄整個實例。
-         */
         activeEffect.reset()
 
         let newEffect =
@@ -275,11 +245,6 @@ final class MetalTrailOverlayView: MTKView {
         )
 
         activeEffect = newEffect
-
-        /*
-         新特效第一幀重新計算 deltaTime，
-         避免上一個 renderer 的幀時間影響粒子速度。
-         */
         lastFrameTimestamp = 0
 
         #if DEBUG
@@ -294,41 +259,19 @@ final class MetalTrailOverlayView: MTKView {
         #endif
     }
 
-    // MARK: - Display link
-
-    fileprivate func handleDisplayLink(
-        _ link: CADisplayLink
-    ) {
-        let deltaTime: CFTimeInterval
-
-        if lastFrameTimestamp == 0 {
-            deltaTime = 1.0 / 30.0
-        } else {
-            deltaTime = max(
-                min(
-                    link.timestamp
-                    - lastFrameTimestamp,
-                    0.1
-                ),
-                1.0 / 240.0
-            )
-        }
-
-        lastFrameTimestamp =
-            link.timestamp
-
-        renderFrame(
-            deltaTime: deltaTime
-        )
-    }
-
     // MARK: - Render frame
 
     private func renderFrame(
+        currentTime: CFTimeInterval,
         deltaTime: CFTimeInterval
     ) {
         autoreleasepool {
-            guard drawableSize.width > 1,
+            guard window != nil,
+                  !isHidden,
+                  alpha > 0,
+                  bounds.width > 1,
+                  bounds.height > 1,
+                  drawableSize.width > 1,
                   drawableSize.height > 1,
                   let renderPassDescriptor =
                     currentRenderPassDescriptor,
@@ -340,12 +283,6 @@ final class MetalTrailOverlayView: MTKView {
                 return
             }
 
-            /*
-             關鍵修正：
-
-             每幀都明確清除成透明背景，
-             不讓上一幀 Blade shader 的結果留在 drawable。
-             */
             if let colorAttachment =
                 renderPassDescriptor
                     .colorAttachments[0] {
@@ -377,9 +314,6 @@ final class MetalTrailOverlayView: MTKView {
                 "BeyTailLiveEffectEncoder"
 
             encoder.setCullMode(.none)
-
-            let currentTime =
-                CACurrentMediaTime()
 
             renderContext.update(
                 drawableSize: drawableSize,
@@ -418,12 +352,6 @@ final class MetalTrailOverlayView: MTKView {
                     tracks = originalTracks
                 }
 
-                /*
-                 activeEffect 與 currentEffect 必須同步。
-
-                 Factory 只在切換時建立新實例，
-                 因此這裡不再重新查快取。
-                 */
                 activeEffect.prepareIfNeeded(
                     context: renderContext
                 )
@@ -435,14 +363,9 @@ final class MetalTrailOverlayView: MTKView {
                 )
             }
 
-            /*
-             目前正式畫面沒有繪製 debug box，
-             但保留屬性以相容 MainViewModel。
-             */
             _ = debugBoundingBoxes
 
             renderContext.endFrame()
-
             encoder.endEncoding()
 
             commandBuffer.present(drawable)
