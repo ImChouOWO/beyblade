@@ -29,22 +29,22 @@ struct TrailRenderProfile: Sendable {
 enum TrailRenderProfiles {
   static let values: [EffectType: TrailRenderProfile] = [
     .lightning: TrailRenderProfile(
-      widthMultiplier: 2,
+      widthMultiplier: 8,
       lengthMs: 400,
       particleSizeMultiplier: 1.5,
-      particleFrequencyMultiplier: 1.0
+      particleFrequencyMultiplier: 2.0
     ),
     .fire: TrailRenderProfile(
-      widthMultiplier: 2,
+      widthMultiplier: 8,
       lengthMs: 600,
       particleSizeMultiplier: 1.5,
       particleFrequencyMultiplier: 1.0
     ),
     .stardust: TrailRenderProfile(
-      widthMultiplier: 2,
-      lengthMs: 280,
+      widthMultiplier: 5,
+      lengthMs: 600,
       particleSizeMultiplier: 1.5,
-      particleFrequencyMultiplier: 1.0
+      particleFrequencyMultiplier: 2.0
     ),
     .wave: TrailRenderProfile(
       widthMultiplier: 2,

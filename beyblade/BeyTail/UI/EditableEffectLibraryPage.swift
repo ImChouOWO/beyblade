@@ -206,10 +206,6 @@ struct EditableEffectLibraryPage: View {
     private var fixedQuickMenuPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("快捷選單設定")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundColor(.white.opacity(0.55))
-
                 Spacer()
 
                 Text("\(quickMenuStore.effects.count)/\(EffectQuickMenuStore.maximumCount)")
@@ -223,15 +219,12 @@ struct EditableEffectLibraryPage: View {
                 selectedEffect: $selectedEffect
             )
 
-            Text("點擊空白 slot 可新增；點擊右上角可移除")
-                .font(.system(size: 11))
-                .foregroundColor(.white.opacity(0.38))
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-        .padding(.bottom, 24)
+        .padding(.horizontal, 10)
+        .padding(.top, 7)
+        .padding(.bottom, 18)
         .background(
-            Color(hex: 0x07111F)
+            Color(.black)
                 .opacity(0.98)
                 .overlay(alignment: .top) {
                     Rectangle()

@@ -14,8 +14,16 @@ private struct UncheckedSendableBox<T>: @unchecked Sendable {
 /// 避免錄影期間累積大量 Task，造成預覽與 Metal 特效延遲數秒。
 private final class LatestCameraFrameRelay: @unchecked Sendable {
     private let lock = NSLock()
+
     private var latestFrame: UncheckedSendableBox<CMSampleBuffer>?
     private var deliveryScheduled = false
+    private var lastDeliveryUptime: TimeInterval = 0
+
+    /// 主執行緒最多接收 30 FPS。
+    ///
+    /// 相機即使輸出 60 FPS，也只保留最新影格，避免 MainActor 被持續
+    /// `while` 迴圈占用，讓 CADisplayLink 有固定機會執行 Metal 預覽。
+    private let minimumDeliveryInterval: TimeInterval = 1.0 / 30.0
 
     func submit(
         _ frame: CMSampleBuffer,
@@ -34,23 +42,68 @@ private final class LatestCameraFrameRelay: @unchecked Sendable {
             return
         }
 
-        Task { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
-
-            while let frame = self.takeLatestFrame() {
-                deliver(frame.value)
-                await Task.yield()
-            }
-        }
+        scheduleDelivery(deliver: deliver)
     }
 
     func reset() {
         lock.lock()
         latestFrame = nil
         deliveryScheduled = false
+        lastDeliveryUptime = 0
         lock.unlock()
+    }
+
+    private func scheduleDelivery(
+        deliver: @escaping @MainActor @Sendable (CMSampleBuffer) -> Void
+    ) {
+        let delay = deliveryDelay()
+
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            if delay > 0 {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(delay * 1_000_000_000)
+                )
+            }
+
+            guard let frame = self.takeLatestFrame() else {
+                self.finishDelivery(
+                    delivered: false,
+                    deliver: deliver
+                )
+                return
+            }
+
+            deliver(frame.value)
+
+            self.finishDelivery(
+                delivered: true,
+                deliver: deliver
+            )
+        }
+    }
+
+    private func deliveryDelay() -> TimeInterval {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+
+        guard lastDeliveryUptime > 0 else {
+            return 0
+        }
+
+        let elapsed =
+            ProcessInfo.processInfo.systemUptime
+            - lastDeliveryUptime
+
+        return max(
+            minimumDeliveryInterval - elapsed,
+            0
+        )
     }
 
     private func takeLatestFrame() -> UncheckedSendableBox<CMSampleBuffer>? {
@@ -59,13 +112,33 @@ private final class LatestCameraFrameRelay: @unchecked Sendable {
             lock.unlock()
         }
 
-        guard let frame = latestFrame else {
-            deliveryScheduled = false
-            return nil
-        }
-
+        let frame = latestFrame
         latestFrame = nil
         return frame
+    }
+
+    private func finishDelivery(
+        delivered: Bool,
+        deliver: @escaping @MainActor @Sendable (CMSampleBuffer) -> Void
+    ) {
+        lock.lock()
+
+        if delivered {
+            lastDeliveryUptime =
+                ProcessInfo.processInfo.systemUptime
+        }
+
+        let hasPendingFrame = latestFrame != nil
+
+        if !hasPendingFrame {
+            deliveryScheduled = false
+        }
+
+        lock.unlock()
+
+        if hasPendingFrame {
+            scheduleDelivery(deliver: deliver)
+        }
     }
 }
 
@@ -1260,17 +1333,38 @@ final class MainViewModel: ObservableObject {
 
             await self.waitForEventInterval()
 
+            let wasLiveCamera =
+                self.appMode == .cameraPreview
+
             self.appMode = .preparingRecording
 
-            await self.clearImageResources(
-                policy: .beforeStartRecording
-            )
+            if wasLiveCamera {
+                /*
+                 即時相機已經運作時，不停止／重啟 session，也不清除
+                 tracker、即時拖尾或目前 Metal renderer。
 
-            self.activeFrameInputSource = .camera
-            self.activeVisionOrientation = .up
-            self.videoFrameCount = 0
+                 原本的 clearImageResources(.beforeStartRecording) 會讓按下
+                 錄影鍵後特效短暫消失，直到模型重新取得 trackId。
+                 */
+                self.recordingTrailEffectEngine.clear()
+                self.activeFrameInputSource = .camera
+                self.activeVisionOrientation =
+                    self.cameraManager.currentVisionImageOrientation
+                self.videoFrameCount = 0
+            } else {
+                /*
+                 從影片庫模式開始錄影時，仍維持原本切回相機的流程。
+                 */
+                await self.clearImageResources(
+                    policy: .beforeStartRecording
+                )
 
-            await self.startCameraPreviewAsync()
+                self.activeFrameInputSource = .camera
+                self.activeVisionOrientation = .up
+                self.videoFrameCount = 0
+
+                await self.startCameraPreviewAsync()
+            }
 
             guard self.appMode == .preparingRecording else {
                 self.finishEvent()

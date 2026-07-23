@@ -343,8 +343,8 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                         width: width,
                         height: height
                     ),
-                AVVideoExpectedSourceFrameRateKey: 60,
-                AVVideoMaxKeyFrameIntervalKey: 60,
+                AVVideoExpectedSourceFrameRateKey: 30,
+                AVVideoMaxKeyFrameIntervalKey: 30,
                 AVVideoProfileLevelKey:
                     AVVideoProfileLevelH264HighAutoLevel
             ]
@@ -453,7 +453,7 @@ private final class RecordingWriterWorker: @unchecked Sendable {
         height: Int
     ) -> Int {
         let estimated =
-            Double(width * height) * 60.0 * 0.14
+            Double(width * height) * 30.0 * 0.14
 
         return Int(
             min(

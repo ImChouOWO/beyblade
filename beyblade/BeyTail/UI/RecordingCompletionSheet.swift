@@ -35,7 +35,7 @@ struct RecordingCompletionSheet: View {
                         actionCard(
                             icon: "square.and.arrow.up",
                             title: "分享",
-                            subtitle: "分享影片"
+                            subtitle: ""
                         )
                     }
                     .buttonStyle(.plain)
@@ -46,7 +46,7 @@ struct RecordingCompletionSheet: View {
                         actionCard(
                             icon: downloadIcon,
                             title: downloadTitle,
-                            subtitle: "儲存到照片"
+                            subtitle: ""
                         )
                     }
                     .buttonStyle(.plain)
@@ -62,7 +62,7 @@ struct RecordingCompletionSheet: View {
                         actionCard(
                             icon: "arrow.counterclockwise",
                             title: "重新錄製",
-                            subtitle: "捨棄目前影片",
+                            subtitle: "",
                             destructive: true
                         )
                     }
@@ -92,9 +92,7 @@ struct RecordingCompletionSheet: View {
                 Text("錄影完成")
                     .font(.system(size: 19, weight: .bold))
 
-                Text("可播放影片並拖曳進度條確認內容")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
+             
             }
 
             Spacer()
@@ -193,7 +191,7 @@ struct RecordingCompletionSheet: View {
     private var recordingStatusView: some View {
         switch vm.recordingSaveState {
         case .idle:
-            Text("向下滑動可關閉")
+            Text("")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
 

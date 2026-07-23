@@ -7,11 +7,14 @@ enum MetalEffectFactory {
         let renderer: MetalEffect
 
         switch effectType {
-        case .lightning,
-             .fire,
-             .stardust:
-            // 三個基礎特效只使用純軌跡 renderer。
-            renderer = GenericMetalEffect()
+        case .lightning:
+            renderer = LightningMetalEffect()
+
+        case .fire:
+            renderer = FireMetalEffect()
+
+        case .stardust:
+            renderer = StardustMetalEffect()
 
         case .wave:
             renderer = WaveMetalEffect()
