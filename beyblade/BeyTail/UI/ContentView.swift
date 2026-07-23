@@ -1722,9 +1722,22 @@ struct CameraPreviewView: UIViewRepresentable {
 
 final class CameraPreviewUIView: UIView {
 
-    private var deviceOrientation: UIDeviceOrientation = .portrait
-    private var lastAppliedPreviewAngle: CGFloat = -1
+    /*
+     AppDelegate 將介面鎖定為 portrait，因此橫置手機時，
+     SwiftUI / UIView 的邏輯 bounds 仍維持直向尺寸。
 
+     不能只修改 AVCaptureVideoPreviewLayer.videoRotationAngle：
+     橫向影像會被塞進直向 bounds，resizeAspectFill 因而產生
+     大幅裁切，看起來像 zoom in。
+
+     此處使用獨立的 AVCaptureVideoPreviewLayer：
+     1. 橫置時交換 layer 的寬高。
+     2. 將 layer 旋轉回使用者目前觀看的方向。
+     3. 保留原本的 videoRotationAngle，使畫面方向與相機輸出一致。
+    */
+    private let capturePreviewLayer = AVCaptureVideoPreviewLayer()
+
+    private var deviceOrientation: UIDeviceOrientation = .portrait
     private var onFocus: ((CGPoint) -> Void)?
 
     private let focusIndicatorView = UIView(
@@ -1736,28 +1749,36 @@ final class CameraPreviewUIView: UIView {
         )
     )
 
-    override static var layerClass: AnyClass {
-        AVCaptureVideoPreviewLayer.self
-    }
-
     var previewLayer: AVCaptureVideoPreviewLayer {
-        guard let layer = layer as? AVCaptureVideoPreviewLayer else {
-            fatalError(
-                "CameraPreviewUIView layer is not AVCaptureVideoPreviewLayer"
-            )
-        }
-
-        return layer
+        capturePreviewLayer
     }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
+        configurePreviewLayer()
         configureFocusInteraction()
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        configurePreviewLayer()
         configureFocusInteraction()
+    }
+
+    private func configurePreviewLayer() {
+        clipsToBounds = true
+
+        capturePreviewLayer.backgroundColor =
+            UIColor.black.cgColor
+        capturePreviewLayer.videoGravity =
+            .resizeAspectFill
+        capturePreviewLayer.anchorPoint =
+            CGPoint(x: 0.5, y: 0.5)
+
+        layer.insertSublayer(
+            capturePreviewLayer,
+            at: 0
+        )
     }
 
     private func configureFocusInteraction() {
@@ -1796,18 +1817,32 @@ final class CameraPreviewUIView: UIView {
             return
         }
 
-        let layerPoint = recognizer.location(in: self)
+        let viewPoint = recognizer.location(in: self)
 
-        guard bounds.contains(layerPoint) else {
+        guard bounds.contains(viewPoint) else {
+            return
+        }
+
+        /*
+         previewLayer 在橫向時具有旋轉 transform，
+         因此先將 UIView 座標轉為 previewLayer 座標，
+         再交給 AVFoundation 計算相機對焦點。
+        */
+        let previewPoint = previewLayer.convert(
+            viewPoint,
+            from: layer
+        )
+
+        guard previewLayer.bounds.contains(previewPoint) else {
             return
         }
 
         let devicePoint =
             previewLayer.captureDevicePointConverted(
-                fromLayerPoint: layerPoint
+                fromLayerPoint: previewPoint
             )
 
-        showFocusIndicator(at: layerPoint)
+        showFocusIndicator(at: viewPoint)
         onFocus?(devicePoint)
     }
 
@@ -1850,26 +1885,37 @@ final class CameraPreviewUIView: UIView {
         if previewLayer.session !== session {
             previewLayer.session = session
         }
+
+        applyPreviewGeometry()
     }
 
     func detachSession() {
         previewLayer.session = nil
     }
 
-    func setVideoGravity(_ videoGravity: AVLayerVideoGravity) {
+    func setVideoGravity(
+        _ videoGravity: AVLayerVideoGravity
+    ) {
         if previewLayer.videoGravity != videoGravity {
             previewLayer.videoGravity = videoGravity
         }
     }
 
-    func setDeviceOrientation(_ orientation: UIDeviceOrientation) {
+    func setDeviceOrientation(
+        _ orientation: UIDeviceOrientation
+    ) {
         switch orientation {
         case .portrait,
              .portraitUpsideDown,
              .landscapeLeft,
              .landscapeRight:
+            guard deviceOrientation != orientation else {
+                return
+            }
+
             deviceOrientation = orientation
-            applyPreviewRotationIfNeeded(force: true)
+            setNeedsLayout()
+            applyPreviewGeometry()
 
         default:
             break
@@ -1878,56 +1924,108 @@ final class CameraPreviewUIView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        applyPreviewRotationIfNeeded(force: true)
+        applyPreviewGeometry()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-
-        previewLayer.frame = bounds
-        applyPreviewRotationIfNeeded(force: false)
+        applyPreviewGeometry()
     }
 
-    private func applyPreviewRotationIfNeeded(force: Bool) {
-        guard let connection = previewLayer.connection else {
-            return
-        }
-
-        let previewAngle = fixedPreviewRotationAngle()
-
-        guard force || previewAngle != lastAppliedPreviewAngle else {
-            return
-        }
-
-        guard connection.isVideoRotationAngleSupported(previewAngle) else {
-            return
-        }
-
-        connection.videoRotationAngle = previewAngle
-        lastAppliedPreviewAngle = previewAngle
+    private struct PreviewGeometry {
+        let videoRotationAngle: CGFloat
+        let layerRotationAngle: CGFloat
+        let layerSize: CGSize
     }
 
-    private func fixedPreviewRotationAngle() -> CGFloat {
+    private func previewGeometry() -> PreviewGeometry {
+        let portraitSize = bounds.size
+        let landscapeSize = CGSize(
+            width: bounds.height,
+            height: bounds.width
+        )
+
         switch deviceOrientation {
         case .portrait:
-            return 90
+            return PreviewGeometry(
+                videoRotationAngle: 90,
+                layerRotationAngle: 0,
+                layerSize: portraitSize
+            )
 
         case .portraitUpsideDown:
-            return 270
+            return PreviewGeometry(
+                videoRotationAngle: 270,
+                layerRotationAngle: .pi,
+                layerSize: portraitSize
+            )
 
         case .landscapeLeft:
-            return 180
+            return PreviewGeometry(
+                videoRotationAngle: 180,
+                layerRotationAngle: -.pi / 2,
+                layerSize: landscapeSize
+            )
 
         case .landscapeRight:
-            return 0
+            return PreviewGeometry(
+                videoRotationAngle: 0,
+                layerRotationAngle: .pi / 2,
+                layerSize: landscapeSize
+            )
 
         default:
-            return lastAppliedPreviewAngle >= 0
-                ? lastAppliedPreviewAngle
-                : 90
+            return PreviewGeometry(
+                videoRotationAngle: 90,
+                layerRotationAngle: 0,
+                layerSize: portraitSize
+            )
         }
     }
+
+    private func applyPreviewGeometry() {
+        guard bounds.width > 1,
+              bounds.height > 1 else {
+            return
+        }
+
+        let geometry = previewGeometry()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+
+        /*
+         橫置時先交換 layer 寬高，再旋轉 layer。
+         這樣 resizeAspectFill 會以真正的橫向比例排版，
+         不會再將 16:9 影像塞進直向框而產生額外放大。
+        */
+        previewLayer.bounds = CGRect(
+            origin: .zero,
+            size: geometry.layerSize
+        )
+        previewLayer.position = CGPoint(
+            x: bounds.midX,
+            y: bounds.midY
+        )
+        previewLayer.setAffineTransform(
+            CGAffineTransform(
+                rotationAngle:
+                    geometry.layerRotationAngle
+            )
+        )
+
+        if let connection = previewLayer.connection,
+           connection.isVideoRotationAngleSupported(
+            geometry.videoRotationAngle
+           ) {
+            connection.videoRotationAngle =
+                geometry.videoRotationAngle
+        }
+
+        CATransaction.commit()
+    }
 }
+
 
 // MARK: - Trail Overlay
 
