@@ -149,7 +149,8 @@ final class MainViewModel: ObservableObject {
 
     @Published var selectedEffect: EffectType = .lightning {
         didSet {
-            guard EffectPurchaseStore.shared.isPurchased(selectedEffect) else {
+            guard selectedEffect.isAvailableInCurrentRelease,
+                  EffectPurchaseStore.shared.isPurchased(selectedEffect) else {
                 if selectedEffect != .lightning {
                     selectedEffect = .lightning
                 }
@@ -1589,7 +1590,8 @@ final class MainViewModel: ObservableObject {
             return
         }
 
-        guard !effect.isLocked else {
+        guard effect.isAvailableInCurrentRelease,
+              !effect.isLocked else {
             return
         }
 

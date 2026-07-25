@@ -77,7 +77,9 @@ final class EffectQuickMenuStore: ObservableObject {
         _ effect: EffectType,
         at slotIndex: Int? = nil
     ) -> Bool {
-        guard !contains(effect), !isFull else {
+        guard effect.isAvailableInCurrentRelease,
+              !contains(effect),
+              !isFull else {
             return false
         }
 
@@ -232,7 +234,8 @@ final class EffectQuickMenuStore: ObservableObject {
                   seen.insert(id).inserted,
                   let effect = EffectType(
                     rawValue: id
-                  ) else {
+                  ),
+                  effect.isAvailableInCurrentRelease else {
                 continue
             }
 
@@ -267,9 +270,10 @@ final class EffectQuickMenuStore: ObservableObject {
         var seen = Set<String>()
 
         for effect in effects {
-            guard seen.insert(
-                effect.rawValue
-            ).inserted else {
+            guard effect.isAvailableInCurrentRelease,
+                  seen.insert(
+                    effect.rawValue
+                  ).inserted else {
                 continue
             }
 

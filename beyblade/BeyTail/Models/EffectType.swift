@@ -23,6 +23,35 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
 
+    /// 下個版本才會開放的特效。
+    ///
+    /// 保留 enum case、Product ID 與 Metal renderer，避免未來重新加入時
+    /// 破壞既有購買紀錄；目前所有 UI 與快捷選單都必須排除。
+    static let temporarilyHiddenEffects: Set<EffectType> = [
+        .crimson,
+        .deathRay,
+        .emerald,
+        .inkWash,
+        .spray
+    ]
+
+    var isAvailableInCurrentRelease: Bool {
+        !Self.temporarilyHiddenEffects.contains(self)
+    }
+
+    /// 手動提供 CaseIterable 清單，讓所有使用 EffectType.allCases 的畫面
+    /// 自動排除尚未開放的特效。
+    static let allCases: [EffectType] = [
+        .lightning,
+        .fire,
+        .stardust,
+        .wave,
+        .thunder,
+        .vortex,
+        .dark
+    ]
+
+
     var emoji: String {
         switch self {
         case .lightning: return "⚡"
@@ -151,12 +180,7 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
             .wave,
             .thunder,
             .vortex,
-            .dark,
-            .crimson,
-            .deathRay,
-            .emerald,
-            .inkWash,
-            .spray
+            .dark
         ]
     }
 

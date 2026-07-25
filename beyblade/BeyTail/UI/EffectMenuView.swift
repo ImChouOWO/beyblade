@@ -30,7 +30,8 @@ struct QuickEffectMenuView: View {
             EffectQuickMenuStore
                 .decode(effectMenuIDsRaw)
                 .filter {
-                    purchaseStore.isPurchased($0)
+                    $0.isAvailableInCurrentRelease
+                    && purchaseStore.isPurchased($0)
                 }
                 .prefix(EffectQuickMenuStore.maximumCount)
         )
