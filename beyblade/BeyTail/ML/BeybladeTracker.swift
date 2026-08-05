@@ -1,3 +1,4 @@
+import Foundation
 import CoreGraphics
 import UIKit
 
@@ -62,29 +63,86 @@ final class BeybladeTracker {
     private let colorSmoothAlpha: CGFloat = 0.15
     private let maximumPredictionTime: TimeInterval = 0.32
 
+    /// 僅保留追蹤診斷輸出；其他既有 print 會由檔案底部的全域 shim 關閉。
+    private let enableTrackerLogs = true
+
+    /// 一般狀態摘要最多每 0.25 秒輸出一次，避免 30／60 FPS 時洗版。
+    private let trackerSummaryLogInterval: TimeInterval = 0.25
+
+    private var lastTrackerSummaryLogTime: TimeInterval = 0
+    private var updateSequence: UInt64 = 0
+
     // MARK: - Public API
 
     func update(_ detections: [DetectionResult]) -> [DetectionResult] {
         let now = CACurrentMediaTime()
+        updateSequence &+= 1
+
         let validDetections = sanitizeDetections(detections)
+        let shouldLogSummary = shouldWriteTrackerSummary(now: now)
+
+        if shouldLogSummary {
+            trackerLog(
+                "[TRACKER_INPUT]",
+                "seq=\(updateSequence)",
+                "incoming=\(detections.count)",
+                "valid=\(validDetections.count)",
+                "tracks=\(tracks.count)",
+                "detections=\(detectionDescriptions(detections))"
+            )
+        }
 
         guard !validDetections.isEmpty else {
             markAllTracksMissed()
+
+            logLostTrackTransitions()
 
             let output = predictedResults(
                 forTrackIndices: Set(tracks.indices),
                 now: now
             )
 
+            if !output.isEmpty {
+                trackerLog(
+                    "[TRACKER_PREDICT]",
+                    "reason=no_detection",
+                    "ids=\(output.map(\.trackId))",
+                    "missed=\(trackMissedFrameDescription())"
+                )
+            }
+
             removeDeadTracks()
+
+            if shouldLogSummary {
+                trackerLog(
+                    "[TRACKER_OUTPUT]",
+                    "seq=\(updateSequence)",
+                    "mode=no_detection",
+                    "output=\(resultDescriptions(output))",
+                    "active=\(trackDescriptions(now: now))"
+                )
+            }
+
             return output
         }
 
         if tracks.isEmpty {
-            return createInitialTracks(
+            let output = createInitialTracks(
                 from: validDetections,
                 now: now
             )
+
+            if shouldLogSummary {
+                trackerLog(
+                    "[TRACKER_OUTPUT]",
+                    "seq=\(updateSequence)",
+                    "mode=initial",
+                    "output=\(resultDescriptions(output))",
+                    "active=\(trackDescriptions(now: now))"
+                )
+            }
+
+            return output
         }
 
         let trackCount = tracks.count
@@ -135,12 +193,28 @@ final class BeybladeTracker {
                 detection.center
             )
 
-            guard centerDistance <= matchDistanceLimit(
+            let distanceLimit = matchDistanceLimit(
                 for: track,
                 now: now
-            ) else {
+            )
+
+            guard centerDistance <= distanceLimit else {
+                if shouldLogSummary {
+                    trackerLog(
+                        "[TRACKER_REJECT]",
+                        "id=\(track.id)",
+                        "detection=\(detectionIndex)",
+                        "reason=distance",
+                        "distance=\(format(centerDistance))",
+                        "limit=\(format(distanceLimit))",
+                        "predicted=\(format(predictedCenter))",
+                        "detected=\(format(detection.center))"
+                    )
+                }
                 continue
             }
+
+            let previousMissedFrames = track.missedFrames
 
             updateTrack(
                 at: trackIndex,
@@ -152,6 +226,28 @@ final class BeybladeTracker {
             matchedDetections.insert(detectionIndex)
 
             let updatedTrack = tracks[trackIndex]
+
+            if previousMissedFrames > 0 {
+                trackerLog(
+                    "[TRACKER_REACTIVATED]",
+                    "id=\(updatedTrack.id)",
+                    "lostFrames=\(previousMissedFrames)",
+                    "confidence=\(format(detection.confidence))",
+                    "distance=\(format(centerDistance))",
+                    "limit=\(format(distanceLimit))",
+                    "center=\(format(detection.center))"
+                )
+            }
+
+            if updatedTrack.confirmedFrames == confirmFrames {
+                trackerLog(
+                    "[TRACKER_CONFIRMED]",
+                    "id=\(updatedTrack.id)",
+                    "frames=\(updatedTrack.confirmedFrames)",
+                    "confidence=\(format(detection.confidence))",
+                    "center=\(format(detection.center))"
+                )
+            }
 
             if updatedTrack.confirmedFrames >= confirmFrames {
                 output.append(
@@ -167,18 +263,29 @@ final class BeybladeTracker {
             matchedTracks: matchedTracks
         )
 
+        logLostTrackTransitions()
+
         let unmatchedConfirmedTracks = Set(
             tracks.indices.filter {
                 !matchedTracks.contains($0)
             }
         )
 
-        output.append(
-            contentsOf: predictedResults(
-                forTrackIndices: unmatchedConfirmedTracks,
-                now: now
-            )
+        let predicted = predictedResults(
+            forTrackIndices: unmatchedConfirmedTracks,
+            now: now
         )
+
+        output.append(contentsOf: predicted)
+
+        if !predicted.isEmpty {
+            trackerLog(
+                "[TRACKER_PREDICT]",
+                "reason=unmatched",
+                "ids=\(predicted.map(\.trackId))",
+                "missed=\(trackMissedFrameDescription())"
+            )
+        }
 
         createTracksForUnmatchedDetections(
             detections: validDetections,
@@ -188,16 +295,29 @@ final class BeybladeTracker {
 
         removeDeadTracks()
 
-        return output.sorted {
+        let sortedOutput = output.sorted {
             $0.trackId < $1.trackId
         }
+
+        if shouldLogSummary {
+            trackerLog(
+                "[TRACKER_OUTPUT]",
+                "seq=\(updateSequence)",
+                "matchedTracks=\(matchedTracks.count)",
+                "matchedDetections=\(matchedDetections.count)",
+                "output=\(resultDescriptions(sortedOutput))",
+                "active=\(trackDescriptions(now: now))"
+            )
+        }
+
+        return sortedOutput
     }
 
     /// 離線影片未執行偵測的影格，可使用此方法延伸已確認軌跡。
     func predictStep() -> [DetectionResult] {
         let now = CACurrentMediaTime()
 
-        return tracks.indices.compactMap { index in
+        let output = tracks.indices.compactMap { index in
             guard tracks[index].confirmedFrames >= confirmFrames,
                   tracks[index].missedFrames <= maxPredictionMissedFrames else {
                 return nil
@@ -208,11 +328,30 @@ final class BeybladeTracker {
                 now: now
             )
         }
+
+        if shouldWriteTrackerSummary(now: now) {
+            trackerLog(
+                "[TRACKER_PREDICT_STEP]",
+                "output=\(resultDescriptions(output))",
+                "active=\(trackDescriptions(now: now))"
+            )
+        }
+
+        return output
     }
 
     func reset() {
+        if !tracks.isEmpty {
+            trackerLog(
+                "[TRACKER_RESET]",
+                "removedIds=\(tracks.map(\.id))"
+            )
+        }
+
         tracks.removeAll()
         nextId = 1
+        updateSequence = 0
+        lastTrackerSummaryLogTime = 0
     }
 
     // MARK: - Detection Validation
@@ -313,6 +452,14 @@ final class BeybladeTracker {
     ) -> Track {
         let id = nextId
         nextId += 1
+
+        trackerLog(
+            "[TRACKER_NEW]",
+            "id=\(id)",
+            "confidence=\(format(detection.confidence))",
+            "center=\(format(detection.center))",
+            "size=(\(format(detection.boundingBox.width)),\(format(detection.boundingBox.height)))"
+        )
 
         return Track(
             id: id,
@@ -426,6 +573,21 @@ final class BeybladeTracker {
     }
 
     private func removeDeadTracks() {
+        let removed = tracks.filter {
+            $0.missedFrames > maxMissedFrames
+        }
+
+        if !removed.isEmpty {
+            for track in removed {
+                trackerLog(
+                    "[TRACKER_REMOVED]",
+                    "id=\(track.id)",
+                    "missedFrames=\(track.missedFrames)",
+                    "lastCenter=\(format(track.center))"
+                )
+            }
+        }
+
         tracks.removeAll {
             $0.missedFrames > maxMissedFrames
         }
@@ -710,6 +872,135 @@ final class BeybladeTracker {
         )
     }
 
+    // MARK: - Tracker Diagnostics
+
+    private func shouldWriteTrackerSummary(
+        now: TimeInterval
+    ) -> Bool {
+        guard enableTrackerLogs else {
+            return false
+        }
+
+        guard lastTrackerSummaryLogTime == 0 ||
+              now - lastTrackerSummaryLogTime >= trackerSummaryLogInterval else {
+            return false
+        }
+
+        lastTrackerSummaryLogTime = now
+        return true
+    }
+
+    private func trackerLog(
+        _ items: Any...
+    ) {
+        guard enableTrackerLogs else {
+            return
+        }
+
+        Swift.print(
+            items.map { String(describing: $0) }
+                .joined(separator: " ")
+        )
+    }
+
+    private func logLostTrackTransitions() {
+        for track in tracks {
+            if track.missedFrames == 1 {
+                trackerLog(
+                    "[TRACKER_LOST]",
+                    "id=\(track.id)",
+                    "confirmed=\(track.confirmedFrames >= confirmFrames)",
+                    "center=\(format(track.center))",
+                    "velocity=\(format(track.velocity))"
+                )
+            }
+
+            if track.missedFrames == maxPredictionMissedFrames + 1 {
+                trackerLog(
+                    "[TRACKER_PREDICTION_STOP]",
+                    "id=\(track.id)",
+                    "missedFrames=\(track.missedFrames)",
+                    "retainedUntil=\(maxMissedFrames)"
+                )
+            }
+        }
+    }
+
+    private func detectionDescriptions(
+        _ detections: [DetectionResult]
+    ) -> String {
+        guard !detections.isEmpty else {
+            return "[]"
+        }
+
+        return "[" + detections.enumerated().map { index, detection in
+            "d\(index){conf=\(format(detection.confidence)),center=\(format(detection.center)),size=(\(format(detection.boundingBox.width)),\(format(detection.boundingBox.height)))}"
+        }.joined(separator: ",") + "]"
+    }
+
+    private func resultDescriptions(
+        _ results: [DetectionResult]
+    ) -> String {
+        guard !results.isEmpty else {
+            return "[]"
+        }
+
+        return "[" + results.map { result in
+            "id\(result.trackId){conf=\(format(result.confidence)),center=\(format(result.center))}"
+        }.joined(separator: ",") + "]"
+    }
+
+    private func trackDescriptions(
+        now: TimeInterval
+    ) -> String {
+        guard !tracks.isEmpty else {
+            return "[]"
+        }
+
+        return "[" + tracks.map { track in
+            let predicted = track.predictedCenter(
+                at: now,
+                maximumPredictionTime: maximumPredictionTime
+            )
+
+            return "id\(track.id){missed=\(track.missedFrames),confirmed=\(track.confirmedFrames),center=\(format(track.center)),pred=\(format(predicted))}"
+        }.joined(separator: ",") + "]"
+    }
+
+    private func trackMissedFrameDescription() -> String {
+        guard !tracks.isEmpty else {
+            return "[]"
+        }
+
+        return "[" + tracks.map {
+            "id\($0.id):\($0.missedFrames)"
+        }.joined(separator: ",") + "]"
+    }
+
+    private func format(
+        _ value: CGFloat
+    ) -> String {
+        String(
+            format: "%.4f",
+            Double(value)
+        )
+    }
+
+    private func format(
+        _ value: Float
+    ) -> String {
+        String(
+            format: "%.4f",
+            Double(value)
+        )
+    }
+
+    private func format(
+        _ point: CGPoint
+    ) -> String {
+        "(\(format(point.x)),\(format(point.y)))"
+    }
+
     // MARK: - Hungarian Assignment
 
     private func hungarian(
@@ -839,4 +1130,19 @@ final class BeybladeTracker {
 
         return assignment
     }
+}
+
+/// 關閉 App 內既有未限定的 `print` 診斷輸出。
+///
+/// Tracker 診斷使用 `Swift.print`，因此不受此函式影響。
+/// 需要重新啟用其他模組 log 時，移除此函式即可。
+@inline(__always)
+func print(
+    _ items: Any...,
+    separator: String = " ",
+    terminator: String = "\n"
+) {
+    _ = items
+    _ = separator
+    _ = terminator
 }
