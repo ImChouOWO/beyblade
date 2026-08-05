@@ -21,14 +21,14 @@ struct ContentView: View {
 
     @State private var showVideoPicker = false
 
-    // BEYTAIL_FEEDBACK_PATCH 2026.06.28-1
-    @AppStorage("hasShownEffectLongPressTip")
-    private var hasShownEffectLongPressTip = false
+    // 首次啟動的特效快捷選單教學
+    @AppStorage("hasShownEffectLongPressGuide")
+    private var hasShownEffectLongPressGuide = false
 
     @AppStorage("effectMenuIDs")
     private var effectMenuIDsRaw: String = ""
 
-    @State private var showEffectLongPressTip = false
+    @State private var showEffectLongPressGuide = false
 
     @AppStorage("is60FPSMode")
     private var is60FPSMode = false
@@ -388,6 +388,244 @@ struct ContentView: View {
         .zIndex(100)
     }
 
+
+    // MARK: - Effect Long Press Guide
+
+    private var effectLongPressGuideLayer: some View {
+        GeometryReader { geometry in
+            let screenSize = geometry.size
+            let highlightedFrame = effectButtonFrame.insetBy(
+                dx: -10,
+                dy: -8
+            )
+
+            ZStack {
+                EffectLongPressGuideMask(
+                    highlightedFrame: highlightedFrame,
+                    cornerRadius: 16
+                )
+                .fill(
+                    Color.gray.opacity(0.72),
+                    style: FillStyle(eoFill: true)
+                )
+                .ignoresSafeArea()
+
+                effectLongPressGuideContent(
+                    screenSize: screenSize,
+                    highlightedFrame: highlightedFrame
+                )
+            }
+            .frame(
+                width: screenSize.width,
+                height: screenSize.height
+            )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                dismissEffectLongPressGuide()
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(showEffectLongPressGuide)
+        .transition(.opacity)
+        .zIndex(200)
+    }
+
+    @ViewBuilder
+    private func effectLongPressGuideContent(
+        screenSize: CGSize,
+        highlightedFrame: CGRect
+    ) -> some View {
+        let isLandscape = screenSize.width > screenSize.height
+
+        if isLandscape {
+            landscapeEffectLongPressGuide(
+                screenSize: screenSize,
+                highlightedFrame: highlightedFrame
+            )
+        } else {
+            portraitEffectLongPressGuide(
+                screenSize: screenSize,
+                highlightedFrame: highlightedFrame
+            )
+        }
+    }
+
+    private func portraitEffectLongPressGuide(
+        screenSize: CGSize,
+        highlightedFrame: CGRect
+    ) -> some View {
+        let guideWidth = min(280, screenSize.width - 40)
+        let preferredY = highlightedFrame.minY - 105
+        let guideY = max(
+            90,
+            min(preferredY, screenSize.height - 190)
+        )
+
+        return VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.tap.fill")
+                    .font(.system(size: 19, weight: .semibold))
+                    .foregroundColor(Color(hex: 0x00F5FF))
+
+                Text("長按特效庫")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white)
+            }
+
+            Text("可呼叫特效快捷選單")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(.white.opacity(0.82))
+
+        
+
+            Text("點擊畫面任意位置關閉")
+                .font(.system(size: 10))
+                .foregroundColor(.white.opacity(0.52))
+        }
+        .frame(width: guideWidth)
+        .padding(.vertical, 16)
+        .background(
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color.black.opacity(0.84))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(
+                            Color(hex: 0x00F5FF).opacity(0.25),
+                            lineWidth: 1
+                        )
+                )
+        )
+        .position(
+            x: min(
+                max(
+                    highlightedFrame.midX,
+                    guideWidth / 2 + 20
+                ),
+                screenSize.width - guideWidth / 2 - 20
+            ),
+            y: guideY
+        )
+    }
+
+    private func landscapeEffectLongPressGuide(
+        screenSize: CGSize,
+        highlightedFrame: CGRect
+    ) -> some View {
+        let guideWidth: CGFloat = 250
+        let guideHeight: CGFloat = 118
+
+        let buttonIsOnRightSide =
+            highlightedFrame.midX >= screenSize.width / 2
+
+        let preferredX: CGFloat
+
+        if buttonIsOnRightSide {
+            preferredX =
+                highlightedFrame.minX
+                - guideWidth / 2
+                - 25
+        } else {
+            preferredX =
+                highlightedFrame.maxX
+                + guideWidth / 2
+                + 25
+        }
+
+        let guideX = min(
+            max(
+                preferredX,
+                guideWidth / 2 + 20
+            ),
+            screenSize.width - guideWidth / 2 - 20
+        )
+
+        let guideY = min(
+            max(
+                highlightedFrame.midY,
+                guideHeight / 2 + 20
+            ),
+            screenSize.height - guideHeight / 2 - 20
+        )
+
+        return landscapeGuideText
+            .frame(
+                width: guideWidth,
+                height: guideHeight
+            )
+            .background(
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color.black.opacity(0.84))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(
+                                Color(hex: 0x00F5FF).opacity(0.25),
+                                lineWidth: 1
+                            )
+                    )
+            )
+            .position(
+                x: guideX,
+                y: guideY
+            )
+    }
+
+    private var landscapeGuideText: some View {
+        VStack(
+            alignment: .leading,
+            spacing: 7
+        ) {
+            HStack(spacing: 7) {
+                Image(systemName: "hand.tap.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(Color(hex: 0x00F5FF))
+
+                Text("長按特效庫")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(.white)
+            }
+
+            Text("可呼叫特效快捷選單")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(.white.opacity(0.82))
+
+            Text("點擊畫面任意位置關閉")
+                .font(.system(size: 9))
+                .foregroundColor(.white.opacity(0.52))
+        }
+    }
+
+    private func presentEffectLongPressGuideIfNeeded(
+        buttonFrame: CGRect
+    ) {
+        guard !hasShownEffectLongPressGuide,
+              !showEffectLongPressGuide,
+              !buttonFrame.isEmpty,
+              buttonFrame.width > 1,
+              buttonFrame.height > 1 else {
+            return
+        }
+
+        hasShownEffectLongPressGuide = true
+
+        withAnimation(
+            .easeInOut(duration: uiAnimationDuration)
+        ) {
+            showEffectLongPressGuide = true
+        }
+    }
+
+    private func dismissEffectLongPressGuide() {
+        guard showEffectLongPressGuide else {
+            return
+        }
+
+        withAnimation(
+            .easeOut(duration: uiAnimationDuration)
+        ) {
+            showEffectLongPressGuide = false
+        }
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
@@ -444,6 +682,10 @@ struct ContentView: View {
                     busyOverlay
                         .transition(.opacity)
                 }
+
+                if showEffectLongPressGuide {
+                    effectLongPressGuideLayer
+                }
             }
             // 手勢掛在整個畫面；只有從特效按鈕開始時才啟動選擇。
             .contentShape(Rectangle())
@@ -455,6 +697,16 @@ struct ContentView: View {
                 EffectButtonFramePreferenceKey.self
             ) { frame in
                 effectButtonFrame = frame
+
+                guard !frame.isEmpty else {
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    presentEffectLongPressGuideIfNeeded(
+                        buttonFrame: frame
+                    )
+                }
             }
             .fullScreenCover(
                 isPresented: $showVideoPicker,
@@ -503,24 +755,11 @@ struct ContentView: View {
                     .interactiveDismissDisabled(vm.recordingSaveState == .saving)
                 }
             }
-            .alert(
-                "操作提示",
-                isPresented: $showEffectLongPressTip
-            ) {
-                Button("知道了", role: .cancel) {}
-            } message: {
-                Text("長按可切換特效")
-            }
             .onAppear {
                 UIDevice.current
                     .beginGeneratingDeviceOrientationNotifications()
 
                 updateIconRotation()
-
-                if !hasShownEffectLongPressTip {
-                    hasShownEffectLongPressTip = true
-                    showEffectLongPressTip = true
-                }
 
                 CameraFrameRateCoordinator.shared.bind(
                     to: vm.cameraManager
@@ -940,7 +1179,8 @@ struct ContentView: View {
             coordinateSpace: .global
         )
         .onChanged { value in
-            guard !isBusy else {
+            guard !isBusy,
+                  !showEffectLongPressGuide else {
                 return
             }
 
@@ -969,6 +1209,11 @@ struct ContentView: View {
             }
         }
         .onEnded { _ in
+            guard !showEffectLongPressGuide else {
+                resetEffectPressState()
+                return
+            }
+
             // 不是從特效按鈕開始的手勢，不做處理。
             guard effectPressStartDate != nil else {
                 return
@@ -1116,6 +1361,34 @@ struct ContentView: View {
         }
 
         return "處理中..."
+    }
+}
+
+
+private struct EffectLongPressGuideMask: Shape {
+    let highlightedFrame: CGRect
+    let cornerRadius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+
+        path.addRect(rect)
+
+        guard !highlightedFrame.isEmpty,
+              highlightedFrame.width > 1,
+              highlightedFrame.height > 1 else {
+            return path
+        }
+
+        path.addRoundedRect(
+            in: highlightedFrame,
+            cornerSize: CGSize(
+                width: cornerRadius,
+                height: cornerRadius
+            )
+        )
+
+        return path
     }
 }
 

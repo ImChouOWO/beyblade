@@ -293,6 +293,10 @@ final class MainViewModel: ObservableObject {
     private var latestOverlaySize = CGSize(width: 1, height: 1)
     private var previewVideoGravity: AVLayerVideoGravity = .resizeAspectFill
 
+    /// 錄影軌跡與 Metal 合成共用的影片時間軸。
+    /// 僅保存 CMSampleBuffer 的 presentationTimeStamp，避免混用 CACurrentMediaTime。
+    private var latestRecordingMediaTime: CFTimeInterval?
+
     private var activeFrameInputSource: FrameInputSource = .camera
     private var activeVisionOrientation: CGImagePropertyOrientation = .up
 
@@ -604,6 +608,7 @@ final class MainViewModel: ObservableObject {
         activeVisionOrientation = .up
         videoFrameCount = 0
         latestSourceFrameSize = CGSize(width: 1, height: 1)
+        latestRecordingMediaTime = nil
 
         appMode = .stopped
     }
@@ -638,9 +643,8 @@ final class MainViewModel: ObservableObject {
             mappedDetections: mappedResults
         )
 
-        if recordingManager.isRecording {
-            let recordingNow = CACurrentMediaTime()
-
+        if recordingManager.isRecording,
+           let recordingNow = latestRecordingMediaTime {
             for result in tracked where result.trackId > 0 {
                 recordingTrailEffectEngine.addPoint(
                     trackId: result.trackId,
@@ -1288,11 +1292,13 @@ final class MainViewModel: ObservableObject {
     private func appendRecordingFrame(
         _ buffer: CMSampleBuffer
     ) {
-        guard recordingManager.isRecording else {
+        guard recordingManager.isRecording,
+              let now = presentationTimeSeconds(from: buffer) else {
             return
         }
 
-        let now = CACurrentMediaTime()
+        latestRecordingMediaTime = now
+
         let trackData = recordingTrailEffectEngine
             .getPointsByTrack(now: now)
 
@@ -1302,6 +1308,25 @@ final class MainViewModel: ObservableObject {
             effect: selectedEffect,
             now: now
         )
+    }
+
+    private func presentationTimeSeconds(
+        from buffer: CMSampleBuffer
+    ) -> CFTimeInterval? {
+        let presentationTime =
+            CMSampleBufferGetPresentationTimeStamp(buffer)
+
+        guard presentationTime.isNumeric else {
+            return nil
+        }
+
+        let seconds = CMTimeGetSeconds(presentationTime)
+
+        guard seconds.isFinite else {
+            return nil
+        }
+
+        return seconds
     }
 
     // MARK: - Recording Event
@@ -1338,6 +1363,7 @@ final class MainViewModel: ObservableObject {
                 self.appMode == .cameraPreview
 
             self.appMode = .preparingRecording
+            self.latestRecordingMediaTime = nil
 
             if wasLiveCamera {
                 /*
@@ -1462,6 +1488,7 @@ final class MainViewModel: ObservableObject {
         activeFrameInputSource = .camera
         activeVisionOrientation = .up
         videoFrameCount = 0
+        latestRecordingMediaTime = nil
 
         finishEvent()
 

@@ -10,7 +10,6 @@ struct SettingsSheetView: View {
     let animationDuration: Double
 
     @Environment(\.openURL) private var openURL
-    @Environment(\.requestReview) private var requestReview
 
     @State private var dragOffset: CGFloat = 0
     @State private var isRestoringPurchases = false
@@ -18,6 +17,10 @@ struct SettingsSheetView: View {
 
     private let supportURL = URL(
         string: "https://forms.gle/KdWvoQipyodQwb8HA"
+    )!
+
+    private let appReviewURL = URL(
+        string: "https://apps.apple.com/app/id6788279432?action=write-review"
     )!
 
     private let privacyPolicyURL = URL(
@@ -50,7 +53,7 @@ struct SettingsSheetView: View {
                         systemName: "star.fill",
                         title: "為 App 評分"
                     ) {
-                        requestReview()
+                        openURL(appReviewURL)
                     }
 
                     settingButton(
@@ -213,12 +216,13 @@ struct SettingsSheetView: View {
                     .frame(width: 38, height: 38)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(
-                                red: 0.0,
-                                green: 229.0 / 255.0,
-                                blue: 1.0
+                            .fill(
+                                Color(
+                                    red: 0.0,
+                                    green: 229.0 / 255.0,
+                                    blue: 1.0
+                                )
                             )
-                        )
                     )
                     .rotationEffect(iconRotation)
 

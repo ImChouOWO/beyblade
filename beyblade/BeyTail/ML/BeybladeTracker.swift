@@ -14,11 +14,21 @@ final class BeybladeTracker {
         var missedFrames: Int
         var confirmedFrames: Int
         var lastUpdateTime: TimeInterval
+        var fps: Float
+        var hardware: BeyTailInferenceHardware
 
-        var predictedCenter: CGPoint {
-            CGPoint(
-                x: center.x + velocity.x,
-                y: center.y + velocity.y
+        func predictedCenter(
+            at now: TimeInterval,
+            maximumPredictionTime: TimeInterval
+        ) -> CGPoint {
+            let elapsed = min(
+                max(now - lastUpdateTime, 0),
+                maximumPredictionTime
+            )
+
+            return CGPoint(
+                x: center.x + velocity.x * elapsed,
+                y: center.y + velocity.y * elapsed
             )
         }
     }
@@ -26,37 +36,64 @@ final class BeybladeTracker {
     private var tracks: [Track] = []
     private var nextId = 1
 
-    private let maxMissedFrames = 8
-    private let confirmFrames = 2
-    private let maxMatchDistance: CGFloat = 0.35
+    /// 場景中的陀螺最多為 5 顆，避免誤判持續建立新軌跡。
+    private let maxTrackCount = 5
 
-    private let velocitySmoothAlpha: CGFloat = 0.30
+    /// 軌跡最多保留的漏檢次數。
+    private let maxMissedFrames = 30
+
+    /// 僅在前三次短暫漏檢時輸出預測框，避免拖尾立即中斷。
+    private let maxPredictionMissedFrames = 6
+
+    /// 新物件必須連續匹配三次，才會正式輸出。
+    /// 可降低高速模糊時偶發的第三個誤判框。
+    private let confirmFrames = 3
+
+    /// 新軌跡需要較高信心；已存在軌跡則可接受較弱偵測結果。
+    private let newTrackConfidenceThreshold: Float = 0.45
+    private let existingTrackConfidenceThreshold: Float = 0.15
+
+    /// 高速移動時放寬配對距離，但仍限制最大範圍。
+    private let baseMatchDistance: CGFloat = 0.22
+    private let maximumMatchDistance: CGFloat = 0.58
+
+    /// 速度採每秒 normalized 座標，避免推論間隔改變時預測距離失真。
+    private let velocitySmoothAlpha: CGFloat = 0.52
     private let colorSmoothAlpha: CGFloat = 0.15
+    private let maximumPredictionTime: TimeInterval = 0.32
 
     // MARK: - Public API
 
     func update(_ detections: [DetectionResult]) -> [DetectionResult] {
         let now = CACurrentMediaTime()
+        let validDetections = sanitizeDetections(detections)
 
-        guard !detections.isEmpty else {
+        guard !validDetections.isEmpty else {
             markAllTracksMissed()
+
+            let output = predictedResults(
+                forTrackIndices: Set(tracks.indices),
+                now: now
+            )
+
             removeDeadTracks()
-            return []
+            return output
         }
 
         if tracks.isEmpty {
             return createInitialTracks(
-                from: detections,
+                from: validDetections,
                 now: now
             )
         }
 
         let trackCount = tracks.count
-        let detectionCount = detections.count
+        let detectionCount = validDetections.count
 
         let costMatrix = buildCostMatrix(
             tracks: tracks,
-            detections: detections
+            detections: validDetections,
+            now: now
         )
 
         let assignment = hungarian(
@@ -82,14 +119,26 @@ final class BeybladeTracker {
             }
 
             let track = tracks[trackIndex]
-            let detection = detections[detectionIndex]
+            let detection = validDetections[detectionIndex]
+
+            guard detection.confidence >= existingTrackConfidenceThreshold else {
+                continue
+            }
+
+            let predictedCenter = track.predictedCenter(
+                at: now,
+                maximumPredictionTime: maximumPredictionTime
+            )
 
             let centerDistance = distance(
-                track.predictedCenter,
+                predictedCenter,
                 detection.center
             )
 
-            guard centerDistance <= maxMatchDistance else {
+            guard centerDistance <= matchDistanceLimit(
+                for: track,
+                now: now
+            ) else {
                 continue
             }
 
@@ -118,58 +167,74 @@ final class BeybladeTracker {
             matchedTracks: matchedTracks
         )
 
-        removeDeadTracks()
+        let unmatchedConfirmedTracks = Set(
+            tracks.indices.filter {
+                !matchedTracks.contains($0)
+            }
+        )
+
+        output.append(
+            contentsOf: predictedResults(
+                forTrackIndices: unmatchedConfirmedTracks,
+                now: now
+            )
+        )
 
         createTracksForUnmatchedDetections(
-            detections: detections,
+            detections: validDetections,
             matchedDetections: matchedDetections,
             now: now
         )
 
-        return output
+        removeDeadTracks()
+
+        return output.sorted {
+            $0.trackId < $1.trackId
+        }
     }
 
+    /// 離線影片未執行偵測的影格，可使用此方法延伸已確認軌跡。
     func predictStep() -> [DetectionResult] {
-        var output: [DetectionResult] = []
+        let now = CACurrentMediaTime()
 
-        for index in tracks.indices {
+        return tracks.indices.compactMap { index in
             guard tracks[index].confirmedFrames >= confirmFrames,
-                  tracks[index].missedFrames == 0 else {
-                continue
+                  tracks[index].missedFrames <= maxPredictionMissedFrames else {
+                return nil
             }
 
-            let predicted = tracks[index].predictedCenter
-
-            tracks[index].center = predicted
-
-            let width = tracks[index].width
-            let height = tracks[index].height
-
-            let box = CGRect(
-                x: predicted.x - width / 2.0,
-                y: predicted.y - height / 2.0,
-                width: width,
-                height: height
+            return makePredictedDetectionResult(
+                track: tracks[index],
+                now: now
             )
-
-            let result = DetectionResult(
-                boundingBox: box,
-                confidence: tracks[index].confidence,
-                fps: 0,
-                hardware: BeyTailInferenceHardware.cpu,
-                trackId: tracks[index].id,
-                dominantColor: tracks[index].smoothColor
-            )
-
-            output.append(result)
         }
-
-        return output
     }
 
     func reset() {
         tracks.removeAll()
         nextId = 1
+    }
+
+    // MARK: - Detection Validation
+
+    private func sanitizeDetections(
+        _ detections: [DetectionResult]
+    ) -> [DetectionResult] {
+        detections
+            .filter { detection in
+                let rect = detection.boundingBox
+
+                return detection.confidence >= existingTrackConfidenceThreshold &&
+                    rect.minX.isFinite &&
+                    rect.minY.isFinite &&
+                    rect.width.isFinite &&
+                    rect.height.isFinite &&
+                    rect.width > 0.005 &&
+                    rect.height > 0.005
+            }
+            .sorted {
+                $0.confidence > $1.confidence
+            }
     }
 
     // MARK: - Track Creation
@@ -180,21 +245,15 @@ final class BeybladeTracker {
     ) -> [DetectionResult] {
         var output: [DetectionResult] = []
 
-        for detection in detections {
-            let id = nextId
-            nextId += 1
+        for detection in detections where
+            detection.confidence >= newTrackConfidenceThreshold {
+            guard tracks.count < maxTrackCount else {
+                break
+            }
 
-            let track = Track(
-                id: id,
-                center: detection.center,
-                width: detection.boundingBox.width,
-                height: detection.boundingBox.height,
-                velocity: .zero,
-                confidence: detection.confidence,
-                smoothColor: detection.dominantColor,
-                missedFrames: 0,
-                confirmedFrames: 1,
-                lastUpdateTime: now
+            let track = makeTrack(
+                from: detection,
+                now: now
             )
 
             tracks.append(track)
@@ -224,24 +283,79 @@ final class BeybladeTracker {
 
             let detection = detections[detectionIndex]
 
-            let id = nextId
-            nextId += 1
+            guard detection.confidence >= newTrackConfidenceThreshold else {
+                continue
+            }
 
-            let track = Track(
-                id: id,
-                center: detection.center,
-                width: detection.boundingBox.width,
-                height: detection.boundingBox.height,
-                velocity: .zero,
-                confidence: detection.confidence,
-                smoothColor: detection.dominantColor,
-                missedFrames: 0,
-                confirmedFrames: 1,
-                lastUpdateTime: now
+            guard tracks.count < maxTrackCount else {
+                break
+            }
+
+            guard !isDuplicateOfExistingTrack(
+                detection,
+                now: now
+            ) else {
+                continue
+            }
+
+            tracks.append(
+                makeTrack(
+                    from: detection,
+                    now: now
+                )
+            )
+        }
+    }
+
+    private func makeTrack(
+        from detection: DetectionResult,
+        now: TimeInterval
+    ) -> Track {
+        let id = nextId
+        nextId += 1
+
+        return Track(
+            id: id,
+            center: detection.center,
+            width: detection.boundingBox.width,
+            height: detection.boundingBox.height,
+            velocity: .zero,
+            confidence: detection.confidence,
+            smoothColor: detection.dominantColor,
+            missedFrames: 0,
+            confirmedFrames: 1,
+            lastUpdateTime: now,
+            fps: detection.fps,
+            hardware: detection.hardware
+        )
+    }
+
+    private func isDuplicateOfExistingTrack(
+        _ detection: DetectionResult,
+        now: TimeInterval
+    ) -> Bool {
+        for track in tracks {
+            let predicted = track.predictedCenter(
+                at: now,
+                maximumPredictionTime: maximumPredictionTime
             )
 
-            tracks.append(track)
+            let centerDistance = distance(
+                predicted,
+                detection.center
+            )
+
+            let sizeReference = max(
+                min(track.width, track.height),
+                0.02
+            )
+
+            if centerDistance < sizeReference * 0.35 {
+                return true
+            }
         }
+
+        return false
     }
 
     // MARK: - Track Update
@@ -258,14 +372,23 @@ final class BeybladeTracker {
         let oldCenter = tracks[index].center
         let newCenter = detection.center
 
-        let dx = newCenter.x - oldCenter.x
-        let dy = newCenter.y - oldCenter.y
+        let elapsed = min(
+            max(now - tracks[index].lastUpdateTime, 1.0 / 120.0),
+            0.50
+        )
+
+        let observedVelocity = CGPoint(
+            x: (newCenter.x - oldCenter.x) / elapsed,
+            y: (newCenter.y - oldCenter.y) / elapsed
+        )
 
         let oldVelocity = tracks[index].velocity
 
         let newVelocity = CGPoint(
-            x: oldVelocity.x * (1.0 - velocitySmoothAlpha) + dx * velocitySmoothAlpha,
-            y: oldVelocity.y * (1.0 - velocitySmoothAlpha) + dy * velocitySmoothAlpha
+            x: oldVelocity.x * (1.0 - velocitySmoothAlpha) +
+                observedVelocity.x * velocitySmoothAlpha,
+            y: oldVelocity.y * (1.0 - velocitySmoothAlpha) +
+                observedVelocity.y * velocitySmoothAlpha
         )
 
         let blendedColor = blendColor(
@@ -283,6 +406,8 @@ final class BeybladeTracker {
         tracks[index].missedFrames = 0
         tracks[index].confirmedFrames += 1
         tracks[index].lastUpdateTime = now
+        tracks[index].fps = detection.fps
+        tracks[index].hardware = detection.hardware
     }
 
     private func markAllTracksMissed() {
@@ -294,10 +419,9 @@ final class BeybladeTracker {
     private func markUnmatchedTracksMissed(
         matchedTracks: Set<Int>
     ) {
-        for index in tracks.indices {
-            if !matchedTracks.contains(index) {
-                tracks[index].missedFrames += 1
-            }
+        for index in tracks.indices where
+            !matchedTracks.contains(index) {
+            tracks[index].missedFrames += 1
         }
     }
 
@@ -307,11 +431,68 @@ final class BeybladeTracker {
         }
     }
 
+    // MARK: - Prediction Output
+
+    private func predictedResults(
+        forTrackIndices indices: Set<Int>,
+        now: TimeInterval
+    ) -> [DetectionResult] {
+        indices.compactMap { index in
+            guard tracks.indices.contains(index),
+                  tracks[index].confirmedFrames >= confirmFrames,
+                  tracks[index].missedFrames > 0,
+                  tracks[index].missedFrames <= maxPredictionMissedFrames else {
+                return nil
+            }
+
+            return makePredictedDetectionResult(
+                track: tracks[index],
+                now: now
+            )
+        }
+    }
+
+    private func makePredictedDetectionResult(
+        track: Track,
+        now: TimeInterval
+    ) -> DetectionResult {
+        let predicted = clampNormalizedPoint(
+            track.predictedCenter(
+                at: now,
+                maximumPredictionTime: maximumPredictionTime
+            )
+        )
+
+        let box = clampNormalizedRect(
+            CGRect(
+                x: predicted.x - track.width / 2.0,
+                y: predicted.y - track.height / 2.0,
+                width: track.width,
+                height: track.height
+            )
+        )
+
+        let decay = pow(
+            0.82,
+            Float(max(track.missedFrames, 0))
+        )
+
+        return DetectionResult(
+            boundingBox: box,
+            confidence: max(track.confidence * decay, 0.01),
+            fps: track.fps,
+            hardware: track.hardware,
+            trackId: track.id,
+            dominantColor: track.smoothColor
+        )
+    }
+
     // MARK: - Cost Matrix
 
     private func buildCostMatrix(
         tracks: [Track],
-        detections: [DetectionResult]
+        detections: [DetectionResult],
+        now: TimeInterval
     ) -> [[Float]] {
         var matrix = Array(
             repeating: Array(
@@ -326,12 +507,20 @@ final class BeybladeTracker {
                 let track = tracks[trackIndex]
                 let detection = detections[detectionIndex]
 
+                let predicted = track.predictedCenter(
+                    at: now,
+                    maximumPredictionTime: maximumPredictionTime
+                )
+
                 let dist = distance(
-                    track.predictedCenter,
+                    predicted,
                     detection.center
                 )
 
-                guard dist <= maxMatchDistance else {
+                guard dist <= matchDistanceLimit(
+                    for: track,
+                    now: now
+                ) else {
                     continue
                 }
 
@@ -340,23 +529,53 @@ final class BeybladeTracker {
                     detection: detection
                 )
 
-                let velocityScore = calculateVelocityScore(
+                let motionScore = calculateMotionScore(
                     track: track,
-                    detection: detection
+                    detection: detection,
+                    now: now
+                )
+
+                let confidenceScore = max(
+                    detection.confidence,
+                    0.10
                 )
 
                 let denominator = max(
-                    sizeScore * velocityScore,
+                    sizeScore * motionScore * confidenceScore,
                     0.0001
                 )
 
-                let cost = Float(dist) / denominator
-
-                matrix[trackIndex][detectionIndex] = cost
+                matrix[trackIndex][detectionIndex] =
+                    Float(dist) / denominator
             }
         }
 
         return matrix
+    }
+
+    private func matchDistanceLimit(
+        for track: Track,
+        now: TimeInterval
+    ) -> CGFloat {
+        let elapsed = min(
+            max(now - track.lastUpdateTime, 0),
+            maximumPredictionTime
+        )
+
+        let speed = sqrt(
+            track.velocity.x * track.velocity.x +
+            track.velocity.y * track.velocity.y
+        )
+
+        let missedAllowance =
+            CGFloat(track.missedFrames) * 0.035
+
+        return min(
+            baseMatchDistance +
+                speed * elapsed * 0.80 +
+                missedAllowance,
+            maximumMatchDistance
+        )
     }
 
     private func calculateSizeScore(
@@ -369,35 +588,36 @@ final class BeybladeTracker {
         )
 
         let detectionArea = max(
-            detection.boundingBox.width * detection.boundingBox.height,
+            detection.boundingBox.width *
+                detection.boundingBox.height,
             0.0001
         )
 
         let areaRatio = detectionArea / trackArea
-        let ratioError = abs(Float(areaRatio) - 1.0)
+        let ratioError = abs(log(max(Float(areaRatio), 0.0001)))
+        let score = exp(-1.25 * ratioError)
 
-        let score = exp(-3.0 * ratioError)
-
-        return score.clamped(to: 0.01...1.0)
+        return score.clamped(to: 0.05...1.0)
     }
 
-    private func calculateVelocityScore(
+    private func calculateMotionScore(
         track: Track,
-        detection: DetectionResult
+        detection: DetectionResult,
+        now: TimeInterval
     ) -> Float {
-        let observedVelocity = CGPoint(
-            x: detection.center.x - track.center.x,
-            y: detection.center.y - track.center.y
+        let predicted = track.predictedCenter(
+            at: now,
+            maximumPredictionTime: maximumPredictionTime
         )
 
-        let velocityError = distance(
-            observedVelocity,
-            track.velocity
+        let predictionError = distance(
+            predicted,
+            detection.center
         )
 
-        let score = exp(-8.0 * Float(velocityError))
+        let score = exp(-3.5 * Float(predictionError))
 
-        return score.clamped(to: 0.01...1.0)
+        return score.clamped(to: 0.05...1.0)
     }
 
     // MARK: - Result Builder
@@ -428,6 +648,31 @@ final class BeybladeTracker {
         return sqrt(dx * dx + dy * dy)
     }
 
+    private func clampNormalizedPoint(
+        _ point: CGPoint
+    ) -> CGPoint {
+        CGPoint(
+            x: min(max(point.x, 0.0), 1.0),
+            y: min(max(point.y, 0.0), 1.0)
+        )
+    }
+
+    private func clampNormalizedRect(
+        _ rect: CGRect
+    ) -> CGRect {
+        let minX = min(max(rect.minX, 0.0), 1.0)
+        let minY = min(max(rect.minY, 0.0), 1.0)
+        let maxX = min(max(rect.maxX, 0.0), 1.0)
+        let maxY = min(max(rect.maxY, 0.0), 1.0)
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0, maxX - minX),
+            height: max(0.0, maxY - minY)
+        )
+    }
+
     private func blendColor(
         _ first: UIColor,
         _ second: UIColor,
@@ -443,30 +688,25 @@ final class BeybladeTracker {
         var b2: CGFloat = 0
         var a2: CGFloat = 0
 
-        first.getRed(
+        guard first.getRed(
             &r1,
             green: &g1,
             blue: &b1,
             alpha: &a1
-        )
-
-        second.getRed(
+        ), second.getRed(
             &r2,
             green: &g2,
             blue: &b2,
             alpha: &a2
-        )
-
-        let red = r1 * (1.0 - t) + r2 * t
-        let green = g1 * (1.0 - t) + g2 * t
-        let blue = b1 * (1.0 - t) + b2 * t
-        let alpha = a1 * (1.0 - t) + a2 * t
+        ) else {
+            return second
+        }
 
         return UIColor(
-            red: red,
-            green: green,
-            blue: blue,
-            alpha: alpha
+            red: r1 * (1.0 - t) + r2 * t,
+            green: g1 * (1.0 - t) + g2 * t,
+            blue: b1 * (1.0 - t) + b2 * t,
+            alpha: a1 * (1.0 - t) + a2 * t
         )
     }
 
@@ -499,12 +739,8 @@ final class BeybladeTracker {
         for row in 0..<numRows {
             for col in 0..<numCols {
                 let value = cost[row][col]
-
-                if value.isFinite {
-                    squareCost[row][col] = value
-                } else {
-                    squareCost[row][col] = largeCost
-                }
+                squareCost[row][col] =
+                    value.isFinite ? value : largeCost
             }
         }
 
@@ -512,17 +748,14 @@ final class BeybladeTracker {
             repeating: Float(0),
             count: size + 1
         )
-
         var v = Array(
             repeating: Float(0),
             count: size + 1
         )
-
         var p = Array(
             repeating: 0,
             count: size + 1
         )
-
         var way = Array(
             repeating: 0,
             count: size + 1
@@ -530,14 +763,11 @@ final class BeybladeTracker {
 
         for i in 1...size {
             p[0] = i
-
             var j0 = 0
-
             var minv = Array(
                 repeating: Float.infinity,
                 count: size + 1
             )
-
             var used = Array(
                 repeating: false,
                 count: size + 1
@@ -601,9 +831,8 @@ final class BeybladeTracker {
 
             let row = i - 1
             let col = j - 1
-            let assignedCost = squareCost[row][col]
 
-            if assignedCost < largeCost {
+            if squareCost[row][col] < largeCost {
                 assignment[row] = col
             }
         }

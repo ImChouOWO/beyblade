@@ -8,6 +8,12 @@ private struct InferenceUncheckedSendableBox<T>: @unchecked Sendable {
     let value: T
 }
 
+private struct PendingInferenceFrame: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let orientation: CGImagePropertyOrientation
+    let sourceSize: CGSize
+}
+
 final class InferenceEngine: @unchecked Sendable {
 
     let isMockMode: Bool
@@ -21,7 +27,13 @@ final class InferenceEngine: @unchecked Sendable {
         qos: .userInitiated
     )
 
+    /// 一次只執行一個 Vision request。
     private var isProcessing = false
+
+    /// 推論忙碌時不再直接丟掉所有影格，只保留最新一張等待處理。
+    private var pendingFrame: PendingInferenceFrame?
+    private var replacedPendingFrameCount = 0
+    private var isEnabled = false
 
     private var frameCount = 0
     private var lastFpsTime = CACurrentMediaTime()
@@ -33,20 +45,32 @@ final class InferenceEngine: @unchecked Sendable {
     private var activeColorPixelBuffer: CVPixelBuffer?
     private var activeColorOrientation: CGImagePropertyOrientation = .up
 
-    private let confidenceThreshold: Float = 0.30
-    private let nmsIoUThreshold: CGFloat = 0.35
-    private let maxOutputDetections = 20
+    /// 高速模糊時允許較低信心框進入追蹤器。
+    /// 新軌跡仍會由 BeybladeTracker 的較高門檻與連續確認機制過濾。
+    private let confidenceThreshold: Float = 0.20
 
-    /*
-     這個值代表 YOLO raw output bbox 座標的基準尺寸。
-     這版會優先從 CoreML input image constraint 自動讀取。
-     如果讀不到，會使用 640x640 fallback。
-     */
-    private var modelInputSize = CGSize(width: 320, height: 320)
+    /// 稍微放寬 NMS，降低兩顆陀螺接近時被合併成一顆的機率。
+    private let nmsIoUThreshold: CGFloat = 0.45
+
+    /// 避免大量低品質候選框進入追蹤器。
+    private let maxOutputDetections = 4
+
+    /// App 預期使用的模型輸入尺寸。
+    /// 真正推論尺寸仍由 Core ML 模型本身決定。
+    private static let preferredModelInputSize = CGSize(
+        width: 640,
+        height: 640
+    )
+
+    /// YOLO raw output bbox 座標的基準尺寸。
+    /// 啟動時會從 Core ML model description 讀取實際值。
+    private var modelInputSize = CGSize(
+        width: 640,
+        height: 640
+    )
 
     private let singleClassId = 0
 
-    private var didPrintModelDescription = false
     private var didPrintFrameDebug = false
     private var didPrintRawOutputInfo = false
     private var didPrintFirstRows = false
@@ -73,11 +97,15 @@ final class InferenceEngine: @unchecked Sendable {
                     configuration: config
                 )
 
-                self.modelInputSize = Self.detectModelInputSize(from: mlModel)
+                self.modelInputSize = Self.detectModelInputSize(
+                    from: mlModel,
+                    fallback: Self.preferredModelInputSize
+                )
 
                 Self.printModelDescriptionDebug(
                     mlModel,
-                    resolvedModelInputSize: self.modelInputSize
+                    resolvedModelInputSize: modelInputSize,
+                    preferredModelInputSize: Self.preferredModelInputSize
                 )
 
                 let vnModel = try VNCoreMLModel(for: mlModel)
@@ -95,15 +123,24 @@ final class InferenceEngine: @unchecked Sendable {
                     }
                 )
 
-                print("[INFO] CoreML model loaded:", modelURL.lastPathComponent)
+                print(
+                    "[INFO] CoreML model loaded:",
+                    modelURL.lastPathComponent
+                )
 
             } catch {
                 self.model = nil
                 self.request = nil
                 self.isMockMode = true
 
-                print("[ERROR] CoreML model load failed:", error.localizedDescription)
-                print("[INFO] Use frame-driven MOCK mode:", modelName)
+                print(
+                    "[ERROR] CoreML model load failed:",
+                    error.localizedDescription
+                )
+                print(
+                    "[INFO] Use frame-driven MOCK mode:",
+                    modelName
+                )
             }
 
         } else {
@@ -111,7 +148,10 @@ final class InferenceEngine: @unchecked Sendable {
             self.request = nil
             self.isMockMode = true
 
-            print("[INFO] CoreML model not found. Use frame-driven MOCK mode:", modelName)
+            print(
+                "[INFO] CoreML model not found. Use frame-driven MOCK mode:",
+                modelName
+            )
         }
     }
 
@@ -125,17 +165,18 @@ final class InferenceEngine: @unchecked Sendable {
         )
 
         request.imageCropAndScaleOption = .scaleFill
-
         return request
     }
 
-    // MARK: - Model Debug
+    // MARK: - Model Input
 
     private static func detectModelInputSize(
-        from mlModel: MLModel
+        from mlModel: MLModel,
+        fallback: CGSize
     ) -> CGSize {
-        for input in mlModel.modelDescription.inputDescriptionsByName {
-            if let imageConstraint = input.value.imageConstraint {
+        for (_, description) in
+            mlModel.modelDescription.inputDescriptionsByName {
+            if let imageConstraint = description.imageConstraint {
                 let width = imageConstraint.pixelsWide
                 let height = imageConstraint.pixelsHigh
 
@@ -148,95 +189,67 @@ final class InferenceEngine: @unchecked Sendable {
                 }
             }
 
-            if let multiArrayConstraint = input.value.multiArrayConstraint {
+            if let multiArrayConstraint =
+                description.multiArrayConstraint {
                 let shape = multiArrayConstraint.shape.map {
                     $0.intValue
                 }
 
                 if shape.count >= 2 {
-                    let possibleHeight = shape[shape.count - 2]
-                    let possibleWidth = shape[shape.count - 1]
+                    let height = shape[shape.count - 2]
+                    let width = shape[shape.count - 1]
 
-                    if possibleWidth > 0,
-                       possibleHeight > 0 {
+                    if width > 0,
+                       height > 0 {
                         return CGSize(
-                            width: possibleWidth,
-                            height: possibleHeight
+                            width: width,
+                            height: height
                         )
                     }
                 }
             }
         }
 
-        return CGSize(width: 640, height: 640)
+        return fallback
     }
 
     private static func printModelDescriptionDebug(
         _ mlModel: MLModel,
-        resolvedModelInputSize: CGSize
+        resolvedModelInputSize: CGSize,
+        preferredModelInputSize: CGSize
     ) {
         print("========== [MODEL DESCRIPTION DEBUG] ==========")
-
         print(
             "[MODEL RESOLVED INPUT SIZE]",
-            "width:",
-            resolvedModelInputSize.width,
-            "height:",
-            resolvedModelInputSize.height
+            resolvedModelInputSize
         )
 
-        print("---------- [MODEL INPUTS] ----------")
-
-        for input in mlModel.modelDescription.inputDescriptionsByName {
-            print("[MODEL INPUT]", input.key)
-            print("[MODEL INPUT TYPE]", input.value.type.rawValue)
-
-            if let imageConstraint = input.value.imageConstraint {
-                print(
-                    "[MODEL INPUT IMAGE]",
-                    "width:",
-                    imageConstraint.pixelsWide,
-                    "height:",
-                    imageConstraint.pixelsHigh
-                )
-            }
-
-            if let multiArrayConstraint = input.value.multiArrayConstraint {
-                print(
-                    "[MODEL INPUT MULTIARRAY]",
-                    "shape:",
-                    multiArrayConstraint.shape,
-                    "dataType:",
-                    multiArrayConstraint.dataType.rawValue
-                )
-            }
+        if resolvedModelInputSize != preferredModelInputSize {
+            print(
+                "[MODEL WARNING] Current Core ML model is not 640x640:",
+                resolvedModelInputSize,
+                "The model must be re-exported as 640x640 to perform true 640x640 inference."
+            )
+        } else {
+            print("[MODEL INPUT] 640x640 enabled")
         }
 
-        print("---------- [MODEL OUTPUTS] ----------")
+        for input in mlModel.modelDescription.inputDescriptionsByName {
+            print(
+                "[MODEL INPUT]",
+                input.key,
+                "type:",
+                input.value.type.rawValue
+            )
+        }
 
         for output in mlModel.modelDescription.outputDescriptionsByName {
-            print("[MODEL OUTPUT]", output.key)
-            print("[MODEL OUTPUT TYPE]", output.value.type.rawValue)
-
-            if let imageConstraint = output.value.imageConstraint {
-                print(
-                    "[MODEL OUTPUT IMAGE]",
-                    "width:",
-                    imageConstraint.pixelsWide,
-                    "height:",
-                    imageConstraint.pixelsHigh
-                )
-            }
-
-            if let multiArrayConstraint = output.value.multiArrayConstraint {
-                print(
-                    "[MODEL OUTPUT MULTIARRAY]",
-                    "shape:",
-                    multiArrayConstraint.shape,
-                    "dataType:",
-                    multiArrayConstraint.dataType.rawValue
-                )
-            }
+            print(
+                "[MODEL OUTPUT]",
+                output.key,
+                "type:",
+                output.value.type.rawValue
+            )
         }
 
         print("===============================================")
@@ -245,10 +258,21 @@ final class InferenceEngine: @unchecked Sendable {
     // MARK: - Public API
 
     func start() {
+        inferenceQueue.async { [weak self] in
+            self?.isEnabled = true
+        }
+
         if isMockMode {
-            print("[INFO] InferenceEngine mock mode enabled. No Timer is used.")
+            print(
+                "[INFO] InferenceEngine mock mode enabled. No Timer is used."
+            )
         } else {
-            print("[INFO] InferenceEngine started:", modelName)
+            print(
+                "[INFO] InferenceEngine started:",
+                modelName,
+                "input:",
+                modelInputSize
+            )
         }
     }
 
@@ -258,6 +282,9 @@ final class InferenceEngine: @unchecked Sendable {
                 return
             }
 
+            self.isEnabled = false
+            self.pendingFrame = nil
+            self.activeColorPixelBuffer = nil
             self.isProcessing = false
         }
 
@@ -273,137 +300,58 @@ final class InferenceEngine: @unchecked Sendable {
             return
         }
 
-        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
-            print("[WARN] Cannot get pixelBuffer from sampleBuffer.")
-            return
-        }
-
-        guard let request else {
-            return
-        }
-
-        let frameWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let frameHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let frameOrientation = orientation
-
-        if !didPrintFrameDebug {
-            didPrintFrameDebug = true
-
+        guard let pixelBuffer =
+            CMSampleBufferGetImageBuffer(sampleBuffer) else {
             print(
-                "[FRAME DEBUG]",
-                "pixelBufferWidth:",
-                frameWidth,
-                "pixelBufferHeight:",
-                frameHeight,
-                "orientationRawValue:",
-                frameOrientation.rawValue,
-                "modelInputSize:",
-                modelInputSize
+                "[WARN] Cannot get pixelBuffer from sampleBuffer."
             )
+            return
         }
 
-        let boxedPixelBuffer = InferenceUncheckedSendableBox(
-            value: pixelBuffer
+        let frame = PendingInferenceFrame(
+            pixelBuffer: pixelBuffer,
+            orientation: orientation,
+            sourceSize: CGSize(
+                width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer)
+            )
         )
 
-        let boxedRequest = InferenceUncheckedSendableBox(
-            value: request
-        )
-
-        inferenceQueue.async { [weak self, boxedPixelBuffer, boxedRequest, frameOrientation] in
-            guard let self else {
+        inferenceQueue.async { [weak self, frame] in
+            guard let self,
+                  self.isEnabled else {
                 return
             }
 
             if self.isProcessing {
+                self.pendingFrame = frame
+                self.replacedPendingFrameCount += 1
+
+                if self.replacedPendingFrameCount.isMultiple(of: 30) {
+                    print(
+                        "[Inference] pending frame replaced:",
+                        self.replacedPendingFrameCount
+                    )
+                }
                 return
             }
 
             self.isProcessing = true
-
-            self.activeFrameSize = CGSize(
-                width: frameWidth,
-                height: frameHeight
-            )
-
-            self.activeColorPixelBuffer = boxedPixelBuffer.value
-            self.activeColorOrientation = frameOrientation
-
-            let handler = VNImageRequestHandler(
-                cvPixelBuffer: boxedPixelBuffer.value,
-                orientation: frameOrientation,
-                options: [:]
-            )
-
-            do {
-                try handler.perform([boxedRequest.value])
-            } catch {
-                print(
-                    "[ERROR] VNImageRequestHandler perform failed:",
-                    error.localizedDescription
-                )
-
-                self.activeColorPixelBuffer = nil
-                self.isProcessing = false
-
-                DispatchQueue.main.async { [weak self] in
-                    self?.onResult?([])
-                }
-            }
+            self.performInference(frame)
         }
     }
 
     /// 離線影片處理使用的同步推論介面。
-    ///
-    /// 即時相機仍維持原本的 processFrame 非同步流程；只有離線影片逐幀處理
-    /// 使用此方法，避免改動現有 MainViewModel 與顯示狀態機。
     func inferSynchronously(
         pixelBuffer: CVPixelBuffer,
         orientation: CGImagePropertyOrientation = .up,
         timestamp: TimeInterval = 0
     ) throws -> [DetectionResult] {
         if isMockMode {
-            let t = Float(timestamp)
-            let pi2 = Float.pi * 2.0
-
-            let a1 = t * (pi2 / 3.0)
-            let cx1 = 0.5 + 0.28 * cos(a1)
-            let cy1 = 0.5 + 0.28 * sin(a1)
-            let h1: Float = 0.07
-
-            let a2 = -(t * (pi2 / 4.5)) + Float.pi
-            let cx2 = 0.5 + 0.22 * cos(a2)
-            let cy2 = 0.5 + 0.22 * sin(a2)
-            let h2: Float = 0.055
-
-            return [
-                DetectionResult(
-                    boundingBox: CGRect(
-                        x: Double(cx1 - h1),
-                        y: Double(cy1 - h1),
-                        width: Double(h1 * 2.0),
-                        height: Double(h1 * 2.0)
-                    ),
-                    confidence: 0.95,
-                    fps: 0,
-                    hardware: BeyTailInferenceHardware.mock,
-                    trackId: 0,
-                    dominantColor: UIColor(hex: 0x00DDFF)
-                ),
-                DetectionResult(
-                    boundingBox: CGRect(
-                        x: Double(cx2 - h2),
-                        y: Double(cy2 - h2),
-                        width: Double(h2 * 2.0),
-                        height: Double(h2 * 2.0)
-                    ),
-                    confidence: 0.91,
-                    fps: 0,
-                    hardware: BeyTailInferenceHardware.mock,
-                    trackId: 0,
-                    dominantColor: UIColor(hex: 0xFF00CC)
-                )
-            ]
+            return makeMockDetections(
+                timestamp: timestamp,
+                fps: 0
+            )
         }
 
         guard let model else {
@@ -414,8 +362,6 @@ final class InferenceEngine: @unchecked Sendable {
             width: CVPixelBufferGetWidth(pixelBuffer),
             height: CVPixelBufferGetHeight(pixelBuffer)
         )
-
-        activeFrameSize = frameSize
 
         let synchronousRequest = VNCoreMLRequest(model: model)
         synchronousRequest.imageCropAndScaleOption = .scaleFill
@@ -428,33 +374,12 @@ final class InferenceEngine: @unchecked Sendable {
 
         try handler.perform([synchronousRequest])
 
-        if let objects = synchronousRequest.results as? [VNRecognizedObjectObservation] {
-            let detections = objects
-                .prefix(100)
-                .compactMap { observation -> DetectionResult? in
-                    let confidence = observation.labels.first?.confidence
-                        ?? observation.confidence
-
-                    guard confidence >= confidenceThreshold else {
-                        return nil
-                    }
-
-                    let rect = CGRect(
-                        x: observation.boundingBox.minX,
-                        y: 1.0 - observation.boundingBox.maxY,
-                        width: observation.boundingBox.width,
-                        height: observation.boundingBox.height
-                    )
-
-                    return DetectionResult(
-                        boundingBox: clampNormalizedRect(rect),
-                        confidence: confidence,
-                        fps: 0,
-                        hardware: BeyTailInferenceHardware.npu,
-                        trackId: 0,
-                        dominantColor: UIColor(hex: 0x00DDFF)
-                    )
-                }
+        if let objects = synchronousRequest.results as?
+            [VNRecognizedObjectObservation] {
+            let detections = decodeObjectObservations(
+                objects,
+                fps: 0
+            )
 
             let filtered = nonMaximumSuppression(
                 detections,
@@ -468,11 +393,13 @@ final class InferenceEngine: @unchecked Sendable {
             )
         }
 
-        if let features = synchronousRequest.results as? [VNCoreMLFeatureValueObservation],
+        if let features = synchronousRequest.results as?
+            [VNCoreMLFeatureValueObservation],
            let array = features.first?.featureValue.multiArrayValue {
             let decoded = decodeYOLOv10Output(
                 array,
-                sourceFrameSize: frameSize
+                sourceFrameSize: frameSize,
+                fps: 0
             )
 
             let filtered = nonMaximumSuppression(
@@ -490,6 +417,75 @@ final class InferenceEngine: @unchecked Sendable {
         return []
     }
 
+    // MARK: - Live Inference Buffer
+
+    private func performInference(
+        _ frame: PendingInferenceFrame
+    ) {
+        guard isEnabled,
+              let request else {
+            finishCurrentInference()
+            return
+        }
+
+        activeFrameSize = frame.sourceSize
+        activeColorPixelBuffer = frame.pixelBuffer
+        activeColorOrientation = frame.orientation
+
+        if !didPrintFrameDebug {
+            didPrintFrameDebug = true
+
+            print(
+                "[FRAME DEBUG]",
+                "pixelBufferSize:",
+                frame.sourceSize,
+                "orientation:",
+                frame.orientation.rawValue,
+                "modelInputSize:",
+                modelInputSize
+            )
+        }
+
+        let handler = VNImageRequestHandler(
+            cvPixelBuffer: frame.pixelBuffer,
+            orientation: frame.orientation,
+            options: [:]
+        )
+
+        do {
+            try autoreleasepool {
+                try handler.perform([request])
+            }
+        } catch {
+            print(
+                "[ERROR] VNImageRequestHandler perform failed:",
+                error.localizedDescription
+            )
+
+            publish([])
+            finishCurrentInference()
+        }
+    }
+
+    private func finishCurrentInference() {
+        activeColorPixelBuffer = nil
+
+        guard isEnabled else {
+            pendingFrame = nil
+            isProcessing = false
+            return
+        }
+
+        if let nextFrame = pendingFrame {
+            pendingFrame = nil
+            inferenceQueue.async { [weak self, nextFrame] in
+                self?.performInference(nextFrame)
+            }
+        } else {
+            isProcessing = false
+        }
+    }
+
     // MARK: - Vision Result
 
     private func handleVisionResult(
@@ -497,98 +493,93 @@ final class InferenceEngine: @unchecked Sendable {
         error: Error?
     ) {
         defer {
-            inferenceQueue.async { [weak self] in
-                self?.activeColorPixelBuffer = nil
-                self?.isProcessing = false
-            }
+            finishCurrentInference()
+        }
+
+        guard isEnabled else {
+            return
         }
 
         if let error {
-            print("[ERROR] Vision request failed:", error.localizedDescription)
-
-            DispatchQueue.main.async { [weak self] in
-                self?.onResult?([])
-            }
-
+            print(
+                "[ERROR] Vision request failed:",
+                error.localizedDescription
+            )
+            publish([])
             return
         }
 
         updateFps()
 
         guard let results = request.results else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onResult?([])
-            }
-
+            publish([])
             return
         }
 
-        if let objects = results as? [VNRecognizedObjectObservation] {
-            handleObjectObservations(objects)
+        if let objects = results as?
+            [VNRecognizedObjectObservation] {
+            let detections = decodeObjectObservations(
+                objects,
+                fps: currentFps
+            )
+
+            let filtered = nonMaximumSuppression(
+                detections,
+                iouThreshold: nmsIoUThreshold
+            )
+
+            publish(
+                applyingDominantColors(
+                    to: filtered
+                )
+            )
             return
         }
 
-        if let features = results as? [VNCoreMLFeatureValueObservation] {
+        if let features = results as?
+            [VNCoreMLFeatureValueObservation] {
             handleRawFeatureObservations(features)
             return
         }
 
-        print("[WARN] Unsupported Vision result type:", type(of: results.first))
-
-        DispatchQueue.main.async { [weak self] in
-            self?.onResult?([])
-        }
+        print(
+            "[WARN] Unsupported Vision result type:",
+            String(describing: results.first)
+        )
+        publish([])
     }
 
-    // MARK: - VNRecognizedObjectObservation Output
-
-    private func handleObjectObservations(
-        _ objects: [VNRecognizedObjectObservation]
-    ) {
-        let detections = objects
+    private func decodeObjectObservations(
+        _ objects: [VNRecognizedObjectObservation],
+        fps: Float
+    ) -> [DetectionResult] {
+        objects
             .prefix(100)
-            .compactMap { obs -> DetectionResult? in
-                let confidence: Float
-
-                if let bestLabel = obs.labels.first {
-                    confidence = bestLabel.confidence
-                } else {
-                    confidence = obs.confidence
-                }
+            .compactMap { observation -> DetectionResult? in
+                let confidence =
+                    observation.labels.first?.confidence ??
+                    observation.confidence
 
                 guard confidence >= confidenceThreshold else {
                     return nil
                 }
 
                 let rect = CGRect(
-                    x: obs.boundingBox.minX,
-                    y: 1.0 - obs.boundingBox.maxY,
-                    width: obs.boundingBox.width,
-                    height: obs.boundingBox.height
+                    x: observation.boundingBox.minX,
+                    y: 1.0 - observation.boundingBox.maxY,
+                    width: observation.boundingBox.width,
+                    height: observation.boundingBox.height
                 )
 
                 return DetectionResult(
                     boundingBox: clampNormalizedRect(rect),
                     confidence: confidence,
-                    fps: currentFps,
+                    fps: fps,
                     hardware: BeyTailInferenceHardware.npu,
                     trackId: 0,
                     dominantColor: UIColor(hex: 0x00DDFF)
                 )
             }
-
-        let filtered = nonMaximumSuppression(
-            detections,
-            iouThreshold: nmsIoUThreshold
-        )
-
-        let colored = applyingDominantColors(
-            to: filtered
-        )
-
-        DispatchQueue.main.async { [weak self, colored] in
-            self?.onResult?(colored)
-        }
     }
 
     // MARK: - YOLOv10 Raw Tensor Output
@@ -599,8 +590,9 @@ final class InferenceEngine: @unchecked Sendable {
         if !didPrintRawOutputInfo {
             didPrintRawOutputInfo = true
 
-            print("[WARN] CoreML returned raw feature outputs. Decode as YOLOv10 tensor.")
-            print("[WARN] raw output count:", features.count)
+            print(
+                "[WARN] CoreML returned raw feature outputs. Decode as YOLOv10 tensor."
+            )
 
             for feature in features {
                 print(
@@ -621,17 +613,16 @@ final class InferenceEngine: @unchecked Sendable {
             }
         }
 
-        guard let array = features.first?.featureValue.multiArrayValue else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onResult?([])
-            }
-
+        guard let array =
+            features.first?.featureValue.multiArrayValue else {
+            publish([])
             return
         }
 
         let decoded = decodeYOLOv10Output(
             array,
-            sourceFrameSize: activeFrameSize
+            sourceFrameSize: activeFrameSize,
+            fps: currentFps
         )
 
         let filtered = nonMaximumSuppression(
@@ -639,13 +630,11 @@ final class InferenceEngine: @unchecked Sendable {
             iouThreshold: nmsIoUThreshold
         )
 
-        let colored = applyingDominantColors(
-            to: filtered
+        publish(
+            applyingDominantColors(
+                to: filtered
+            )
         )
-
-        DispatchQueue.main.async { [weak self, colored] in
-            self?.onResult?(colored)
-        }
     }
 
     private enum YOLOOutputLayout {
@@ -655,19 +644,19 @@ final class InferenceEngine: @unchecked Sendable {
 
     private func decodeYOLOv10Output(
         _ array: MLMultiArray,
-        sourceFrameSize: CGSize
+        sourceFrameSize: CGSize,
+        fps: Float
     ) -> [DetectionResult] {
         let shape = array.shape.map {
             $0.intValue
         }
 
-        guard shape.count == 3 else {
-            print("[ERROR] Unsupported YOLOv10 output rank:", shape)
-            return []
-        }
-
-        guard shape[0] == 1 else {
-            print("[ERROR] Unsupported YOLOv10 batch size:", shape)
+        guard shape.count == 3,
+              shape[0] == 1 else {
+            print(
+                "[ERROR] Unsupported YOLOv10 output shape:",
+                shape
+            )
             return []
         }
 
@@ -684,12 +673,14 @@ final class InferenceEngine: @unchecked Sendable {
             valueCount = shape[1]
             layout = .channelsFirst
         } else {
-            print("[ERROR] Unsupported YOLOv10 output shape:", shape)
+            print(
+                "[ERROR] Unsupported YOLOv10 output shape:",
+                shape
+            )
             return []
         }
 
         guard valueCount >= 6 else {
-            print("[ERROR] YOLOv10 output value count < 6:", shape)
             return []
         }
 
@@ -703,35 +694,30 @@ final class InferenceEngine: @unchecked Sendable {
                 row: row,
                 col: 0
             )
-
             let y1Raw = yoloValue(
                 array,
                 layout: layout,
                 row: row,
                 col: 1
             )
-
             let x2Raw = yoloValue(
                 array,
                 layout: layout,
                 row: row,
                 col: 2
             )
-
             let y2Raw = yoloValue(
                 array,
                 layout: layout,
                 row: row,
                 col: 3
             )
-
             let confidence = yoloValue(
                 array,
                 layout: layout,
                 row: row,
                 col: 4
             )
-
             let classIdFloat = yoloValue(
                 array,
                 layout: layout,
@@ -739,7 +725,8 @@ final class InferenceEngine: @unchecked Sendable {
                 col: 5
             )
 
-            if !didPrintFirstRows, row < 5 {
+            if !didPrintFirstRows,
+               row < 5 {
                 print(
                     "[DEBUG] row:",
                     row,
@@ -757,62 +744,50 @@ final class InferenceEngine: @unchecked Sendable {
                   x2Raw.isFinite,
                   y2Raw.isFinite,
                   confidence.isFinite,
-                  classIdFloat.isFinite else {
-                continue
-            }
-
-            guard confidence >= confidenceThreshold else {
+                  classIdFloat.isFinite,
+                  confidence >= confidenceThreshold else {
                 continue
             }
 
             let classId = Int(classIdFloat.rounded())
 
-            guard classId == singleClassId else {
+            guard classId == singleClassId,
+                  let rect = makeYOLOv10XYXYBoundingBox(
+                    x1: x1Raw,
+                    y1: y1Raw,
+                    x2: x2Raw,
+                    y2: y2Raw,
+                    sourceFrameSize: sourceFrameSize
+                  ) else {
                 continue
             }
 
-            guard let rect = makeYOLOv10XYXYBoundingBox(
-                x1: x1Raw,
-                y1: y1Raw,
-                x2: x2Raw,
-                y2: y2Raw,
-                sourceFrameSize: sourceFrameSize
-            ) else {
-                continue
-            }
-
-            if !didPrintKeptRows, keptPrintCount < 5 {
+            if !didPrintKeptRows,
+               keptPrintCount < 5 {
                 keptPrintCount += 1
 
                 print(
                     "[KEEP]",
-                    "x1:", x1Raw,
-                    "y1:", y1Raw,
-                    "x2:", x2Raw,
-                    "y2:", y2Raw,
                     "conf:", confidence,
-                    "class:", classIdFloat,
                     "mappedRect:", rect
                 )
             }
 
-            let detection = DetectionResult(
-                boundingBox: rect,
-                confidence: confidence,
-                fps: currentFps,
-                hardware: BeyTailInferenceHardware.npu,
-                trackId: 0,
-                dominantColor: UIColor(hex: 0x00DDFF)
+            detections.append(
+                DetectionResult(
+                    boundingBox: rect,
+                    confidence: confidence,
+                    fps: fps,
+                    hardware: BeyTailInferenceHardware.npu,
+                    trackId: 0,
+                    dominantColor: UIColor(hex: 0x00DDFF)
+                )
             )
-
-            detections.append(detection)
         }
 
-        if !didPrintFirstRows {
-            didPrintFirstRows = true
-        }
+        didPrintFirstRows = true
 
-        if !didPrintKeptRows, keptPrintCount > 0 {
+        if keptPrintCount > 0 {
             didPrintKeptRows = true
         }
 
@@ -873,11 +848,6 @@ final class InferenceEngine: @unchecked Sendable {
 
             print(
                 "[COORD DEBUG]",
-                "raw:",
-                "x1:", rawX1,
-                "y1:", rawY1,
-                "x2:", rawX2,
-                "y2:", rawY2,
                 "maxCoordinate:", maxCoordinate,
                 "coordinateSpace:", coordinateSpace,
                 "modelInputSize:", modelInputSize,
@@ -894,24 +864,19 @@ final class InferenceEngine: @unchecked Sendable {
             sourceFrameSize: sourceFrameSize
         )
 
-        let nx1 = normalized.0
-        let ny1 = normalized.1
-        let nx2 = normalized.2
-        let ny2 = normalized.3
-
-        guard nx2 > nx1,
-              ny2 > ny1 else {
+        guard normalized.2 > normalized.0,
+              normalized.3 > normalized.1 else {
             return nil
         }
 
-        let rect = CGRect(
-            x: nx1,
-            y: ny1,
-            width: nx2 - nx1,
-            height: ny2 - ny1
+        let clamped = clampNormalizedRect(
+            CGRect(
+                x: normalized.0,
+                y: normalized.1,
+                width: normalized.2 - normalized.0,
+                height: normalized.3 - normalized.1
+            )
         )
-
-        let clamped = clampNormalizedRect(rect)
 
         guard clamped.width > 0.001,
               clamped.height > 0.001 else {
@@ -921,10 +886,21 @@ final class InferenceEngine: @unchecked Sendable {
         return clamped
     }
 
-    private enum YOLOCoordinateSpace {
+    private enum YOLOCoordinateSpace: CustomStringConvertible {
         case normalized
         case modelInputPixel
         case sourceFramePixel
+
+        var description: String {
+            switch self {
+            case .normalized:
+                return "normalized"
+            case .modelInputPixel:
+                return "modelInputPixel"
+            case .sourceFramePixel:
+                return "sourceFramePixel"
+            }
+        }
     }
 
     private func inferCoordinateSpace(
@@ -966,66 +942,20 @@ final class InferenceEngine: @unchecked Sendable {
 
         case .modelInputPixel:
             return (
-                x1 / modelInputSize.width,
-                y1 / modelInputSize.height,
-                x2 / modelInputSize.width,
-                y2 / modelInputSize.height
+                x1 / max(modelInputSize.width, 1.0),
+                y1 / max(modelInputSize.height, 1.0),
+                x2 / max(modelInputSize.width, 1.0),
+                y2 / max(modelInputSize.height, 1.0)
             )
 
         case .sourceFramePixel:
-            let safeWidth = max(sourceFrameSize.width, 1.0)
-            let safeHeight = max(sourceFrameSize.height, 1.0)
-
             return (
-                x1 / safeWidth,
-                y1 / safeHeight,
-                x2 / safeWidth,
-                y2 / safeHeight
+                x1 / max(sourceFrameSize.width, 1.0),
+                y1 / max(sourceFrameSize.height, 1.0),
+                x2 / max(sourceFrameSize.width, 1.0),
+                y2 / max(sourceFrameSize.height, 1.0)
             )
         }
-    }
-
-    private func clampNormalizedRect(
-        _ rect: CGRect
-    ) -> CGRect {
-        let minX = clamp(
-            rect.minX,
-            lower: 0.0,
-            upper: 1.0
-        )
-
-        let minY = clamp(
-            rect.minY,
-            lower: 0.0,
-            upper: 1.0
-        )
-
-        let maxX = clamp(
-            rect.maxX,
-            lower: 0.0,
-            upper: 1.0
-        )
-
-        let maxY = clamp(
-            rect.maxY,
-            lower: 0.0,
-            upper: 1.0
-        )
-
-        return CGRect(
-            x: minX,
-            y: minY,
-            width: max(0.0, maxX - minX),
-            height: max(0.0, maxY - minY)
-        )
-    }
-
-    private func clamp(
-        _ value: CGFloat,
-        lower: CGFloat,
-        upper: CGFloat
-    ) -> CGFloat {
-        min(max(value, lower), upper)
     }
 
     // MARK: - Dominant Color
@@ -1080,33 +1010,30 @@ final class InferenceEngine: @unchecked Sendable {
         var selected: [DetectionResult] = []
 
         for detection in sorted {
-            var shouldKeep = true
-
-            for kept in selected {
-                let overlap = iou(
+            let shouldKeep = selected.allSatisfy { kept in
+                iou(
                     detection.boundingBox,
                     kept.boundingBox
-                )
-
-                if overlap > iouThreshold {
-                    shouldKeep = false
-                    break
-                }
+                ) <= iouThreshold
             }
 
             if shouldKeep {
                 selected.append(detection)
             }
+
+            if selected.count >= maxOutputDetections {
+                break
+            }
         }
 
-        return Array(selected.prefix(maxOutputDetections))
+        return selected
     }
 
     private func iou(
-        _ a: CGRect,
-        _ b: CGRect
+        _ first: CGRect,
+        _ second: CGRect
     ) -> CGFloat {
-        let intersection = a.intersection(b)
+        let intersection = first.intersection(second)
 
         if intersection.isNull ||
            intersection.width <= 0 ||
@@ -1114,8 +1041,13 @@ final class InferenceEngine: @unchecked Sendable {
             return 0
         }
 
-        let intersectionArea = intersection.width * intersection.height
-        let unionArea = a.width * a.height + b.width * b.height - intersectionArea
+        let intersectionArea =
+            intersection.width * intersection.height
+
+        let unionArea =
+            first.width * first.height +
+            second.width * second.height -
+            intersectionArea
 
         guard unionArea > 0 else {
             return 0
@@ -1124,7 +1056,57 @@ final class InferenceEngine: @unchecked Sendable {
         return intersectionArea / unionArea
     }
 
-    // MARK: - FPS
+    // MARK: - Normalization
+
+    private func clampNormalizedRect(
+        _ rect: CGRect
+    ) -> CGRect {
+        let minX = clamp(
+            rect.minX,
+            lower: 0.0,
+            upper: 1.0
+        )
+        let minY = clamp(
+            rect.minY,
+            lower: 0.0,
+            upper: 1.0
+        )
+        let maxX = clamp(
+            rect.maxX,
+            lower: 0.0,
+            upper: 1.0
+        )
+        let maxY = clamp(
+            rect.maxY,
+            lower: 0.0,
+            upper: 1.0
+        )
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0, maxX - minX),
+            height: max(0.0, maxY - minY)
+        )
+    }
+
+    private func clamp(
+        _ value: CGFloat,
+        lower: CGFloat,
+        upper: CGFloat
+    ) -> CGFloat {
+        min(max(value, lower), upper)
+    }
+
+    // MARK: - Result / FPS
+
+    private func publish(
+        _ detections: [DetectionResult]
+    ) {
+        DispatchQueue.main.async { [weak self, detections] in
+            self?.onResult?(detections)
+        }
+    }
 
     private func updateFps() {
         frameCount += 1
@@ -1144,30 +1126,43 @@ final class InferenceEngine: @unchecked Sendable {
     private var mockStartTime: TimeInterval = CACurrentMediaTime()
 
     private func mockTick() {
-        let t = Float(CACurrentMediaTime() - mockStartTime)
-        let pi2 = Float.pi * 2.0
-
-        let a1 = t * (pi2 / 3.0)
-        let cx1 = 0.5 + 0.28 * cos(a1)
-        let cy1 = 0.5 + 0.28 * sin(a1)
-        let h1: Float = 0.07
-
-        let a2 = -(t * (pi2 / 4.5)) + Float.pi
-        let cx2 = 0.5 + 0.22 * cos(a2)
-        let cy2 = 0.5 + 0.22 * sin(a2)
-        let h2: Float = 0.055
+        let timestamp = CACurrentMediaTime() - mockStartTime
 
         updateFps()
 
-        let fps = currentFps
+        publish(
+            makeMockDetections(
+                timestamp: timestamp,
+                fps: currentFps
+            )
+        )
+    }
 
-        let detections = [
+    private func makeMockDetections(
+        timestamp: TimeInterval,
+        fps: Float
+    ) -> [DetectionResult] {
+        let t = Float(timestamp)
+        let pi2 = Float.pi * 2.0
+
+        let firstAngle = t * (pi2 / 3.0)
+        let firstCenterX = 0.5 + 0.28 * cos(firstAngle)
+        let firstCenterY = 0.5 + 0.28 * sin(firstAngle)
+        let firstHalfSize: Float = 0.07
+
+        let secondAngle =
+            -(t * (pi2 / 4.5)) + Float.pi
+        let secondCenterX = 0.5 + 0.22 * cos(secondAngle)
+        let secondCenterY = 0.5 + 0.22 * sin(secondAngle)
+        let secondHalfSize: Float = 0.055
+
+        return [
             DetectionResult(
                 boundingBox: CGRect(
-                    x: Double(cx1 - h1),
-                    y: Double(cy1 - h1),
-                    width: Double(h1 * 2.0),
-                    height: Double(h1 * 2.0)
+                    x: Double(firstCenterX - firstHalfSize),
+                    y: Double(firstCenterY - firstHalfSize),
+                    width: Double(firstHalfSize * 2.0),
+                    height: Double(firstHalfSize * 2.0)
                 ),
                 confidence: 0.95,
                 fps: fps,
@@ -1177,10 +1172,10 @@ final class InferenceEngine: @unchecked Sendable {
             ),
             DetectionResult(
                 boundingBox: CGRect(
-                    x: Double(cx2 - h2),
-                    y: Double(cy2 - h2),
-                    width: Double(h2 * 2.0),
-                    height: Double(h2 * 2.0)
+                    x: Double(secondCenterX - secondHalfSize),
+                    y: Double(secondCenterY - secondHalfSize),
+                    width: Double(secondHalfSize * 2.0),
+                    height: Double(secondHalfSize * 2.0)
                 ),
                 confidence: 0.91,
                 fps: fps,
@@ -1189,9 +1184,5 @@ final class InferenceEngine: @unchecked Sendable {
                 dominantColor: UIColor(hex: 0xFF00CC)
             )
         ]
-
-        DispatchQueue.main.async { [weak self, detections] in
-            self?.onResult?(detections)
-        }
     }
 }

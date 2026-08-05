@@ -16,8 +16,14 @@ private final class RecordingWriterWorker: @unchecked Sendable {
         qos: .userInitiated
     )
 
-    /// 最多保留兩個待合成影格，避免 Metal 合成速度落後時記憶體持續增長。
-    private let frameSlots = DispatchSemaphore(value: 2)
+    /// 最多保留五個待合成影格，避免 Metal 合成短暫落後時立即丟幀。
+    private let frameSlots = DispatchSemaphore(value: 5)
+
+    /// AVAssetWriter 暫時忙碌時，最多等待 0.12 秒。
+    private let writerReadyTimeout: TimeInterval = 0.12
+
+    /// 每次檢查寫入狀態的間隔。
+    private let writerReadyPollInterval: TimeInterval = 0.002
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -56,7 +62,18 @@ private final class RecordingWriterWorker: @unchecked Sendable {
     func append(_ payload: RecordingFramePayload) {
         guard frameSlots.wait(timeout: .now()) == .success else {
             queue.async { [weak self] in
-                self?.droppedFrameCount += 1
+                guard let self else {
+                    return
+                }
+
+                self.droppedFrameCount += 1
+
+                if self.droppedFrameCount.isMultiple(of: 10) {
+                    print(
+                        "[Recording] frame queue full, dropped:",
+                        self.droppedFrameCount
+                    )
+                }
             }
             return
         }
@@ -227,8 +244,16 @@ private final class RecordingWriterWorker: @unchecked Sendable {
             firstPresentationTime = presentationTime
         }
 
-        guard videoInput.isReadyForMoreMediaData else {
+        guard waitUntilVideoInputReady(videoInput) else {
             droppedFrameCount += 1
+
+            if droppedFrameCount.isMultiple(of: 10) {
+                print(
+                    "[Recording] writer timeout, dropped:",
+                    droppedFrameCount
+                )
+            }
+
             return
         }
 
@@ -293,6 +318,32 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                 droppedFrameCount
             )
         }
+    }
+
+    private func waitUntilVideoInputReady(
+        _ videoInput: AVAssetWriterInput
+    ) -> Bool {
+        if videoInput.isReadyForMoreMediaData {
+            return true
+        }
+
+        let deadline =
+            ProcessInfo.processInfo.systemUptime
+            + writerReadyTimeout
+
+        while !videoInput.isReadyForMoreMediaData {
+            guard acceptingFrames,
+                  writer?.status == .writing,
+                  ProcessInfo.processInfo.systemUptime < deadline else {
+                return false
+            }
+
+            Thread.sleep(
+                forTimeInterval: writerReadyPollInterval
+            )
+        }
+
+        return true
     }
 
     private func configureWriter(
