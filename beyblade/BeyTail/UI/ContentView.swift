@@ -733,7 +733,7 @@ struct ContentView: View {
                 .preferredColorScheme(.dark)
                 .statusBarHidden(true)
             }
-            .sheet(
+            .fullScreenCover(
                 isPresented: Binding(
                     get: {
                         vm.isRecordingResultPresented
@@ -750,9 +750,11 @@ struct ContentView: View {
                         vm: vm,
                         videoURL: videoURL
                     )
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.visible)
-                    .interactiveDismissDisabled(vm.recordingSaveState == .saving)
+                    .interactiveDismissDisabled(
+                        vm.recordingSaveState == .saving
+                    )
+                    .preferredColorScheme(.dark)
+                    .statusBarHidden(true)
                 }
             }
             .onAppear {

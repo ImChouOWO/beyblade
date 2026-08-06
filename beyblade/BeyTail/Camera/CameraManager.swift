@@ -471,7 +471,7 @@ final class CameraManager: NSObject {
         videoOutput.alwaysDiscardsLateVideoFrames = true
 
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelBufferPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
 
         videoOutput.setSampleBufferDelegate(

@@ -9,6 +9,10 @@ private struct RecordingFramePayload: @unchecked Sendable {
     let now: TimeInterval
 }
 
+private struct RecordingAudioPayload: @unchecked Sendable {
+    let sampleBuffer: CMSampleBuffer
+}
+
 private final class RecordingWriterWorker: @unchecked Sendable {
 
     private let queue = DispatchQueue(
@@ -27,6 +31,7 @@ private final class RecordingWriterWorker: @unchecked Sendable {
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var compositor: PicTrailPixelBufferCompositor?
 
@@ -37,8 +42,11 @@ private final class RecordingWriterWorker: @unchecked Sendable {
     private var acceptingFrames = false
     private var firstPresentationTime: CMTime?
     private var lastPresentationTime: CMTime?
+    private var lastAudioPresentationTime: CMTime?
     private var appendedFrameCount = 0
     private var droppedFrameCount = 0
+    private var appendedAudioBufferCount = 0
+    private var droppedAudioBufferCount = 0
 
     private var fatalErrorHandler: (@Sendable (String) -> Void)?
 
@@ -96,6 +104,22 @@ private final class RecordingWriterWorker: @unchecked Sendable {
         }
     }
 
+
+    func appendAudio(_ payload: RecordingAudioPayload) {
+        queue.async { [weak self, payload] in
+            guard let self,
+                  self.acceptingFrames else {
+                return
+            }
+
+            do {
+                try self.appendAudioOnQueue(payload)
+            } catch {
+                self.failOnQueue(error.localizedDescription)
+            }
+        }
+    }
+
     func finish(
         completion: @escaping @Sendable (URL?) -> Void
     ) {
@@ -140,10 +164,13 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                 "[Recording] finishing composited video:",
                 "frames=\(self.appendedFrameCount)",
                 "dropped=\(self.droppedFrameCount)",
+                "audioBuffers=\(self.appendedAudioBufferCount)",
+                "audioDropped=\(self.droppedAudioBufferCount)",
                 "duration=\(String(format: "%.2f", duration))"
             )
 
             videoInput.markAsFinished()
+            self.audioInput?.markAsFinished()
 
             writer.finishWriting { [weak self, outputURL] in
                 guard let self else {
@@ -320,6 +347,55 @@ private final class RecordingWriterWorker: @unchecked Sendable {
         }
     }
 
+
+    private func appendAudioOnQueue(
+        _ payload: RecordingAudioPayload
+    ) throws {
+        let sampleBuffer = payload.sampleBuffer
+
+        guard CMSampleBufferDataIsReady(sampleBuffer),
+              didStartSession,
+              let writer,
+              let audioInput,
+              writer.status == .writing,
+              let firstPresentationTime else {
+            return
+        }
+
+        let presentationTime =
+            CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        guard presentationTime.isValid,
+              !presentationTime.isIndefinite,
+              CMTimeCompare(
+                presentationTime,
+                firstPresentationTime
+              ) >= 0 else {
+            return
+        }
+
+        if let lastAudioPresentationTime,
+           CMTimeCompare(
+            presentationTime,
+            lastAudioPresentationTime
+           ) <= 0 {
+            return
+        }
+
+        guard audioInput.isReadyForMoreMediaData else {
+            droppedAudioBufferCount += 1
+            return
+        }
+
+        guard audioInput.append(sampleBuffer) else {
+            throw writer.error ??
+                makeError("寫入錄影音訊失敗")
+        }
+
+        appendedAudioBufferCount += 1
+        lastAudioPresentationTime = presentationTime
+    }
+
     private func waitUntilVideoInputReady(
         _ videoInput: AVAssetWriterInput
     ) -> Bool {
@@ -421,6 +497,27 @@ private final class RecordingWriterWorker: @unchecked Sendable {
 
         writer.add(input)
 
+        let audioSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: 48_000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 128_000
+        ]
+
+        let audioInput = AVAssetWriterInput(
+            mediaType: .audio,
+            outputSettings: audioSettings
+        )
+        audioInput.expectsMediaDataInRealTime = true
+
+        guard writer.canAdd(audioInput) else {
+            throw makeError(
+                "無法加入錄影 audio input"
+            )
+        }
+
+        writer.add(audioInput)
+
         let adaptor =
             AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: input,
@@ -441,6 +538,7 @@ private final class RecordingWriterWorker: @unchecked Sendable {
 
         self.writer = writer
         self.videoInput = input
+        self.audioInput = audioInput
         self.adaptor = adaptor
         self.compositor =
             try PicTrailPixelBufferCompositor()
@@ -477,11 +575,13 @@ private final class RecordingWriterWorker: @unchecked Sendable {
            let writer,
            writer.status == .writing {
             videoInput?.markAsFinished()
+            audioInput?.markAsFinished()
             writer.cancelWriting()
         }
 
         writer = nil
         videoInput = nil
+        audioInput = nil
         adaptor = nil
         compositor = nil
         outputURL = nil
@@ -489,8 +589,11 @@ private final class RecordingWriterWorker: @unchecked Sendable {
         didStartSession = false
         firstPresentationTime = nil
         lastPresentationTime = nil
+        lastAudioPresentationTime = nil
         appendedFrameCount = 0
         droppedFrameCount = 0
+        appendedAudioBufferCount = 0
+        droppedAudioBufferCount = 0
         fatalErrorHandler = nil
     }
 
@@ -704,6 +807,21 @@ final class RecordingManager {
                 now: now
             )
         )
+    }
+
+
+    // MARK: - Append microphone audio
+
+    func makeAudioSampleBufferHandler() -> (CMSampleBuffer) -> Void {
+        let worker = self.worker
+
+        return { sampleBuffer in
+            worker.appendAudio(
+                RecordingAudioPayload(
+                    sampleBuffer: sampleBuffer
+                )
+            )
+        }
     }
 
     // MARK: - Stop

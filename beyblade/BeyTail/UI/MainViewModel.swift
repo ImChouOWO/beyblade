@@ -585,6 +585,7 @@ final class MainViewModel: ObservableObject {
         resetDetectionStatus()
 
         cameraManager.onFrame = nil
+        cameraManager.onAudioFrame = nil
         cameraFrameRelay.reset()
         cameraManager.stop()
 
@@ -1398,6 +1399,14 @@ final class MainViewModel: ObservableObject {
                 return
             }
 
+            guard await self.cameraManager.prepareAudioCaptureAsync() else {
+                self.recordingTrailEffectEngine.clear()
+                self.latestRecordingMediaTime = nil
+                self.appMode = .cameraPreview
+                self.finishEvent()
+                return
+            }
+
             let recordingOrientation = self.lastValidDeviceOrientation
 
             print("[RECORD] call startRecording")
@@ -1802,6 +1811,9 @@ final class MainViewModel: ObservableObject {
             }
         }
 
+        cameraManager.onAudioFrame =
+            recordingManager.makeAudioSampleBufferHandler()
+
         let started = await cameraManager.requestPermissionAndStartAsync()
 
         if !started {
@@ -1840,6 +1852,7 @@ final class MainViewModel: ObservableObject {
 
     private func stopCameraForExternalPicker() async {
         cameraManager.onFrame = nil
+        cameraManager.onAudioFrame = nil
         cameraFrameRelay.reset()
         videoFrameSource.stop()
 
