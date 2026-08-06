@@ -9,6 +9,7 @@ final class CameraManager: NSObject {
     let session = AVCaptureSession()
 
     var onFrame: ((CMSampleBuffer) -> Void)?
+    var onAudioFrame: ((CMSampleBuffer) -> Void)?
 
     var currentVisionImageOrientation: CGImagePropertyOrientation {
         orientationLock.lock()
@@ -58,9 +59,16 @@ final class CameraManager: NSObject {
         qos: .userInitiated
     )
 
+    private let audioQueue = DispatchQueue(
+        label: "com.beytail.camera.audio.queue",
+        qos: .userInitiated
+    )
+
     private let videoOutput = AVCaptureVideoDataOutput()
+    private let audioOutput = AVCaptureAudioDataOutput()
 
     private var isConfigured = false
+    private var isAudioConfigured = false
     private var isSessionRunning = false
 
     private let orientationLock = NSLock()
@@ -82,6 +90,8 @@ final class CameraManager: NSObject {
     }
 
     deinit {
+        videoOutput.setSampleBufferDelegate(nil, queue: nil)
+        audioOutput.setSampleBufferDelegate(nil, queue: nil)
         NotificationCenter.default.removeObserver(self)
     }
 
@@ -149,6 +159,73 @@ final class CameraManager: NSObject {
 
         @unknown default:
             print("[ERROR] Unknown camera permission status.")
+            return false
+        }
+    }
+
+    /// 只在使用者開始錄影時要求麥克風權限，並將音訊輸入／輸出加入既有相機 Session。
+    func prepareAudioCaptureAsync() async -> Bool {
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+
+        let granted: Bool
+
+        switch status {
+        case .authorized:
+            granted = true
+
+        case .notDetermined:
+            granted = await withCheckedContinuation { continuation in
+                AVCaptureDevice.requestAccess(for: .audio) { allowed in
+                    continuation.resume(returning: allowed)
+                }
+            }
+
+        case .denied, .restricted:
+            granted = false
+
+        @unknown default:
+            granted = false
+        }
+
+        guard granted else {
+            print("[ERROR] Microphone permission is required for recording.")
+            return false
+        }
+
+        guard configureAudioSessionForRecording() else {
+            return false
+        }
+
+        return await withCheckedContinuation { continuation in
+            sessionQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: false)
+                    return
+                }
+
+                let configured = self.configureAudioCaptureIfNeeded()
+                continuation.resume(returning: configured)
+            }
+        }
+    }
+
+    private func configureAudioSessionForRecording() -> Bool {
+        let audioSession = AVAudioSession.sharedInstance()
+
+        do {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .videoRecording,
+                options: [.defaultToSpeaker]
+            )
+            try audioSession.setPreferredSampleRate(48_000)
+            try audioSession.setActive(true)
+            return true
+        } catch {
+            print(
+                "[ERROR] Configure audio session failed:",
+                error.localizedDescription
+            )
             return false
         }
     }
@@ -284,7 +361,83 @@ final class CameraManager: NSObject {
         isConfigured = true
     }
 
+    private func configureAudioCaptureIfNeeded() -> Bool {
+        if isAudioConfigured,
+           session.inputs.contains(where: { input in
+               guard let deviceInput = input as? AVCaptureDeviceInput else {
+                   return false
+               }
+               return deviceInput.device.hasMediaType(.audio)
+           }),
+           session.outputs.contains(where: { $0 === audioOutput }) {
+            return true
+        }
+
+        guard let microphone = AVCaptureDevice.default(for: .audio) else {
+            print("[ERROR] Microphone device not found.")
+            isAudioConfigured = false
+            return false
+        }
+
+        let audioInput: AVCaptureDeviceInput
+
+        do {
+            audioInput = try AVCaptureDeviceInput(device: microphone)
+        } catch {
+            print(
+                "[ERROR] Create microphone input failed:",
+                error.localizedDescription
+            )
+            isAudioConfigured = false
+            return false
+        }
+
+        session.beginConfiguration()
+        defer {
+            session.commitConfiguration()
+        }
+
+        let hasAudioInput = session.inputs.contains { input in
+            guard let deviceInput = input as? AVCaptureDeviceInput else {
+                return false
+            }
+
+            return deviceInput.device.hasMediaType(.audio)
+        }
+
+        if !hasAudioInput {
+            guard session.canAddInput(audioInput) else {
+                print("[ERROR] Cannot add microphone input.")
+                isAudioConfigured = false
+                return false
+            }
+
+            session.addInput(audioInput)
+        }
+
+        audioOutput.setSampleBufferDelegate(
+            self,
+            queue: audioQueue
+        )
+
+        if !session.outputs.contains(where: { $0 === audioOutput }) {
+            guard session.canAddOutput(audioOutput) else {
+                print("[ERROR] Cannot add camera audio output.")
+                isAudioConfigured = false
+                return false
+            }
+
+            session.addOutput(audioOutput)
+        }
+
+        isAudioConfigured = true
+        return true
+    }
+
     private func removeExistingInputsAndOutputs() {
+        videoOutput.setSampleBufferDelegate(nil, queue: nil)
+        audioOutput.setSampleBufferDelegate(nil, queue: nil)
+
         for input in session.inputs {
             session.removeInput(input)
         }
@@ -292,6 +445,8 @@ final class CameraManager: NSObject {
         for output in session.outputs {
             session.removeOutput(output)
         }
+
+        isAudioConfigured = false
     }
 
     private func addCameraInput(_ device: AVCaptureDevice) -> Bool {
@@ -316,7 +471,7 @@ final class CameraManager: NSObject {
         videoOutput.alwaysDiscardsLateVideoFrames = true
 
         videoOutput.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelBufferPixelFormatType_32BGRA
         ]
 
         videoOutput.setSampleBufferDelegate(
@@ -511,15 +666,24 @@ final class CameraManager: NSObject {
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+// MARK: - AVCaptureDataOutputSampleBufferDelegate
 
-extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraManager:
+    AVCaptureVideoDataOutputSampleBufferDelegate,
+    AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func captureOutput(
         _ output: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        onFrame?(sampleBuffer)
+        if output === videoOutput {
+            onFrame?(sampleBuffer)
+            return
+        }
+
+        if output === audioOutput {
+            onAudioFrame?(sampleBuffer)
+        }
     }
 }
