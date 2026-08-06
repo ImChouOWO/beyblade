@@ -11,10 +11,16 @@ struct RecordingCompletionSheet: View {
     let videoURL: URL
 
     @StateObject private var playerModel: RecordingPreviewPlayerModel
-    @State private var deviceOrientation: UIDeviceOrientation = .portrait
+
+    @State private var displayedOrientation: UIDeviceOrientation = .portrait
+    @State private var targetOrientation: UIDeviceOrientation = .portrait
+    @State private var contentOpacity: Double = 1.0
+    @State private var hasInitializedOrientation = false
+    @State private var orientationTransitionTask: Task<Void, Never>?
 
     private let screenEdgeSpacing: CGFloat = 10
     private let previewControlSpacing: CGFloat = 5
+    private let orientationAnimationDuration: Double = 0.25
 
     init(
         vm: MainViewModel,
@@ -36,7 +42,7 @@ struct RecordingCompletionSheet: View {
             )
             let rotatedContentSize = contentSize(
                 for: availableSize,
-                orientation: deviceOrientation
+                orientation: displayedOrientation
             )
 
             ZStack {
@@ -48,7 +54,11 @@ struct RecordingCompletionSheet: View {
                         width: rotatedContentSize.width,
                         height: rotatedContentSize.height
                     )
-                    .rotationEffect(rotationAngle)
+                    .rotationEffect(
+                        rotationAngle(for: displayedOrientation)
+                    )
+                    .opacity(contentOpacity)
+                    .allowsHitTesting(contentOpacity >= 0.99)
                     .position(
                         x: screenSize.width / 2,
                         y: screenSize.height / 2
@@ -68,6 +78,8 @@ struct RecordingCompletionSheet: View {
             updateDeviceOrientation(UIDevice.current.orientation)
         }
         .onDisappear {
+            orientationTransitionTask?.cancel()
+            orientationTransitionTask = nil
             playerModel.stop()
         }
     }
@@ -461,8 +473,10 @@ struct RecordingCompletionSheet: View {
         )
     }
 
-    private var rotationAngle: Angle {
-        switch deviceOrientation {
+    private func rotationAngle(
+        for orientation: UIDeviceOrientation
+    ) -> Angle {
+        switch orientation {
         case .portrait:
             return .degrees(0)
 
@@ -504,10 +518,57 @@ struct RecordingCompletionSheet: View {
              .portraitUpsideDown,
              .landscapeLeft,
              .landscapeRight:
-            deviceOrientation = orientation
+            break
 
         default:
-            break
+            return
+        }
+
+        if !hasInitializedOrientation {
+            displayedOrientation = orientation
+            targetOrientation = orientation
+            contentOpacity = 1.0
+            hasInitializedOrientation = true
+            return
+        }
+
+        guard targetOrientation != orientation else {
+            return
+        }
+
+        targetOrientation = orientation
+        orientationTransitionTask?.cancel()
+
+        let duration = orientationAnimationDuration
+
+        orientationTransitionTask = Task { @MainActor in
+            withAnimation(
+                .easeOut(duration: duration)
+            ) {
+                contentOpacity = 0
+            }
+
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(
+                        duration * 1_000_000_000
+                    )
+                )
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            displayedOrientation = orientation
+
+            withAnimation(
+                .easeIn(duration: duration)
+            ) {
+                contentOpacity = 1
+            }
         }
     }
 
