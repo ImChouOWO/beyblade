@@ -63,10 +63,10 @@ final class BeybladeTracker {
     private let colorSmoothAlpha: CGFloat = 0.15
     private let maximumPredictionTime: TimeInterval = 0.32
 
-    /// 僅保留追蹤診斷輸出；其他既有 print 會由檔案底部的全域 shim 關閉。
+    /// 僅保留追蹤診斷輸出。
     private let enableTrackerLogs = true
 
-    /// 一般狀態摘要最多每 0.25 秒輸出一次，避免 30／60 FPS 時洗版。
+    /// 一般摘要最多每 0.25 秒輸出一次，避免 30／60 FPS 洗版。
     private let trackerSummaryLogInterval: TimeInterval = 0.25
 
     private var lastTrackerSummaryLogTime: TimeInterval = 0
@@ -94,7 +94,6 @@ final class BeybladeTracker {
 
         guard !validDetections.isEmpty else {
             markAllTracksMissed()
-
             logLostTrackTransitions()
 
             let output = predictedResults(
@@ -262,7 +261,6 @@ final class BeybladeTracker {
         markUnmatchedTracksMissed(
             matchedTracks: matchedTracks
         )
-
         logLostTrackTransitions()
 
         let unmatchedConfirmedTracks = Set(
@@ -275,7 +273,6 @@ final class BeybladeTracker {
             forTrackIndices: unmatchedConfirmedTracks,
             now: now
         )
-
         output.append(contentsOf: predicted)
 
         if !predicted.isEmpty {
@@ -317,7 +314,7 @@ final class BeybladeTracker {
     func predictStep() -> [DetectionResult] {
         let now = CACurrentMediaTime()
 
-        let output = tracks.indices.compactMap { index in
+        let output: [DetectionResult] = tracks.indices.compactMap { index -> DetectionResult? in
             guard tracks[index].confirmedFrames >= confirmFrames,
                   tracks[index].missedFrames <= maxPredictionMissedFrames else {
                 return nil
@@ -577,15 +574,13 @@ final class BeybladeTracker {
             $0.missedFrames > maxMissedFrames
         }
 
-        if !removed.isEmpty {
-            for track in removed {
-                trackerLog(
-                    "[TRACKER_REMOVED]",
-                    "id=\(track.id)",
-                    "missedFrames=\(track.missedFrames)",
-                    "lastCenter=\(format(track.center))"
-                )
-            }
+        for track in removed {
+            trackerLog(
+                "[TRACKER_REMOVED]",
+                "id=\(track.id)",
+                "missedFrames=\(track.missedFrames)",
+                "lastCenter=\(format(track.center))"
+            )
         }
 
         tracks.removeAll {
@@ -980,19 +975,13 @@ final class BeybladeTracker {
     private func format(
         _ value: CGFloat
     ) -> String {
-        String(
-            format: "%.4f",
-            Double(value)
-        )
+        String(format: "%.4f", Double(value))
     }
 
     private func format(
         _ value: Float
     ) -> String {
-        String(
-            format: "%.4f",
-            Double(value)
-        )
+        String(format: "%.4f", Double(value))
     }
 
     private func format(
@@ -1133,9 +1122,7 @@ final class BeybladeTracker {
 }
 
 /// 關閉 App 內既有未限定的 `print` 診斷輸出。
-///
-/// Tracker 診斷使用 `Swift.print`，因此不受此函式影響。
-/// 需要重新啟用其他模組 log 時，移除此函式即可。
+/// Tracker 使用 `Swift.print`，因此不受影響。
 @inline(__always)
 func print(
     _ items: Any...,

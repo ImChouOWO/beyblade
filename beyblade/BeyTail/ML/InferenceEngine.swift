@@ -47,13 +47,13 @@ final class InferenceEngine: @unchecked Sendable {
 
     /// 高速模糊時允許較低信心框進入追蹤器。
     /// 新軌跡仍會由 BeybladeTracker 的較高門檻與連續確認機制過濾。
-    private let confidenceThreshold: Float = 0.20
+    private let confidenceThreshold: Float = 0.15
 
     /// 稍微放寬 NMS，降低兩顆陀螺接近時被合併成一顆的機率。
-    private let nmsIoUThreshold: CGFloat = 0.45
+    private let nmsIoUThreshold: CGFloat = 0.35
 
     /// 避免大量低品質候選框進入追蹤器。
-    private let maxOutputDetections = 4
+    private let maxOutputDetections = 3
 
     /// App 預期使用的模型輸入尺寸。
     /// 真正推論尺寸仍由 Core ML 模型本身決定。
