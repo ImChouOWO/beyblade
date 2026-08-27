@@ -766,7 +766,7 @@ extension PicTrailSceneBuilder {
             let phase = Float(strand) * Float.pi
             let wMult: Float = strand == 0 ? 1 : 0.62
             let aMult: Float = strand == 0 ? 1 : 0.7
-            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { j, life, normal in
                 let u = Float(j) / Float(m - 1)
                 let wave = sin(u * TWIST_FREQ * 2 * Float.pi + phase - now * WRIGGLE_SPEED)
                 return normal * (wave * SERPENT_AMP * (1 - u))
@@ -1323,7 +1323,7 @@ extension PicTrailSceneBuilder {
         let pos = rs.pos, alp = rs.alpha
         let m = pos.count
         let VINE_AMP = ndcToPixels(0.018, minDim: minDim)
-        let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+        let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { j, life, normal in
             let u = Float(j) / Float(m - 1)
             let wave = sin(u * 2.0 * 2 * Float.pi - now * 4.0)
             return normal * (wave * VINE_AMP * (1 - u))
@@ -1387,7 +1387,7 @@ extension PicTrailSceneBuilder {
             let sideSign: Float = strand % 2 == 1 ? 1 : -1
             let ampMult: Float = isMain ? 0.30 : 1
             let phase = Float(strand) * 1.7
-            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { [self] j, life, normal in
+            let offset: (Int, Float, SIMD2<Float>) -> SIMD2<Float> = { j, life, normal in
                 let u = Float(j) / Float(m - 1)
                 let wave = sin(u * 1.6 * 2 * Float.pi + phase - now * 3.0)
                 let off = wave * INK_AMP * ampMult * (1 - 0.4 * u)

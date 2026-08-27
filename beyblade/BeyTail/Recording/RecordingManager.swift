@@ -179,8 +179,14 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                 }
 
                 self.queue.async {
-                    let status = writer.status
-                    let errorMessage = writer.error?.localizedDescription
+                    guard let currentWriter = self.writer else {
+                        self.resetOnQueue(cancelWriter: false)
+                        completion(nil)
+                        return
+                    }
+
+                    let status = currentWriter.status
+                    let errorMessage = currentWriter.error?.localizedDescription
 
                     self.resetOnQueue(cancelWriter: false)
 

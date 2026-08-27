@@ -11,8 +11,8 @@ final class VideoRenderProcessor: @unchecked Sendable {
     var onCompleted: (@MainActor @Sendable (URL) -> Void)?
     var onFailed: (@MainActor @Sendable (String) -> Void)?
 
-    private let stateLock = NSLock()
-    private var isCancelled = false
+    nonisolated(unsafe) private let stateLock = NSLock()
+    nonisolated(unsafe) private var isCancelled = false
 
     func process(
         inputURL: URL,
@@ -62,7 +62,7 @@ final class VideoRenderProcessor: @unchecked Sendable {
         setCancelled(true)
     }
 
-    private var cancelled: Bool {
+    nonisolated private var cancelled: Bool {
         stateLock.lock()
         defer {
             stateLock.unlock()
@@ -70,7 +70,7 @@ final class VideoRenderProcessor: @unchecked Sendable {
         return isCancelled
     }
 
-    private func setCancelled(
+    nonisolated private func setCancelled(
         _ value: Bool
     ) {
         stateLock.lock()
