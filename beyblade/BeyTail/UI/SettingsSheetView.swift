@@ -11,8 +11,12 @@ struct SettingsSheetView: View {
 
     @Environment(\.openURL) private var openURL
 
+    @ObservedObject private var purchaseStore =
+        EffectPurchaseStore.shared
+
     @State private var dragOffset: CGFloat = 0
     @State private var isRestoringPurchases = false
+    @State private var isOfferCodeRedemptionPresented = false
     @State private var presentedAlert: SettingsAlert?
 
     private let supportURL = URL(
@@ -72,6 +76,13 @@ struct SettingsSheetView: View {
                     ) {
                         openURL(privacyPolicyURL)
                     }
+
+                    settingButton(
+                        systemName: "ticket.fill",
+                        title: "兌換優惠碼"
+                    ) {
+                        isOfferCodeRedemptionPresented = true
+                    }
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 16)
@@ -107,6 +118,21 @@ struct SettingsSheetView: View {
                 message: Text(alert.message),
                 dismissButton: .default(Text("好"))
             )
+        }
+        .offerCodeRedemption(
+            isPresented: $isOfferCodeRedemptionPresented
+        ) { result in
+            switch result {
+            case .success:
+                Task { @MainActor in
+                    await purchaseStore.refreshPurchasedProducts()
+                }
+            case .failure(let error):
+                presentedAlert = SettingsAlert(
+                    title: "兌換失敗",
+                    message: error.localizedDescription
+                )
+            }
         }
     }
 

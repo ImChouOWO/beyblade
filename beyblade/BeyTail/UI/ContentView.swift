@@ -59,8 +59,8 @@ struct ContentView: View {
     private let fixedVideoGravity: AVLayerVideoGravity = .resizeAspectFill
     private let controlBarHeight: CGFloat = 110
 
-    private let topBarHeight: CGFloat = 40
-    private let topBarTopPadding: CGFloat = 10
+    private let topBarHeight: CGFloat = 44
+    private let topBarTopPadding: CGFloat = 8
     private let uiAnimationDuration: Double = 0.25
 
     private var isBusy: Bool {
@@ -226,7 +226,7 @@ struct ContentView: View {
         return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
 
-    private var topBarLayer: some View {
+    private func topBarLayer(safeAreaTop: CGFloat) -> some View {
         GeometryReader { geometry in
             topBar
                 .frame(
@@ -235,7 +235,7 @@ struct ContentView: View {
                 )
                 .position(
                     x: geometry.size.width / 2,
-                    y: topBarTopPadding + topBarHeight / 2
+                    y: max(safeAreaTop, 16) + topBarTopPadding + topBarHeight / 2
                 )
         }
         .ignoresSafeArea()
@@ -672,7 +672,7 @@ struct ContentView: View {
                 }
                 .ignoresSafeArea()
 
-                topBarLayer
+                topBarLayer(safeAreaTop: geometry.safeAreaInsets.top)
                 recognitionStatusLayer
                 controlBarLayer
                 effectMenuLayer
@@ -782,7 +782,7 @@ struct ContentView: View {
                 recognitionStatusTransitionTask?.cancel()
                 recognitionStatusTransitionTask = nil
             }
-            .onChange(of: scenePhase) { newPhase in
+            .onChange(of: scenePhase) { _, newPhase in
                 switch newPhase {
                 case .active:
                     if !showVideoPicker {
@@ -799,7 +799,7 @@ struct ContentView: View {
                     break
                 }
             }
-            .onChange(of: size) { newSize in
+            .onChange(of: size) { _, newSize in
                 vm.updatePreviewLayout(
                     overlaySize: newSize,
                     videoGravity: fixedVideoGravity
@@ -807,7 +807,7 @@ struct ContentView: View {
 
                 vm.cameraManager.updateVideoRotation()
             }
-            .onChange(of: is60FPSMode) { enabled in
+            .onChange(of: is60FPSMode) { _, enabled in
                 CameraFrameRateCoordinator.shared.set60FPSMode(
                     enabled
                 )
@@ -985,7 +985,7 @@ struct ContentView: View {
                 Image(systemName: "gearshape.fill")
                     .font(.system(size: 16))
                     .foregroundColor(.white)
-                    .frame(width: 40, height: 40)
+                    .frame(width: 44, height: 44)
                     .background(
                         Color.white.opacity(0.15),
                         in: RoundedRectangle(cornerRadius: 10)
@@ -996,7 +996,6 @@ struct ContentView: View {
             .opacity(isBusy ? 0.45 : 1.0)
         }
         .padding(.horizontal, 16)
-        .padding(.top, 8)
     }
 
     // MARK: - Hint Bar
@@ -1479,7 +1478,7 @@ private struct EffectLibraryPage: View {
         }
         .onChange(
                 of: purchaseStore.purchasedProductIDs
-            ) { _ in
+            ) {
             removeUnownedEffectsFromMenu()
         }
         .fullScreenCover(

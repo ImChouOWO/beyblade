@@ -105,16 +105,16 @@ struct QuickEffectMenuView: View {
         ) { frame in
             menuFrame = frame
         }
-        .onChange(of: dragLocation) { newLocation in
+        .onChange(of: dragLocation) { _, newLocation in
             updateSelectionByDragLocation(newLocation)
         }
-        .onChange(of: effectMenuIDsRaw) { _ in
+        .onChange(of: effectMenuIDsRaw) {
             normalizePersistedOrder()
             removeInvalidSelectionIfNeeded()
         }
         .onChange(
             of: purchaseStore.purchasedProductIDs
-        ) { _ in
+        ) {
             removeInvalidSelectionIfNeeded()
         }
         .onAppear {

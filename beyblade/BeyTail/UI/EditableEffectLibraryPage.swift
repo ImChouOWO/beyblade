@@ -75,7 +75,7 @@ struct EditableEffectLibraryPage: View {
         }
         .onChange(
             of: purchaseStore.purchasedProductIDs
-        ) { _ in
+        ) {
             synchronizeQuickMenuOwnership()
         }
         .fullScreenCover(
