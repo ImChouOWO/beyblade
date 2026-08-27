@@ -1,0 +1,280 @@
+name: Apply BeyTail requested updates
+
+on:
+  push:
+    paths:
+      - .github/workflows/apply-beytail-requested-updates.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-updates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update Swift sources
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path('.')
+          content_path = root / 'beyblade/BeyTail/UI/ContentView.swift'
+          settings_path = root / 'beyblade/BeyTail/UI/SettingsSheetView.swift'
+
+          # ------------------------------------------------------------
+          # 1. Top bar: keep BEY TAIL and gear on the same vertical center,
+          #    while moving the whole bar below the protected top area.
+          # ------------------------------------------------------------
+          content = content_path.read_text(encoding='utf-8')
+
+          old_constants = '''    private let topBarHeight: CGFloat = 40
+    private let topBarTopPadding: CGFloat = 10
+    private let uiAnimationDuration: Double = 0.25'''
+          new_constants = '''    // 44 pt keeps the gear hit target at the iOS recommended minimum.
+    private let topBarHeight: CGFloat = 44
+
+    // The entire top bar is placed below the top safe area so BEY TAIL and
+    // the settings button stay at exactly the same vertical center.
+    private let topBarTopPadding: CGFloat = 8
+    private let topBarHorizontalPadding: CGFloat = 16
+
+    private let uiAnimationDuration: Double = 0.25'''
+
+          if old_constants not in content:
+              raise RuntimeError('ContentView top-bar constants were not in the expected state')
+          content = content.replace(old_constants, new_constants, 1)
+
+          old_layer = '''    private var topBarLayer: some View {
+        GeometryReader { geometry in
+            topBar
+                .frame(
+                    width: geometry.size.width,
+                    height: topBarHeight
+                )
+                .position(
+                    x: geometry.size.width / 2,
+                    y: topBarTopPadding + topBarHeight / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(true)
+    }'''
+
+          new_layer = '''    private func topBarLayer(
+        safeAreaTop: CGFloat
+    ) -> some View {
+        GeometryReader { geometry in
+            // Status-bar visibility can make the reported inset smaller on
+            // some devices, so keep a small minimum protection as fallback.
+            let protectedTopInset = max(safeAreaTop, 16)
+
+            topBar
+                .frame(
+                    width: geometry.size.width,
+                    height: topBarHeight
+                )
+                .position(
+                    x: geometry.size.width / 2,
+                    y: protectedTopInset
+                        + topBarTopPadding
+                        + topBarHeight / 2
+                )
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(true)
+    }'''
+
+          if old_layer not in content:
+              raise RuntimeError('ContentView topBarLayer was not in the expected state')
+          content = content.replace(old_layer, new_layer, 1)
+
+          old_call = '''                topBarLayer
+                recognitionStatusLayer'''
+          new_call = '''                topBarLayer(
+                    safeAreaTop: geometry.safeAreaInsets.top
+                )
+                recognitionStatusLayer'''
+          if old_call not in content:
+              raise RuntimeError('ContentView topBarLayer call was not in the expected state')
+          content = content.replace(old_call, new_call, 1)
+
+          top_marker = content.index('    // MARK: - Top Bar\n')
+          hint_marker = content.index('    // MARK: - Hint Bar\n', top_marker)
+          top_block = content[top_marker:hint_marker]
+          if '.frame(width: 40, height: 40)' not in top_block:
+              raise RuntimeError('Settings button frame was not in the expected state')
+          top_block = top_block.replace(
+              '.frame(width: 40, height: 40)',
+              '.frame(width: 44, height: 44)',
+              1
+          )
+          top_block = top_block.replace(
+              '        .padding(.horizontal, 16)\n        .padding(.top, 8)',
+              '        .padding(.horizontal, topBarHorizontalPadding)',
+              1
+          )
+          content = content[:top_marker] + top_block + content[hint_marker:]
+          content_path.write_text(content, encoding='utf-8')
+
+          # ------------------------------------------------------------
+          # 2. Real App Store Offer Code redemption.
+          #    Apple owns the code-entry/validation UI. StoreKit emits the
+          #    redeemed transaction through Transaction.updates, which the
+          #    existing EffectPurchaseStore already listens to.
+          # ------------------------------------------------------------
+          settings = settings_path.read_text(encoding='utf-8')
+
+          environment_anchor = '''    @Environment(\\.openURL) private var openURL
+
+    @State private var dragOffset: CGFloat = 0'''
+          environment_replacement = '''    @Environment(\\.openURL) private var openURL
+
+    @ObservedObject private var purchaseStore =
+        EffectPurchaseStore.shared
+
+    @State private var dragOffset: CGFloat = 0'''
+          if environment_anchor not in settings:
+              raise RuntimeError('SettingsSheetView environment anchor was not found')
+          settings = settings.replace(
+              environment_anchor,
+              environment_replacement,
+              1
+          )
+
+          state_anchor = '''    @State private var isRestoringPurchases = false
+    @State private var presentedAlert: SettingsAlert?'''
+          state_replacement = '''    @State private var isRestoringPurchases = false
+    @State private var isOfferCodeRedemptionPresented = false
+    @State private var presentedAlert: SettingsAlert?'''
+          if state_anchor not in settings:
+              raise RuntimeError('SettingsSheetView state anchor was not found')
+          settings = settings.replace(state_anchor, state_replacement, 1)
+
+          privacy_block = '''                    settingButton(
+                        systemName: "lock.fill",
+                        title: "隱私權政策"
+                    ) {
+                        openURL(privacyPolicyURL)
+                    }'''
+          redeem_block = privacy_block + '''
+
+                    settingButton(
+                        systemName: "ticket.fill",
+                        title: "兌換優惠碼"
+                    ) {
+                        isOfferCodeRedemptionPresented = true
+                    }'''
+          if privacy_block not in settings:
+              raise RuntimeError('Privacy button block was not found')
+          settings = settings.replace(privacy_block, redeem_block, 1)
+
+          alert_block = '''        .alert(item: $presentedAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("好"))
+            )
+        }
+    }'''
+          redemption_modifier = '''        .alert(item: $presentedAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("好"))
+            )
+        }
+        .offerCodeRedemption(
+            isPresented: $isOfferCodeRedemptionPresented
+        ) { result in
+            switch result {
+            case .success:
+                // The actual entitlement arrives through Transaction.updates.
+                // Refresh once more after the system sheet closes so the UI
+                // also reflects a redemption completed immediately.
+                Task { @MainActor in
+                    await purchaseStore.refreshPurchasedProducts()
+                }
+
+            case .failure(let error):
+                presentedAlert = SettingsAlert(
+                    title: "兌換失敗",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }'''
+          if alert_block not in settings:
+              raise RuntimeError('SettingsSheetView alert block was not found')
+          settings = settings.replace(alert_block, redemption_modifier, 1)
+          settings_path.write_text(settings, encoding='utf-8')
+
+          # ------------------------------------------------------------
+          # 3. Migrate every deprecated one-parameter SwiftUI onChange
+          #    closure in the repository to the iOS 17 API shape.
+          # ------------------------------------------------------------
+          legacy_onchange = re.compile(
+              r'(\.onChange\s*\([^{}]*?\)\s*\{)\s*'
+              r'([A-Za-z_][A-Za-z0-9_]*|_)\s+in',
+              re.DOTALL
+          )
+
+          total_replacements = 0
+          changed_files = []
+
+          def migrate(match: re.Match[str]) -> str:
+              nonlocal_holder[0] += 1
+              prefix = match.group(1)
+              parameter = match.group(2)
+              if parameter == '_':
+                  return prefix
+              return f'{prefix} _, {parameter} in'
+
+          for path in root.rglob('*.swift'):
+              text = path.read_text(encoding='utf-8')
+              nonlocal_holder = [0]
+              migrated = legacy_onchange.sub(migrate, text)
+              count = nonlocal_holder[0]
+              if count:
+                  path.write_text(migrated, encoding='utf-8')
+                  total_replacements += count
+                  changed_files.append((str(path), count))
+
+          # The current project has eight deprecated onChange closures.
+          if total_replacements < 8:
+              raise RuntimeError(
+                  f'Expected at least 8 onChange migrations, got {total_replacements}'
+              )
+
+          # Ensure no one-parameter deprecated onChange closure remains.
+          remaining = []
+          for path in root.rglob('*.swift'):
+              text = path.read_text(encoding='utf-8')
+              if legacy_onchange.search(text):
+                  remaining.append(str(path))
+          if remaining:
+              raise RuntimeError(
+                  'Deprecated onChange closures remain in: ' + ', '.join(remaining)
+              )
+
+          print('Migrated deprecated onChange closures:', total_replacements)
+          for path, count in changed_files:
+              print(f'  {path}: {count}')
+          PY
+
+      - name: Commit requested source changes and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-beytail-requested-updates.yml
+          git add beyblade/BeyTail
+          git commit -m "Implement offer code redemption and modernize SwiftUI UI"
+          git push origin HEAD:main
