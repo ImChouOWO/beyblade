@@ -11,7 +11,7 @@ final class VideoRenderProcessor: @unchecked Sendable {
     var onCompleted: (@MainActor @Sendable (URL) -> Void)?
     var onFailed: (@MainActor @Sendable (String) -> Void)?
 
-    nonisolated(unsafe) private let stateLock = NSLock()
+    private let stateLock = NSLock()
     nonisolated(unsafe) private var isCancelled = false
 
     func process(
