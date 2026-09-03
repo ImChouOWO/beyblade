@@ -135,9 +135,10 @@ private final class RecordingWriterWorker: @unchecked Sendable {
                   let videoInput = self.videoInput,
                   let outputURL = self.outputURL,
                   self.didStartSession,
-                  self.appendedFrameCount > 0 else {
+                  self.appendedFrameCount > 0,
+                  self.appendedAudioBufferCount > 0 else {
                 print(
-                    "[Recording] stop failed: no composited frames were appended"
+                    "[Recording] stop failed: video or audio samples are missing"
                 )
                 self.resetOnQueue(cancelWriter: true)
                 completion(nil)

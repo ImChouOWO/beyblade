@@ -92,41 +92,9 @@ final class CameraManager: NSObject {
     deinit {
         videoOutput.setSampleBufferDelegate(nil, queue: nil)
         audioOutput.setSampleBufferDelegate(nil, queue: nil)
-        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - Permission / Start
-
-    func requestPermissionAndStart() {
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-
-        switch status {
-        case .authorized:
-            start()
-
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                guard let self else {
-                    return
-                }
-
-                if granted {
-                    self.start()
-                } else {
-                    print("[ERROR] Camera permission denied by user.")
-                }
-            }
-
-        case .denied:
-            print("[ERROR] Camera permission denied. Please enable it in Settings.")
-
-        case .restricted:
-            print("[ERROR] Camera permission restricted.")
-
-        @unknown default:
-            print("[ERROR] Unknown camera permission status.")
-        }
-    }
 
     func requestPermissionAndStartAsync() async -> Bool {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -227,16 +195,6 @@ final class CameraManager: NSObject {
                 error.localizedDescription
             )
             return false
-        }
-    }
-
-    func start() {
-        sessionQueue.async { [weak self] in
-            guard let self else {
-                return
-            }
-
-            self.startSessionIfNeeded()
         }
     }
 

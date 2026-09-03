@@ -145,8 +145,19 @@ final class VideoRenderProcessor: @unchecked Sendable {
 
         var audioOutput:
             AVAssetReaderTrackOutput?
+        var audioFormatDescription:
+            CMFormatDescription?
 
         if let audioTrack {
+            // MP4 音訊 passthrough 必須提供來源格式，否則 writer 可能拒絕加入音軌。
+            guard let formatDescription = try await audioTrack
+                .load(.formatDescriptions)
+                .first else {
+                throw makeError(
+                    "無法讀取來源音訊格式"
+                )
+            }
+
             let output =
                 AVAssetReaderTrackOutput(
                     track: audioTrack,
@@ -155,10 +166,16 @@ final class VideoRenderProcessor: @unchecked Sendable {
 
             output.alwaysCopiesSampleData = false
 
-            if reader.canAdd(output) {
-                reader.add(output)
-                audioOutput = output
+            guard reader.canAdd(output) else {
+                throw makeError(
+                    "無法建立音訊讀取器"
+                )
             }
+
+            reader.add(output)
+            audioOutput = output
+            audioFormatDescription =
+                formatDescription
         }
 
         let outputURL = FileManager.default
@@ -238,19 +255,25 @@ final class VideoRenderProcessor: @unchecked Sendable {
 
         var audioInput: AVAssetWriterInput?
 
-        if audioOutput != nil {
+        if let audioFormatDescription {
             let input = AVAssetWriterInput(
                 mediaType: .audio,
-                outputSettings: nil
+                outputSettings: nil,
+                sourceFormatHint:
+                    audioFormatDescription
             )
 
             input.expectsMediaDataInRealTime =
                 false
 
-            if writer.canAdd(input) {
-                writer.add(input)
-                audioInput = input
+            guard writer.canAdd(input) else {
+                throw makeError(
+                    "無法建立音訊輸出器"
+                )
             }
+
+            writer.add(input)
+            audioInput = input
         }
 
         guard writer.startWriting() else {
@@ -415,6 +438,8 @@ final class VideoRenderProcessor: @unchecked Sendable {
 
         if let audioOutput,
            let audioInput {
+            var audioSampleCount = 0
+
             while let sampleBuffer =
                     audioOutput.copyNextSampleBuffer() {
                 try checkCancellation(
@@ -438,9 +463,22 @@ final class VideoRenderProcessor: @unchecked Sendable {
                             "寫入音訊失敗"
                         )
                 }
+
+                audioSampleCount += 1
             }
 
             audioInput.markAsFinished()
+
+            guard audioSampleCount > 0 else {
+                throw makeError(
+                    "來源影片的音軌沒有可輸出的音訊資料"
+                )
+            }
+        }
+
+        if reader.status == .failed {
+            throw reader.error ??
+                makeError("讀取音訊失敗")
         }
 
         try checkCancellation(
