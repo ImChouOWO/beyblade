@@ -31,8 +31,7 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
         .crimson,
         .deathRay,
         .emerald,
-        .inkWash,
-        .spray
+        .inkWash
     ]
 
     var isAvailableInCurrentRelease: Bool {
@@ -48,7 +47,8 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
         .wave,
         .thunder,
         .vortex,
-        .dark
+        .dark,
+        .spray
     ]
 
 
@@ -180,7 +180,8 @@ enum EffectType: String, CaseIterable, Identifiable, Sendable {
             .wave,
             .thunder,
             .vortex,
-            .dark
+            .dark,
+            .spray
         ]
     }
 
